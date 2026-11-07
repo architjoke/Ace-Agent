@@ -77,9 +77,16 @@ paths:
   memory_db: data/ace_memory.db
   output_dir: output
 
+network:
+  # JobSpy rotates across this list (+ PROXY_URL from .env when set).
+  # Leave empty for direct egress. Example: ["http://user:pass@host:port"]
+  proxies: []
+  rotate_discovery: true
+
 browser:
   # Persistent Chromium profile: log into Gmail / LinkedIn / ATS once, then reuse.
   # Leave empty to use data/browser_profile (created automatically).
+  # Sticky proxy for Chromium: set PROXY_URL in .env (re-run ace login after changing it).
   user_data_dir: data/browser_profile
   profile_directory: Default
   headless: false

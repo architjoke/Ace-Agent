@@ -32,6 +32,37 @@ _NOISE_HINTS = re.compile(
     re.I,
 )
 
+# Actionable assessment / scheduling hosts (allowlist — not bare https)
+_ACTION_HOSTS = re.compile(
+    r"https?://[^\s<>\"']*(?:"
+    r"calendly\.com|"
+    r"hackerrank\.com|"
+    r"codesignal\.com|"
+    r"mettl\.com|"
+    r"hirevue\.com|"
+    r"greenhouse\.io/|"
+    r"lever\.co/"
+    r")[^\s<>\"']*",
+    re.I,
+)
+_TRAIL = re.compile(r"[\]\)\.,;:]+$")
+_DEADLINE = re.compile(
+    r"(?:deadline|complete by|schedule by|expires?(?:\s+on)?|by)\s*[:\-]?\s*"
+    r"((?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4})|"
+    r"(?:(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4})|"
+    r"(?:\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2})?))",
+    re.I,
+)
+_HOST_PRIORITY = (
+    "calendly.com",
+    "hirevue.com",
+    "hackerrank.com",
+    "codesignal.com",
+    "mettl.com",
+    "greenhouse.io",
+    "lever.co",
+)
+
 
 class EmailOutcome(BaseModel):
     company_name: str = Field(..., description="Employer / ATS company if identifiable")
@@ -170,6 +201,63 @@ Body:
     )
 
 
+def extract_action_links(body: str) -> tuple[str | None, str | None]:
+    """Pull best assessment/schedule URL + optional deadline from email body."""
+    text = body or ""
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in _ACTION_HOSTS.findall(text):
+        url = _TRAIL.sub("", match.strip())
+        if url and url not in seen:
+            seen.add(url)
+            found.append(url)
+
+    def _rank(url: str) -> int:
+        lower = url.lower()
+        for i, host in enumerate(_HOST_PRIORITY):
+            if host in lower:
+                return i
+        return len(_HOST_PRIORITY)
+
+    found.sort(key=_rank)
+    action_url = found[0] if found else None
+
+    deadline: str | None = None
+    m = _DEADLINE.search(text)
+    if m:
+        raw = m.group(1).strip()[:64]
+        deadline = _normalize_deadline(raw) or raw
+
+    return action_url, deadline
+
+
+def _normalize_deadline(raw: str) -> str | None:
+    """Best-effort ISO-ish normalization; None if unparseable."""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    # Already ISO-ish
+    if re.match(r"^\d{4}-\d{2}-\d{2}", text):
+        return text.replace(" ", "T", 1) if " " in text and "T" not in text else text
+    for fmt in (
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M",
+        "%d/%m/%Y",
+        "%m/%d/%Y",
+        "%d-%m-%Y",
+        "%b %d, %Y",
+        "%B %d, %Y",
+        "%b %d %Y",
+        "%B %d %Y",
+    ):
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
 def process_inbox(
     *,
     email_address: str | None = None,
@@ -177,7 +265,7 @@ def process_inbox(
     lookback_hours: int | None = None,
     update_db: bool = True,
 ) -> list[dict]:
-    """Fetch → filter → classify → optionally update SQLite outcomes."""
+    """Fetch → filter → classify → extract action links → optionally update SQLite."""
     messages = fetch_recent_emails(
         email_address,
         app_password,
@@ -193,25 +281,34 @@ def process_inbox(
             logger.exception("Failed to classify: %s", msg.subject[:120])
             continue
 
+        action_url, action_deadline = None, None
+        if result.outcome in {"INTERVIEW_INVITE", "ASSESSMENT", "SELECTED"}:
+            action_url, action_deadline = extract_action_links(msg.body)
+
         record = {
             "company_name": result.company_name,
             "outcome": result.outcome,
             "reason": result.reason,
             "subject": msg.subject,
             "from_addr": msg.from_addr,
+            "action_url": action_url,
+            "action_deadline": action_deadline,
         }
         if update_db and result.outcome != "UNCLEAR":
             matched = update_application_outcome(
                 result.company_name,
                 result.outcome,
                 reason=result.reason,
+                action_url=action_url or "",
+                action_deadline=action_deadline or "",
             )
             record["db_matches"] = matched
             logger.info(
-                "Inbox outcome %s @ %s (matched=%s)",
+                "Inbox outcome %s @ %s (matched=%s, action_url=%s)",
                 result.outcome,
                 result.company_name,
                 matched,
+                action_url or "-",
             )
         actionable.append(record)
 

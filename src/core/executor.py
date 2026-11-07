@@ -249,11 +249,17 @@ def _browser_profile(user_data_dir: Path | str | None = None) -> BrowserProfile:
         "no",
         "off",
     }
+    from src.core.network import browser_proxy_settings
+
+    proxy = browser_proxy_settings()
+    if proxy is not None:
+        logger.info("BrowserProfile sticky proxy enabled (PROXY_URL / network.proxies)")
     return BrowserProfile(
         user_data_dir=str(profile_dir),
         profile_directory=settings.browser_profile_directory,
         headless=settings.browser_headless,
         keep_alive=keep,
+        proxy=proxy,
     )
 
 
@@ -469,17 +475,14 @@ async def execute_application(
     cleanup_linkedin_resume: bool | None = None,
     user_data_dir: Path | str | None = None,
 ) -> bool:
-    """Drive browser-use through the apply form.
+    """Apply via ATS playbook when possible, else browser-use Gemini vision.
 
-    Upload filename comes from ACE_APPLY_RESUME_FILENAME (via unique_apply_pdf).
-    Per-apply LinkedIn cleanup is optional — prefer batch cleanup at cycle end.
+    Greenhouse / Lever / Ashby / Workday DOM playbooks run first (no vision
+    tokens). On TimeoutError / PlaybookFallback the Chromium profile is closed
+    and Gemini takes over with the same user_data_dir cookies.
     """
     pdf_path = Path(tailored_pdf_path).expanduser().resolve()
     master_path = Path(master_yaml_path).expanduser().resolve()
-    pdf_abs = os.path.abspath(str(pdf_path))
-    pdf_stem = pdf_path.stem
-    pdf_filename = pdf_path.name
-
     if not pdf_path.is_file():
         raise FileNotFoundError(f"Tailored PDF not found: {pdf_path}")
     if not master_path.is_file():
@@ -490,13 +493,93 @@ async def execute_application(
         raise ValueError("job_url is required")
 
     do_submit = _auto_submit_enabled() if auto_submit is None else bool(auto_submit)
-    # One-offs: cleanup LinkedIn after success. Parallel pool passes False and
-    # runs batch cleanup once per cycle instead.
     do_cleanup = (
         cleanup_linkedin_resume
         if cleanup_linkedin_resume is not None
         else ("linkedin.com" in job_url.lower())
     )
+
+    from src.playbooks import PlaybookFallback, classify_ats
+
+    kind = classify_ats(job_url)
+    if do_submit and kind in {"greenhouse", "lever", "ashby", "workday"}:
+        try:
+            ok = False
+            if kind == "greenhouse":
+                from src.playbooks.greenhouse import run_greenhouse
+
+                logger.info("ATS router → greenhouse playbook for %s", job_url)
+                ok = await asyncio.to_thread(
+                    run_greenhouse,
+                    job_url,
+                    pdf_path,
+                    master_path,
+                    user_data_dir=user_data_dir,
+                )
+            elif kind in {"lever", "ashby"}:
+                from src.playbooks.lever import run_lever
+
+                logger.info("ATS router → %s playbook for %s", kind, job_url)
+                ok = await asyncio.to_thread(
+                    run_lever,
+                    job_url,
+                    pdf_path,
+                    master_path,
+                    user_data_dir=user_data_dir,
+                    ats=kind,
+                )
+            elif kind == "workday":
+                from src.playbooks.workday import run_workday
+
+                logger.info("ATS router → workday playbook for %s", job_url)
+                ok = await asyncio.to_thread(
+                    run_workday,
+                    job_url,
+                    pdf_path,
+                    master_path,
+                    user_data_dir=user_data_dir,
+                )
+            if ok:
+                logger.info("%s playbook succeeded for %s", kind, job_url)
+                return True
+        except (TimeoutError, PlaybookFallback) as exc:
+            logger.warning(
+                "ATS playbook stuck → Gemini handoff (kind=%s, reason=%s)",
+                kind,
+                exc,
+            )
+        except Exception:
+            logger.exception(
+                "ATS playbook crashed (kind=%s) — falling back to Gemini vision",
+                kind,
+            )
+
+    return await _execute_with_browser_use(
+        job_url,
+        pdf_path,
+        master_path,
+        auto_submit=do_submit,
+        cleanup_linkedin_resume=do_cleanup,
+        user_data_dir=user_data_dir,
+    )
+
+
+async def _execute_with_browser_use(
+    job_url: str,
+    pdf_path: Path,
+    master_path: Path,
+    *,
+    auto_submit: bool,
+    cleanup_linkedin_resume: bool,
+    user_data_dir: Path | str | None = None,
+) -> bool:
+    """Drive browser-use through the apply form (Gemini vision/DOM)."""
+    pdf_abs = os.path.abspath(str(pdf_path))
+    pdf_stem = pdf_path.stem
+    pdf_filename = pdf_path.name
+    do_submit = bool(auto_submit)
+    do_cleanup = bool(cleanup_linkedin_resume)
+
     master_preview = master_path.read_text(encoding="utf-8")
     form_answers = _application_answers_block(master_path)
     lessons = load_lessons()
@@ -530,7 +613,6 @@ async def execute_application(
         "\n…[truncated]\n" if len(lessons_block) > 2500 else ""
     )
     form_block = f"\n\n{form_answers}\n" if form_answers else ""
-    # Prefer form answers + trim huge master dump so phone/PIN/notice stay visible
     master_clip = master_preview
     if len(master_clip) > 12000:
         master_clip = master_clip[:12000] + "\n…[truncated master.yaml]\n"

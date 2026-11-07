@@ -46,6 +46,8 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
         "tailored_yaml_snapshot": "TEXT",
         "outcome_reason": "TEXT",
         "outcome_updated_at": "TEXT",
+        "action_url": "TEXT",
+        "action_deadline": "TEXT",
     }
     for name, decl in migrations.items():
         if name not in cols:
@@ -70,7 +72,9 @@ def init_db(db_path: Path | None = None) -> Path:
                 jd_text TEXT,
                 tailored_yaml_snapshot TEXT,
                 outcome_reason TEXT,
-                outcome_updated_at TEXT
+                outcome_updated_at TEXT,
+                action_url TEXT,
+                action_deadline TEXT
             )
             """
         )
@@ -180,9 +184,13 @@ def update_application_outcome(
     outcome: str,
     reason: str = "",
     db_path: Path | None = None,
+    *,
+    action_url: str = "",
+    action_deadline: str = "",
 ) -> int:
     """Fuzzy-match company_name to PENDING applications; set outcome_status.
 
+    Optionally stores action_url / action_deadline (Calendly, HackerRank, …).
     Returns number of rows updated.
     """
     outcome = (outcome or "").strip().upper()
@@ -196,6 +204,8 @@ def update_application_outcome(
         return 0
 
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    url = (action_url or "").strip() or None
+    deadline = (action_deadline or "").strip() or None
     updated = 0
     with _connect(db_path) as conn:
         _ensure_columns(conn)
@@ -214,10 +224,14 @@ def update_application_outcome(
                 conn.execute(
                     """
                     UPDATE applications
-                    SET outcome_status = ?, outcome_reason = ?, outcome_updated_at = ?
+                    SET outcome_status = ?,
+                        outcome_reason = ?,
+                        outcome_updated_at = ?,
+                        action_url = COALESCE(?, action_url),
+                        action_deadline = COALESCE(?, action_deadline)
                     WHERE id = ?
                     """,
-                    (outcome, reason or "", ts, row["id"]),
+                    (outcome, reason or "", ts, url, deadline, row["id"]),
                 )
                 updated += 1
                 break  # one email → one best match

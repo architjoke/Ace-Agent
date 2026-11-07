@@ -147,14 +147,21 @@ def fetch_jobs(
         location,
         max_results,
     )
-    jobs = scrape_jobs(
-        site_name=site_names,
-        search_term=keywords,
-        location=location,
-        results_wanted=max_results,
-        country_indeed=country_indeed,
-        fetch_description=True,
-    )
+    from src.core.network import discovery_proxies_arg
+
+    proxy_list = discovery_proxies_arg()
+    scrape_kwargs: dict = {
+        "site_name": site_names,
+        "search_term": keywords,
+        "location": location,
+        "results_wanted": max_results,
+        "country_indeed": country_indeed,
+        "fetch_description": True,
+    }
+    if proxy_list:
+        scrape_kwargs["proxies"] = proxy_list
+        logger.info("JobSpy using %s proxy endpoint(s)", len(proxy_list))
+    jobs = scrape_jobs(**scrape_kwargs)
 
     if jobs is None or jobs.empty:
         return pd.DataFrame()
