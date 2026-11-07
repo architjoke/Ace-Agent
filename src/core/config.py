@@ -25,9 +25,16 @@ WORKER_STATUS: Path = DATA_DIR / "browser_workers.json"
 
 
 def ensure_runtime_dirs() -> None:
-    """Create data/ and output/ if missing (first clone / fresh machine)."""
+    """Create local workspace dirs if missing (first clone / fresh machine).
+
+    These dirs are gitignored — each user gets an empty local sandbox, never
+    someone else's resumes or Manual_Action packages.
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / "Manual_Action").mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / "Submitted").mkdir(parents=True, exist_ok=True)
+    (PROJECT_ROOT / "resumes").mkdir(parents=True, exist_ok=True)
 
 
 def resolve_master_yaml() -> Path:

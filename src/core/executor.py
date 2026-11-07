@@ -8,6 +8,7 @@ import os
 import shutil
 from pathlib import Path
 
+import yaml
 from browser_use import Agent, ChatGoogle
 from browser_use.browser.profile import BrowserProfile
 
@@ -97,10 +98,21 @@ On-screen name must show: {pdf_stem}
 ### Other ATS (Indeed / Greenhouse / Lever / Workday / Keka / careers pages)
 Always upload {pdf_abs_path} via the file input — never reuse a previously saved CV.
 
+## Form filling (mandatory)
+Use the APPLICATION FORM ANSWERS block below for every matching field.
+- Phone: use phone_country_code + phone_national / phone_display (never invent another country).
+- Notice / availability / join date: use notice_period / earliest_join_date (never claim same-day join unless forced — then pick within that window).
+- Address / pincode / ZIP / postal: use the listed city, state, country, pincode fields.
+- Do not invent street/house numbers if not listed — use city/state/PIN/country.
+- Never fabricate salary history, foreign citizenship, or security-clearance eligibility.
+
 ## HARD RULES
 - ALWAYS upload from the disk path above — never click a previously listed LinkedIn resume.
 - NEVER click Next/Submit until "{pdf_stem}" is visibly attached from this upload.
 - On CAPTCHA / Cloudflare / login wall you cannot clear: stop and describe the blocker.
+- SCAM ABORT: If the form/JD asks to join a WhatsApp group/community/channel, or is a
+  "training and placement" internship that asks for any fee/amount/deposit — STOP.
+  Do NOT submit. Describe the scam signal and leave (treat as blocked).
 - After real confirmation UI, output exactly: {submitted_token}
 """
 
@@ -109,6 +121,10 @@ _TASK_TEMPLATE_REVIEW = """Navigate to {job_url}.
 ALWAYS upload resume from disk (never select an old LinkedIn resume):
 {pdf_abs_path}
 On-screen name should be: {pdf_filename}
+
+## Form filling (mandatory)
+Use the APPLICATION FORM ANSWERS block below for phone, notice/join window,
+address/pincode, and other listed fields. Do not invent unsupported facts.
 
 DO NOT click final Submit. When filled + OUR file is attached, output: {ready_token}
 """
@@ -149,6 +165,26 @@ def _keep_resume_names() -> list[str]:
     if raw:
         return [x.strip() for x in raw.split("|") if x.strip()]
     return list(_DEFAULT_KEEP_RESUMES)
+
+
+def _application_answers_block(master_path: Path) -> str:
+    """Extract application_answers from master.yaml for the browser prompt."""
+    try:
+        data = yaml.safe_load(master_path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        logger.warning("Could not parse application_answers from %s: %s", master_path, exc)
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    answers = data.get("application_answers")
+    if not isinstance(answers, dict) or not answers:
+        return ""
+    lines = ["## APPLICATION FORM ANSWERS (authoritative — use these on the form)"]
+    for key, value in answers.items():
+        if value is None or value == "":
+            continue
+        lines.append(f"- {key}: {value}")
+    return "\n".join(lines)
 
 
 def unique_apply_pdf(pdf_path: Path | str, company: str = "") -> Path:
@@ -462,6 +498,7 @@ async def execute_application(
         else ("linkedin.com" in job_url.lower())
     )
     master_preview = master_path.read_text(encoding="utf-8")
+    form_answers = _application_answers_block(master_path)
     lessons = load_lessons()
     max_steps, timeout_sec = _step_budget(job_url)
 
@@ -492,9 +529,14 @@ async def execute_application(
     lessons_block = lessons_block[:2500] + (
         "\n…[truncated]\n" if len(lessons_block) > 2500 else ""
     )
+    form_block = f"\n\n{form_answers}\n" if form_answers else ""
+    # Prefer form answers + trim huge master dump so phone/PIN/notice stay visible
+    master_clip = master_preview
+    if len(master_clip) > 12000:
+        master_clip = master_clip[:12000] + "\n…[truncated master.yaml]\n"
     task = (
-        f"{task}{lessons_block}\n\n"
-        f"--- BEGIN master.yaml contents ---\n{master_preview}\n"
+        f"{task}{form_block}{lessons_block}\n\n"
+        f"--- BEGIN master.yaml contents ---\n{master_clip}\n"
         f"--- END master.yaml contents ---"
     )
 

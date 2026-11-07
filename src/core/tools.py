@@ -151,8 +151,9 @@ def _recent_application_rows(limit: int = 300) -> list[Any]:
 def find_companies(query: str) -> str:
     """Fuzzy-search recent applications + Manual_Action folders by partial company name.
 
-    Use this whenever the user gives an incomplete / informal company name
-    (e.g. 'midbrain', 'kaleris', 'smartbridge') before marking or cleaning up.
+    STATUS / LOOKUP ONLY — not for form-fill behavior or config.yaml changes.
+    Use when the user gives an incomplete / informal company name
+    (e.g. 'midbrain', 'kaleris', 'smartbridge') before mark or cleanup.
     """
     q = (query or "").strip()
     if not q:
@@ -202,7 +203,9 @@ def find_companies(query: str) -> str:
 def mark_application_submitted(company_name: str) -> str:
     """Mark matching application row(s) as SUCCESS (user confirmed they submitted).
 
+    STATUS ONLY — use when the user says they applied / submitted a company.
     Accepts partial names (e.g. 'MidBrains' → 'Midbrains Technologies').
+    Do NOT use for form-fill instructions or config.yaml changes.
     """
     q = (company_name or "").strip()
     if not q:
@@ -249,7 +252,9 @@ def mark_application_submitted(company_name: str) -> str:
 def cleanup_manual_folder(company_name: str) -> str:
     """Delete one company folder under output/Manual_Action/ only (path-jailed).
 
+    CLEANUP ONLY — after the user submitted / no longer needs the package.
     Accepts partial names; fuzzy-resolves to a single folder when unambiguous.
+    Do NOT use for form-fill instructions or config.yaml changes.
     """
     allowed = _manual_action_root()
     allowed.mkdir(parents=True, exist_ok=True)
@@ -305,10 +310,20 @@ def memorize_new_rule(
     rule_text: str,
     enforcement_level: str,
 ) -> str:
-    """Permanently learn a preference. enforcement_level must be HARD or SOFT.
+    """Permanently learn a behavioral preference into lessons_learned.md (ACE_PREF).
+    enforcement_level must be HARD or SOFT.
 
-    HARD = absolute dealbreaker (instant reject). SOFT = -15 fit penalty (serendipity).
-    Re-affirming the same rule refreshes its timestamp (forgetting curve).
+    USE THIS FOR ALL BEHAVIORAL INSTRUCTIONS. If the user says "when you apply, write X",
+    "when asked for notice period, put Y", "don't apply to Z", or any form/resume/apply
+    behavior — save it here as a rule (NOT update_config_preference).
+
+    Categories (prefer one of):
+    - APPLY_BEHAVIOR — how to fill forms, notice period, phone/PIN wording, submit habits
+    - JOB_FILTERING — what jobs to skip/prefer (WhatsApp, unpaid, citizenship, locations taste)
+    - TAILORING — how to write or shape the resume/cover letter
+
+    HARD = absolute dealbreaker (instant reject where applicable).
+    SOFT = -15 fit penalty (serendipity). Re-affirming refreshes the forgetting curve.
     """
     level = (enforcement_level or "").strip().upper()
     if level not in {"HARD", "SOFT"}:
@@ -337,7 +352,15 @@ def _dig_set(data: dict, dotted: str, value: Any) -> Any:
 
 @tool
 def update_config_preference(target_key: str, new_value: str) -> str:
-    """Safely update an allowlisted key in config.yaml (e.g. filters.minimum_fit_score)."""
+    """Safely update an allowlisted key in config.yaml (e.g. filters.minimum_fit_score,
+    search_preferences.locations, browser.workers).
+
+    USE ONLY FOR SYSTEM SETTINGS like search locations, minimum ATS/fit scores,
+    worker counts, headless mode, or other allowlisted config.yaml knobs.
+    NEVER use this for instructions on how to fill out web forms or resumes,
+    notice periods, cover-letter wording, or "when you apply, write X" behavior —
+    those belong in memorize_new_rule (APPLY_BEHAVIOR / JOB_FILTERING / TAILORING).
+    """
     key = (target_key or "").strip()
     if key not in ALLOWED_CONFIG_KEYS:
         allowed = ", ".join(sorted(ALLOWED_CONFIG_KEYS))

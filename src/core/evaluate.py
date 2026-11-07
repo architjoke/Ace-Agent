@@ -121,6 +121,64 @@ def _hard_config_reject(jd_text: str) -> FitResult | None:
         config_terms = []
         require_paid = True
 
+    # Scam shields first — clearer rule_broken codes than generic exclude_terms
+    if re.search(
+        r"whatsapp\s*(group|community|channel|link)|"
+        r"join\s+(our\s+)?(whatsapp|wa\.me)|"
+        r"wa\.me/|"
+        r"chat\.whatsapp\.com",
+        jd,
+        flags=re.IGNORECASE,
+    ):
+        reason = (
+            "RULE BROKEN: scam_whatsapp. "
+            "Listing funnels to WhatsApp group/community — treat as scam."
+        )
+        logger.info("Hard shield rejected JD — %s", reason)
+        return {
+            "fit_score": 0,
+            "reason": reason,
+            "passed": False,
+            "rule_broken": "scam_whatsapp",
+            "matched_skills": [],
+            "missing_must_haves": [],
+            "recommended_track": "",
+        }
+
+    training_placement = bool(
+        re.search(
+            r"training\s*(and|&|/)?\s*placement|placement\s*(and|&|/)?\s*training|"
+            r"training\s+cum\s+placement|pay\s+after\s+placement",
+            jd,
+            flags=re.IGNORECASE,
+        )
+    )
+    asks_money = bool(
+        re.search(
+            r"\b(registration\s+fee|course\s+fee|training\s+fee|program\s+fee|"
+            r"admission\s+fee|security\s+deposit|pay\s+(a\s+)?fee|fees?\s+applicable|"
+            r"₹\s*\d|rs\.?\s*\d|inr\s*\d|pay\s+to\s+(join|apply|register)|"
+            r"amount\s+(to\s+be\s+)?paid|one[- ]time\s+(fee|payment))\b",
+            jd,
+            flags=re.IGNORECASE,
+        )
+    )
+    if training_placement and asks_money:
+        reason = (
+            "RULE BROKEN: scam_paid_training_placement. "
+            "Training/placement internship asking for money — treat as scam."
+        )
+        logger.info("Hard shield rejected JD — %s", reason)
+        return {
+            "fit_score": 0,
+            "reason": reason,
+            "passed": False,
+            "rule_broken": "scam_paid_training_placement",
+            "matched_skills": [],
+            "missing_must_haves": [],
+            "recommended_track": "",
+        }
+
     exclude_terms = sorted(set(config_terms) | _BUILTIN_EXCLUSIONS)
     for term in exclude_terms:
         if term and term in jd:

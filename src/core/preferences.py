@@ -270,12 +270,18 @@ def rule_matches_jd(rule_text: str, jd_text: str) -> bool:
         m = re.search(pat, rule)
         if m:
             needle = m.group(1).strip().strip("\"'")
+            # Skip if this capture is only an "A" or "B" list of quotes (handled above)
+            if '"' in needle or "'" in needle:
+                continue
             if len(needle) >= 3 and needle in jd:
                 return True
 
+    # Token fallback ignores quoted phrases so "training fee" does not
+    # fire on every JD that merely says "training".
+    rule_unquoted = re.sub(r"[\"'][^\"']{3,}[\"']", " ", rule)
     tokens = [
         t
-        for t in re.findall(r"[a-z0-9][a-z0-9+\-]{2,}", rule)
+        for t in re.findall(r"[a-z0-9][a-z0-9+\-]{2,}", rule_unquoted)
         if t not in _STOP
     ]
     # Prefer distinctive multi-token phrases (whatsapp + community)

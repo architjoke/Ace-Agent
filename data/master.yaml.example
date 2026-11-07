@@ -1,12 +1,33 @@
 # Copy to data/master.yaml and fill with YOUR facts only.
 # Never invent employers, metrics, or skills. This is the RenderCV fact bank
 # the agent trims per job description.
+#
+# application_answers: browser/ATS form fill (ignored by RenderCV resume render).
+
+application_answers:
+  notice_period: "7 to 14 days"
+  earliest_join_date: "Within 7–14 days of offer acceptance"
+  phone_e164: "+91XXXXXXXXXX"
+  phone_display: "+91 XXXXXXXXXX"
+  phone_national: "XXXXXXXXXX"
+  phone_country_code: "+91"
+  city: "Your City"
+  state: "Your State"
+  country: "India"
+  pincode: "000000"
+  address_line: "City, State PIN, India"
+  work_authorization: "Authorized to work in India"
+  require_visa_sponsorship_india: "No"
+  willing_to_relocate_india: "Yes"
+  preferred_work_mode: "Remote, hybrid, or on-site"
+  expected_ctc: "As per company norms"
+  how_did_you_hear: "LinkedIn"
 
 cv:
   name: Your Full Name
   location: City, Region, Country
   email: you@example.com
-  phone: "+1 555 000 0000"
+  phone: "+91 XXXXXXXXXX"
   social_networks:
     - network: LinkedIn
       username: your-linkedin-slug
