@@ -1,0 +1,70 @@
+# ── Secrets & local env ──────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+token*.json
+
+# ── Python ───────────────────────────────────────────────────────
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ── IDE / OS ─────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Runtime output (generated per user — never publish) ──────────
+output/**
+!output/.gitkeep
+!output/Manual_Action/
+!output/Manual_Action/.gitkeep
+!output/Submitted/
+!output/Submitted/.gitkeep
+rendercv_output/
+.browser-use/
+
+# ── Personal profile & state (each fork fills these locally) ─────
+data/ace_memory.db
+data/ace_memory.db-*
+data/*.db
+data/ace_worker.pid
+data/browser_workers.json
+data/browser_profile/
+data/browser_profile_w*/
+data/lessons_learned.md
+data/master.yaml
+data/master_profile.yaml
+# Keep templates / placeholders tracked:
+!data/.gitkeep
+!data/master.yaml.example
+!data/lessons_learned.md.example
+
+# ── Personal resumes / media (users supply their own) ────────────
+resumes/**
+!resumes/.gitkeep
+!resumes/README.md
+
+# ── Logs & temp ──────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+.cache/

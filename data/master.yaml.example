@@ -1,0 +1,64 @@
+# Copy to data/master.yaml and fill with YOUR facts only.
+# Never invent employers, metrics, or skills. This is the RenderCV fact bank
+# the agent trims per job description.
+
+cv:
+  name: Your Full Name
+  location: City, Region, Country
+  email: you@example.com
+  phone: "+1 555 000 0000"
+  social_networks:
+    - network: LinkedIn
+      username: your-linkedin-slug
+    - network: GitHub
+      username: your-github
+
+  sections:
+    summary:
+      - "One dense paragraph: degree + stack + internship/project focus. Truthful only."
+
+    education:
+      - institution: Your University
+        area: Computer Science
+        degree: B.Tech / B.S.
+        start_date: "2023-08"
+        end_date: "2027-05"
+        location: City
+        highlights:
+          - "CGPA: X.X/10"
+          - "Coursework: DSA, OOP, OS, DBMS, Networks, ML."
+
+    experience:
+      - company: Example Intern Co
+        position: Software Engineering Intern
+        start_date: "2025-05"
+        end_date: "2025-08"
+        location: City / Remote
+        highlights:
+          - "Built X using Y; improved Z by measurable metric from fact bank only."
+          - "Second XYZ bullet with real stack (Python, React, SQL, …)."
+          - "Third XYZ bullet."
+
+    projects:
+      - name: Project One
+        date: "2025"
+        highlights:
+          - "What you built + tools (truthful)."
+          - "Second bullet."
+          - "Third bullet."
+      - name: Project Two
+        date: "2024"
+        highlights:
+          - "What you built + tools."
+          - "Second bullet."
+          - "Third bullet."
+
+    skills:
+      - label: Languages
+        details: Python, TypeScript, SQL
+      - label: Frameworks
+        details: React, Node.js, FastAPI
+      - label: ML / Data
+        details: Scikit-learn, PyTorch, Pandas
+      - label: Tools
+        details: Git, Docker, Linux

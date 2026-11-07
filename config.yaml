@@ -1,0 +1,110 @@
+# Ace Job Agent — user preferences (edit freely; no code changes needed)
+#
+# Hybrid LLM architecture
+#   browser-use (apply)  → Gemini vision/DOM ONLY
+#   draft/triage/fallback → Groq → NVIDIA → Ollama (env pins prefer head, keep chain)
+#   reflect/inbox         → Ollama → Groq → NVIDIA
+# Env ACE_*_PROVIDER / ACE_ALLOW_GEMINI_TEXT always override this block.
+
+llm:
+  draft: groq
+  triage: groq
+  fallback: groq
+  reflect: ollama
+  inbox: ollama
+  allow_gemini_text: false
+
+search_preferences:
+  locations:
+    - India
+  country_indeed: India
+  max_results_per_track: 25
+  # JobSpy site keys
+  sites:
+    - linkedin
+    - indeed
+    # glassdoor: Cloudflare bot walls block browser-use — skip for autonomous apply
+  tracks:
+    SDE: "Software Development Engineer OR Software Engineer Intern OR Backend Developer Intern OR Full Stack Developer Intern"
+    AI: "AI Engineer Intern OR AI Software Engineer OR Applied AI Engineer OR Generative AI Engineer Intern"
+    ML: "Machine Learning Engineer Intern OR ML Engineer Intern OR Deep Learning Engineer Intern OR Computer Vision Engineer Intern"
+
+filters:
+  minimum_fit_score: 72
+  require_paid: true
+  exclude_terms:
+    - unpaid
+    - volunteer
+    - "pay to apply"
+    - "5+ years"
+    - "security clearance"
+    - "us citizen"
+    - "u.s. citizen"
+    - "green card"
+    - senior
+
+# ATS gate is per company + JD (not one global bar).
+# Tailor loops until keyword coverage ≥ pass_score for THAT posting.
+ats:
+  default_pass_score: 85
+  min_pass_score: 75
+  max_pass_score: 95
+  # Optional hard overrides by company name (case-insensitive substring match)
+  company_pass_scores:
+    Google: 92
+    Microsoft: 90
+    Amazon: 90
+    Meta: 90
+    Apple: 90
+    Netflix: 90
+    Uber: 88
+    Atlassian: 88
+    Adobe: 88
+  # When no company override: raise/lower bar from JD keyword hardness
+  jd_hardness:
+    dense_supportable_raise: 5   # ≥12 supportable JD keywords
+    sparse_supportable_lower: 5  # ≤5 supportable JD keywords
+    unsupported_heavy_lower: 3   # many JD terms we cannot truthfully claim
+
+paths:
+  # Fact bank + durable state live under data/ (never commit secrets)
+  master_yaml: data/master.yaml
+  lessons_learned: data/lessons_learned.md
+  memory_db: data/ace_memory.db
+  output_dir: output
+
+browser:
+  # Persistent Chromium profile: log into Gmail / LinkedIn / ATS once, then reuse.
+  # Leave empty to use data/browser_profile (created automatically).
+  user_data_dir: data/browser_profile
+  profile_directory: Default
+  headless: false
+  # Parallel Chromium windows (cloned profiles w1…wN). Each keeps one window alive.
+  # Use 1 for calm single-window UX; 2–3 for throughput. Override: ACE_BROWSER_WORKERS.
+  workers: 2
+  # Soft LinkedIn Easy Apply cap across all workers (per hour / account).
+  linkedin_max_per_hour: 10
+  # Auto-submit is controlled by env ACE_AUTO_SUBMIT (default 1).
+  # Manual_Action packages are only created when browser submit fails.
+
+pipeline:
+  # Concurrent triage+tailor tasks (override ACE_TAILOR_WORKERS).
+  tailor_workers: 4
+  # Cap concurrent Groq/NVIDIA draft calls to avoid TPD cascades.
+  groq_concurrency: 2
+
+schedule:
+  pipeline_time: "08:00"
+  inbox_time: "19:00"
+  retrain_time: "19:30"
+  report_time: "20:00"
+
+email:
+  # IMAP for autonomous inbox outcome scanning (optional but recommended)
+  imap_host: imap.gmail.com
+  imap_port: 993
+  lookback_hours: 24
+  # SMTP for evening brief (optional)
+  smtp_host: smtp.gmail.com
+  smtp_port: 587
+  send_brief: false

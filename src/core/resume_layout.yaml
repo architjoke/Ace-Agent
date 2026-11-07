@@ -1,0 +1,114 @@
+# Ace visual layout — theme `ace` + volume-driven spacing presets.
+# Do NOT set design.page.*_margin — Typst crashes on RenderCV 2.3.
+#
+# Readable 1-pager: larger body type + clearer bullet gaps. Content selection
+# stays JD/track-driven in tailor.py; these presets only control chrome/spacing.
+
+theme: ace
+
+page:
+  size: a4
+  show_page_numbering: false
+  show_last_updated_date: false
+
+header:
+  vertical_space_between_name_and_connections: 0.32cm
+  vertical_space_between_connections_and_first_section: 0.38cm
+  use_icons_for_connections: true
+  use_urls_as_placeholders_for_connections: true
+  make_connections_links: true
+  separator_between_connections: "|"
+  horizontal_space_between_connections: 0.3cm
+  name_font_size: 23pt
+
+# Volume thresholds (highlight bullets across experience+projects)
+volume:
+  airy_max_bullets: 11
+  dense_min_bullets: 18
+
+presets:
+  # Open readable look when the JD draft is lighter.
+  airy:
+    text:
+      font_size: 10.5pt
+      leading: 0.66em
+    section_titles:
+      font_size: 1.28em
+      vertical_space_above: 0.42cm
+      vertical_space_below: 0.22cm
+    entries:
+      vertical_space_between_entries: 0.62em
+      date_and_location_width: 3.5cm
+      horizontal_space_between_columns: 0.14cm
+      left_and_right_margin: 0.04cm
+    highlights:
+      top_margin: 0.18cm
+      vertical_space_between_highlights: 0.22cm
+      horizontal_space_between_bullet_and_highlight: 0.42em
+      left_margin: 0.12cm
+
+  # Preferred readable handmade 1-pager.
+  balanced:
+    text:
+      font_size: 10.5pt
+      leading: 0.62em
+    section_titles:
+      font_size: 1.26em
+      vertical_space_above: 0.38cm
+      vertical_space_below: 0.2cm
+    entries:
+      vertical_space_between_entries: 0.52em
+      date_and_location_width: 3.45cm
+      horizontal_space_between_columns: 0.12cm
+      left_and_right_margin: 0.03cm
+    highlights:
+      top_margin: 0.16cm
+      vertical_space_between_highlights: 0.2cm
+      horizontal_space_between_bullet_and_highlight: 0.4em
+      left_margin: 0.1cm
+
+  # Still readable; used when balanced overflows one page.
+  dense:
+    text:
+      font_size: 10pt
+      leading: 0.58em
+    section_titles:
+      font_size: 1.24em
+      vertical_space_above: 0.34cm
+      vertical_space_below: 0.16cm
+    entries:
+      vertical_space_between_entries: 0.45em
+      date_and_location_width: 3.4cm
+      horizontal_space_between_columns: 0.1cm
+      left_and_right_margin: 0.02cm
+    highlights:
+      top_margin: 0.14cm
+      vertical_space_between_highlights: 0.17cm
+      horizontal_space_between_bullet_and_highlight: 0.38em
+      left_margin: 0.09cm
+
+  # Full-page readable fit for dense truthful drafts (JD-selected content).
+  # Clearer section breaks + slightly larger section names; still 1 page.
+  ultra_dense:
+    header:
+      vertical_space_between_name_and_connections: 0.26cm
+      vertical_space_between_connections_and_first_section: 0.28cm
+      horizontal_space_between_connections: 0.26cm
+      name_font_size: 22pt
+    text:
+      font_size: 10pt
+      leading: 0.55em
+    section_titles:
+      font_size: 1.2em
+      vertical_space_above: 0.28cm
+      vertical_space_below: 0.14cm
+    entries:
+      vertical_space_between_entries: 0.3em
+      date_and_location_width: 3.35cm
+      horizontal_space_between_columns: 0.09cm
+      left_and_right_margin: 0.02cm
+    highlights:
+      top_margin: 0.11cm
+      vertical_space_between_highlights: 0.14cm
+      horizontal_space_between_bullet_and_highlight: 0.38em
+      left_margin: 0.09cm

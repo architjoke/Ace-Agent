@@ -1,0 +1,22 @@
+python-jobspy
+google-genai
+langchain-google-genai
+langchain-groq
+# Keep groq<1 for langchain-groq; browser-use pins groq==1.0.0 but Gemini path does not need it.
+groq>=0.30.0,<1.0.0
+langchain-ollama
+langchain-nvidia-ai-endpoints
+langgraph
+langchain-core
+rendercv
+playwright
+browser-use
+pyyaml
+pandas
+pydantic
+scikit-learn
+nltk
+spacy
+python-dotenv
+schedule
+pypdf
