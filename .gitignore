@@ -68,3 +68,8 @@ resumes/**
 *.tmp
 *.bak
 .cache/
+
+# ── Test Chromium scratch profiles (never commit) ────────────────
+tests/mocks/_tmp_profile/
+**/SingletonLock
+**/DevToolsActivePort
