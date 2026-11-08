@@ -206,10 +206,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if cmd == "start":
-        return _start_worker(
-            getattr(args, "max_results_per_track", None),
-            getattr(args, "cycle_sleep", 900),
-        )
+        return _start_worker(args.max_results_per_track, args.cycle_sleep)
 
     if cmd == "stop":
         return _stop_worker()

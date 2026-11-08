@@ -12,7 +12,9 @@ from pydantic import BaseModel, Field, ValidationError
 
 from src.core.ats_playbook import ATS_MATCHING_DOCTRINE
 from src.core.llm_router import invoke_with_failover
+from src.core.prompts import EVALUATE_FIT, EVALUATE_FIT_JSON_HINT
 from src.core.settings import get_settings
+from src.core.utils import fit_reject
 
 logger = logging.getLogger(__name__)
 
@@ -95,19 +97,17 @@ class FitResult(TypedDict):
     recommended_track: str
 
 
+def _reject(rule: str, reason: str) -> FitResult:
+    """Log + return a hard-shield FitResult."""
+    logger.info("Hard shield rejected JD — %s", reason[:200])
+    return fit_reject(rule, reason)  # type: ignore[return-value]
+
+
 def _hard_config_reject(jd_text: str) -> FitResult | None:
     """Pure-Python shield — 0 tokens. Drops doomed JDs before any LLM call."""
     jd = (jd_text or "").lower()
     if not jd.strip():
-        return {
-            "fit_score": 0,
-            "reason": "RULE BROKEN: empty_jd. Job description missing.",
-            "passed": False,
-            "rule_broken": "empty_jd",
-            "matched_skills": [],
-            "missing_must_haves": [],
-            "recommended_track": "",
-        }
+        return _reject("empty_jd", "RULE BROKEN: empty_jd. Job description missing.")
 
     try:
         settings = get_settings()
@@ -130,20 +130,11 @@ def _hard_config_reject(jd_text: str) -> FitResult | None:
         jd,
         flags=re.IGNORECASE,
     ):
-        reason = (
+        return _reject(
+            "scam_whatsapp",
             "RULE BROKEN: scam_whatsapp. "
-            "Listing funnels to WhatsApp group/community — treat as scam."
+            "Listing funnels to WhatsApp group/community — treat as scam.",
         )
-        logger.info("Hard shield rejected JD — %s", reason)
-        return {
-            "fit_score": 0,
-            "reason": reason,
-            "passed": False,
-            "rule_broken": "scam_whatsapp",
-            "matched_skills": [],
-            "missing_must_haves": [],
-            "recommended_track": "",
-        }
 
     training_placement = bool(
         re.search(
@@ -164,81 +155,49 @@ def _hard_config_reject(jd_text: str) -> FitResult | None:
         )
     )
     if training_placement and asks_money:
-        reason = (
+        return _reject(
+            "scam_paid_training_placement",
             "RULE BROKEN: scam_paid_training_placement. "
-            "Training/placement internship asking for money — treat as scam."
+            "Training/placement internship asking for money — treat as scam.",
         )
-        logger.info("Hard shield rejected JD — %s", reason)
-        return {
-            "fit_score": 0,
-            "reason": reason,
-            "passed": False,
-            "rule_broken": "scam_paid_training_placement",
-            "matched_skills": [],
-            "missing_must_haves": [],
-            "recommended_track": "",
-        }
 
-    exclude_terms = sorted(set(config_terms) | _BUILTIN_EXCLUSIONS)
-    for term in exclude_terms:
-        if term and term in jd:
-            # Don't drop true intern roles solely on a bare "senior" substring
-            # inside "senior design project" noise — still drop role-title senior.
-            if term == "senior" and "intern" in jd and not re.search(
-                r"\bsenior\s+(software|engineer|developer|sde|role|position)\b", jd
-            ):
-                continue
-            reason = f"RULE BROKEN: config_exclude_term. Matched {term!r}."
-            logger.info("Hard shield rejected JD — %s", reason)
-            return {
-                "fit_score": 0,
-                "reason": reason,
-                "passed": False,
-                "rule_broken": "config_exclude_term",
-                "matched_skills": [],
-                "missing_must_haves": [],
-                "recommended_track": "",
-            }
+    for term in sorted(set(config_terms) | _BUILTIN_EXCLUSIONS):
+        if not term or term not in jd:
+            continue
+        # Don't drop true intern roles solely on a bare "senior" substring
+        # inside "senior design project" noise — still drop role-title senior.
+        if term == "senior" and "intern" in jd and not re.search(
+            r"\bsenior\s+(software|engineer|developer|sde|role|position)\b", jd
+        ):
+            continue
+        return _reject(
+            "config_exclude_term",
+            f"RULE BROKEN: config_exclude_term. Matched {term!r}.",
+        )
 
     if require_paid and (
         re.search(r"\bunpaid\b", jd)
         or re.search(r"\bvolunteer\b", jd)
         or "pay to apply" in jd
     ):
-        reason = "RULE BROKEN: unpaid_or_pay_to_apply. Deterministic compensation shield."
-        logger.info("Hard shield rejected JD — %s", reason)
-        return {
-            "fit_score": 0,
-            "reason": reason,
-            "passed": False,
-            "rule_broken": "unpaid_or_pay_to_apply",
-            "matched_skills": [],
-            "missing_must_haves": [],
-            "recommended_track": "",
-        }
+        return _reject(
+            "unpaid_or_pay_to_apply",
+            "RULE BROKEN: unpaid_or_pay_to_apply. Deterministic compensation shield.",
+        )
 
     for pattern in _SENIOR_PATTERNS:
-        if re.search(pattern, jd, flags=re.IGNORECASE):
-            if "intern" in jd and "senior" not in jd and re.search(
-                r"\b\d\+\s*years?\b", jd
-            ):
-                continue
-            if pattern == r"\bsenior\b" and "intern" in jd:
-                continue
-            reason = (
-                f"RULE BROKEN: senior_experience_required. "
-                f"Matched pattern={pattern!r}."
-            )
-            logger.info("Hard shield rejected JD — %s", reason)
-            return {
-                "fit_score": 0,
-                "reason": reason,
-                "passed": False,
-                "rule_broken": "senior_experience_required",
-                "matched_skills": [],
-                "missing_must_haves": [],
-                "recommended_track": "",
-            }
+        if not re.search(pattern, jd, flags=re.IGNORECASE):
+            continue
+        if "intern" in jd and "senior" not in jd and re.search(
+            r"\b\d\+\s*years?\b", jd
+        ):
+            continue
+        if pattern == r"\bsenior\b" and "intern" in jd:
+            continue
+        return _reject(
+            "senior_experience_required",
+            f"RULE BROKEN: senior_experience_required. Matched pattern={pattern!r}.",
+        )
 
     # Dynamic Preference Engine — HARD dealbreakers only (SOFT applied post-LLM).
     try:
@@ -246,16 +205,7 @@ def _hard_config_reject(jd_text: str) -> FitResult | None:
 
         hard_reason, _, _ = apply_preference_gate(jd_text)
         if hard_reason:
-            logger.info("HARD preference rejected JD — %s", hard_reason[:200])
-            return {
-                "fit_score": 0,
-                "reason": hard_reason,
-                "passed": False,
-                "rule_broken": "preference_hard",
-                "matched_skills": [],
-                "missing_must_haves": [],
-                "recommended_track": "",
-            }
+            return _reject("preference_hard", hard_reason)
     except Exception:
         logger.exception("Preference HARD gate crashed — continuing triage")
 
@@ -322,45 +272,11 @@ def evaluate_fit(
     else:
         fact_bank = str(master_yaml)
 
-    prompt = f"""You are a strict technical recruiter for an India-based CS student
-(graduation 2027, seeking PAID internships / entry-level roles only).
-
-{ATS_MATCHING_DOCTRINE}
-
-## HARD RULES — evaluate these FIRST, before skill fit
-If ANY rule fails, you MUST return fit_score=0, set rule_broken to the matching
-code, and begin reason with "RULE BROKEN: <rule>".
-
-1. unpaid_or_pay_to_apply — Discard if unpaid, volunteer-only, stipend-free
-   "experience" roles, or any job that requires the candidate to pay/fees.
-2. relocation_outside_india — Discard if the role requires physical relocation
-   or onsite attendance outside India. India onsite/hybrid/remote is OK.
-   Remote roles that hire and pay people located in India are OK.
-   Remote roles restricted to US/EU/other countries (not India) are NOT OK.
-3. senior_experience_required — Discard if the role clearly requires senior /
-   mid-senior full-time experience of 3+ years (or equivalent senior titles).
-   Internships, new-grad, and entry-level with 0–2 years are OK.
-
-Only if ALL hard rules pass, score skill/project fit from 1–100:
-- Extract JD must-have tools/languages/methods with exact phrasing.
-- matched_skills = JD terms with clear evidence in the fact bank.
-- missing_must_haves = critical JD requirements with no evidence.
-- recommended_track = SDE, AI, or ML based on JD emphasis.
-- High scores require overlap on repeated JD hard skills + relevant projects.
-- Do NOT invent experience. A role needing mostly unsupported stack should score <60.
-
-Return structured fields only.
-
-## Job Description
----
-{jd_text}
----
-
-## Master Fact Bank (RenderCV YAML)
----
-{fact_bank}
----
-"""
+    prompt = EVALUATE_FIT.format(
+        doctrine=ATS_MATCHING_DOCTRINE,
+        jd_text=jd_text,
+        fact_bank=fact_bank,
+    )
 
     try:
         assessment = invoke_with_failover(
@@ -377,10 +293,7 @@ Return structured fields only.
         assessment = _salvage_fit_from_text(
             invoke_with_failover(
                 "triage",
-                prompt
-                + "\n\nReply with ONLY a JSON object with keys: "
-                "fit_score, reason, rule_broken, matched_skills, "
-                "missing_must_haves, recommended_track.",
+                prompt + EVALUATE_FIT_JSON_HINT,
                 temperature=0,
             )
         )

@@ -13,7 +13,8 @@ from src.playbooks import PlaybookFallback
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_TIMEOUT_MS = 45_000
+# Per-action timeout (goto uses goto_dom's 15s). Keep fills/submits forgiving.
+_DEFAULT_TIMEOUT_MS = 30_000
 
 
 def _load_profile(master_yaml_path: Path) -> dict[str, Any]:
@@ -158,10 +159,13 @@ def run_greenhouse(
     context = None
     try:
         with sync_playwright() as p:
+            from src.playbooks._common import CHROMIUM_STEALTH_ARGS, pick_chrome_user_agent
+
             launch_kwargs: dict[str, Any] = {
                 "user_data_dir": str(profile),
                 "headless": use_headless,
-                "args": ["--disable-blink-features=AutomationControlled"],
+                "args": list(CHROMIUM_STEALTH_ARGS),
+                "user_agent": pick_chrome_user_agent(),
             }
             if proxy:
                 launch_kwargs["proxy"] = proxy
@@ -171,7 +175,9 @@ def run_greenhouse(
             page.set_default_timeout(timeout_ms)
 
             logger.info("Greenhouse playbook navigating %s", job_url)
-            page.goto(job_url, wait_until="domcontentloaded")
+            from src.playbooks._common import goto_dom
+
+            goto_dom(page, job_url)
 
             # Open application form if still on job description
             for label in (
@@ -331,9 +337,6 @@ def run_greenhouse(
     except PlaywrightTimeout as exc:
         raise TimeoutError(f"Greenhouse playbook timed out on {job_url}") from exc
     finally:
-        try:
-            if context is not None:
-                context.close()
-        except Exception:
-            logger.exception("Failed closing Greenhouse Playwright context")
-        browser = None  # noqa: F841 — persistent context owns browser
+        from src.playbooks._common import close_context_safe
+
+        close_context_safe(context, user_data_dir=user_data_dir)

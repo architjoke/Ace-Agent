@@ -18,7 +18,7 @@ from src.playbooks._common import (
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_TIMEOUT_MS = 45_000
+_DEFAULT_TIMEOUT_MS = 30_000
 
 
 def _is_ashby(job_url: str) -> bool:
@@ -192,7 +192,9 @@ def run_lever(
             )
             kind = "ashby" if ashby else "lever"
             logger.info("%s playbook navigating %s", kind.capitalize(), job_url)
-            page.goto(job_url, wait_until="domcontentloaded")
+            from src.playbooks._common import goto_dom
+
+            goto_dom(page, job_url)
             _click_apply(page)
 
             filled = _fill_ashby(page, fields) if ashby else _fill_lever(page, fields)
@@ -225,8 +227,6 @@ def run_lever(
     except PlaywrightTimeout as exc:
         raise TimeoutError(f"Lever/Ashby playbook timed out on {job_url}") from exc
     finally:
-        try:
-            if context is not None:
-                context.close()
-        except Exception:
-            logger.exception("Failed closing Lever/Ashby Playwright context")
+        from src.playbooks._common import close_context_safe
+
+        close_context_safe(context, user_data_dir=user_data_dir)

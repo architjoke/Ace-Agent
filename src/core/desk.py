@@ -119,6 +119,8 @@ def format_status() -> str:
             f"Unique companies touched: {counts['unique_companies']}",
             f"Auto-submitted (SUCCESS): {counts['staged_ready']}",
             f"Manual Action (couldn't submit): {counts['manual_action']} (folders: {len(manuals)})",
+            f"Already applied (skipped): {counts.get('already_applied', 0)}",
+            f"Timeout/stuck:            {counts.get('failed_timeout_or_stuck', 0)}",
             f"Failed:                   {counts['failed']}",
             f"Total attempted:          {counts['attempted']}",
             f"Awaiting recruiter reply: {counts['pending_outcomes']}",

@@ -27,6 +27,7 @@ from src.core.llm_router import (
 from src.core.config import OUTPUT_DIR as _DEFAULT_OUTPUT
 from src.core.config import PROJECT_ROOT, THEMES_DIR, resolve_master_yaml
 from src.core.llm_text import message_text
+from src.core.prompts import DRAFT_RESUME
 from src.core.reflect import load_lessons
 
 logger = logging.getLogger(__name__)
@@ -1230,9 +1231,7 @@ def _build_draft_prompt(state: State, *, compact: bool) -> str:
             len(master),
         )
 
-    lessons_block = (
-        f"## Lessons (follow)\n{lessons}\n" if lessons else ""
-    )
+    lessons_block = f"## Lessons (follow)\n{lessons}\n" if lessons else ""
     missing_block = (
         f"## Missing ATS keywords (integrate organically)\n{missing}\n"
         if missing
@@ -1247,71 +1246,28 @@ def _build_draft_prompt(state: State, *, compact: bool) -> str:
     prev_block = (
         f"## Previous draft\n---\n{prev_draft}\n---\n" if prev_draft.strip() else ""
     )
+    style_extra = (
+        ""
+        if compact
+        else f"## Resume Style Guide\n---\n{_load_style_guide()}\n---\n"
+    )
 
-    pass_score = int(state.get("ats_pass_score") or ATS_PASS_SCORE_DEFAULT)
-    company = state.get("company") or "Unknown"
-    style_extra = ""
-    if not compact:
-        style_extra = (
-            f"## Resume Style Guide\n---\n{_load_style_guide()}\n---\n"
-        )
-
-    return f"""You are an elite ATS resume writer. master_yaml is a FACT BANK only — never invent
-employers, titles, dates, tools, or metrics. Expand technical DEPTH by rephrasing
-true facts with the XYZ formula; do not invent history.
-
-DUAL GOAL:
-1) Dense 1-page fresher resume that fills the page (no sparse whitespace).
-2) ATS coverage ≥ {pass_score}% of supportable keywords for {company}.
-
-SECTION ORDER (exact):
-summary → education → experience → projects → skills → hackathons_and_activities
-
-DENSITY + TRUTH LAW (non-negotiable):
-- Experience: exactly 2 JD-best roles (MSG + Infosys preferred). EACH role has
-  3–4 impressive XYZ bullets rewritten ONLY from fact-bank highlights.
-- Projects: exactly 2 JD-best projects (prefer Road Inspection + Earthquake or
-  DCGAN). EACH has 3–4 weighty technical bullets from the fact bank.
-- NEVER invent metrics (%, req/day, mAP, F1, latency wins) unless present in facts.
-- NEVER invent orgs/events (no HackathonX, no GDSC) — use only RIDEhack / LNMIIT /
-  IIT Madras / Amazon ML / NEP Saarthi / workshops from the fact bank.
-- Bullets should feel handmade: strong verb + concrete stack + what shipped.
-  Bold 2–4 JD/tech tokens with **markdown**. Target ~120–170 chars.
-- Education: ONE college row; optional highlight exactly `CGPA: 8.8/10`.
-- Skills: 4–5 labeled groups from the fact bank (JD overlaps first).
-- hackathons_and_activities: 2–3 compact bullets from the fact bank.
-- Final PDF MUST be exactly ONE A4 page. No Class X/XII. No "Another U".
-- GitHub project links in `location` as [GitHub](url) when URL exists in facts.
-- Track: {track}. {track_brief(track)}
-
-Matching doctrine: rewrite for THIS JD and career track; mirror exact JD spellings
-when truthful; omit unsupported keywords; pick roles/projects that match the role
-family (SDE vs AI/ML vs Backend). Fill the page — do not leave sparse stub bullets.
-Layout/fonts are applied by the pipeline — do not invent a theme.
-
-Output ONLY one fenced ```yaml RenderCV document (cv + sections). Do NOT invent
-a theme — design is applied by the pipeline.
-
-{style_extra}{lessons_block}
-## Job Description
----
-{jd}
----
-
-## Fact Bank
----
-{master}
----
-
-## Required keywords (integrate organically)
-{required}
-
-## Unsupported (omit)
-{unsupported}
-
-{missing_block}{compile_block}{critique_block}{prev_block}
-Respond with ONLY a fenced ```yaml block containing the full RenderCV YAML.
-"""
+    return DRAFT_RESUME.format(
+        pass_score=int(state.get("ats_pass_score") or ATS_PASS_SCORE_DEFAULT),
+        company=state.get("company") or "Unknown",
+        track=track,
+        track_brief=track_brief(track),
+        style_extra=style_extra,
+        lessons_block=lessons_block,
+        jd=jd,
+        master=master,
+        required=required,
+        unsupported=unsupported,
+        missing_block=missing_block,
+        compile_block=compile_block,
+        critique_block=critique_block,
+        prev_block=prev_block,
+    )
 
 
 def draft_node(state: State) -> dict:

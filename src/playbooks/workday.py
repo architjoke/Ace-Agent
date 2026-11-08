@@ -16,7 +16,7 @@ from src.playbooks._common import (
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_TIMEOUT_MS = 20_000
+_DEFAULT_TIMEOUT_MS = 30_000
 _OVERALL_BUDGET_S = 120
 
 # Labels we know how to fill — anything else required → Gemini
@@ -242,7 +242,9 @@ def run_workday(
                 timeout_ms=timeout_ms,
             )
             logger.info("Workday playbook navigating %s", job_url)
-            page.goto(job_url, wait_until="domcontentloaded")
+            from src.playbooks._common import goto_dom
+
+            goto_dom(page, job_url)
             _start_apply(page)
 
             if not _upload_resume_aria(page, pdf):
@@ -295,8 +297,6 @@ def run_workday(
     except PlaywrightTimeout as exc:
         raise TimeoutError(f"Workday playbook timed out on {job_url}") from exc
     finally:
-        try:
-            if context is not None:
-                context.close()
-        except Exception:
-            logger.exception("Failed closing Workday Playwright context")
+        from src.playbooks._common import close_context_safe
+
+        close_context_safe(context, user_data_dir=user_data_dir)

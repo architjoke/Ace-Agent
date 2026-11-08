@@ -10,6 +10,49 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+# Anti-detection flags for Google OAuth / ATS persistent Chromium.
+CHROMIUM_STEALTH_ARGS: list[str] = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-infobars",
+]
+
+_CHROME_USER_AGENTS: tuple[str, ...] = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36",
+)
+
+
+def pick_chrome_user_agent() -> str:
+    """Stable-enough desktop Chrome UA (rotates lightly per process)."""
+    import random
+
+    return random.choice(_CHROME_USER_AGENTS)
+
+# DOM-ready navigation — ignore tracking-pixel networkidle hangs.
+GOTO_DOM_TIMEOUT_MS = 15_000
+
+
+def goto_dom(page, url: str, *, timeout_ms: int = GOTO_DOM_TIMEOUT_MS) -> None:
+    """Navigate with wait_until=domcontentloaded; one reload retry on timeout."""
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+    except Exception as first_exc:
+        logger.warning(
+            "goto_dom timeout/fail on %s (%s) — reloading once",
+            (url or "")[:160],
+            type(first_exc).__name__,
+        )
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
+        except Exception as reload_exc:
+            raise TimeoutError(
+                f"DOM navigation failed for {url[:160]}: {first_exc}; reload={reload_exc}"
+            ) from reload_exc
+
 
 def load_applicant_profile(master_yaml_path: Path) -> dict[str, Any]:
     data = yaml.safe_load(master_yaml_path.read_text(encoding="utf-8")) or {}
@@ -66,14 +109,31 @@ def clear_profile_locks(profile: Path) -> None:
             pass
 
 
+def close_context_safe(context, *, user_data_dir: Path | str | None = None) -> None:
+    """Close Playwright context and clear Chromium singleton locks."""
+    from src.core.settings import get_settings
+
+    try:
+        if context is not None:
+            context.close()
+    except Exception:
+        logger.exception("Failed closing Playwright context")
+    profile = Path(user_data_dir) if user_data_dir else Path(get_settings().browser_user_data_dir)
+    try:
+        clear_profile_locks(profile.expanduser().resolve())
+    except Exception:
+        pass
+
+
 def launch_persistent_context(
     playwright,
     *,
     user_data_dir: Path | str | None = None,
     headless: bool | None = None,
-    timeout_ms: int = 45_000,
+    timeout_ms: int = GOTO_DOM_TIMEOUT_MS,
+    proxy: dict[str, str] | None = None,
 ):
-    """Launch Chromium persistent context (cookies) + sticky proxy."""
+    """Launch Chromium persistent context (cookies) + sticky/override proxy."""
     from src.core.network import playwright_proxy_dict
     from src.core.settings import get_settings
 
@@ -84,14 +144,15 @@ def launch_persistent_context(
     clear_profile_locks(profile)
 
     use_headless = settings.browser_headless if headless is None else bool(headless)
-    proxy = playwright_proxy_dict()
+    proxy_cfg = proxy if proxy is not None else playwright_proxy_dict()
     launch_kwargs: dict[str, Any] = {
         "user_data_dir": str(profile),
         "headless": use_headless,
-        "args": ["--disable-blink-features=AutomationControlled"],
+        "args": list(CHROMIUM_STEALTH_ARGS),
+        "user_agent": pick_chrome_user_agent(),
     }
-    if proxy:
-        launch_kwargs["proxy"] = proxy
+    if proxy_cfg:
+        launch_kwargs["proxy"] = proxy_cfg
     context = playwright.chromium.launch_persistent_context(**launch_kwargs)
     page = context.pages[0] if context.pages else context.new_page()
     page.set_default_timeout(timeout_ms)

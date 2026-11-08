@@ -15,36 +15,38 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from src.core.llm_router import _build_provider, _is_failover_error, providers_for_role
+from src.core.prompts import COPILOT_SYSTEM
 from src.core.tools import READ_ONLY_TOOLS, get_copilot_tools
 
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 8
+SYSTEM_PROMPT = COPILOT_SYSTEM  # re-export for callers / tests
 
 _RETRY_IN_RE = re.compile(
     r"try again in\s+([0-9]+m)?\s*([0-9]+(?:\.[0-9]+)?s)?",
     re.IGNORECASE,
 )
+_TOKEN_LIMIT_NEEDLES = (
+    "429",
+    "rate_limit",
+    "rate limit",
+    "ratelimit",
+    "too many requests",
+    "tokens per day",
+    "tokens per minute",
+    "tpd",
+    "tpm",
+    "quota",
+    "resource_exhausted",
+    "token limit",
+    "daily token",
+)
 
 
 def _is_token_limit_error(exc: BaseException) -> bool:
     msg = str(exc).lower()
-    needles = (
-        "429",
-        "rate_limit",
-        "rate limit",
-        "ratelimit",
-        "too many requests",
-        "tokens per day",
-        "tokens per minute",
-        "tpd",
-        "tpm",
-        "quota",
-        "resource_exhausted",
-        "token limit",
-        "daily token",
-    )
-    return any(n in msg for n in needles)
+    return any(n in msg for n in _TOKEN_LIMIT_NEEDLES)
 
 
 def _retry_hint(exc: BaseException) -> str:
@@ -52,14 +54,11 @@ def _retry_hint(exc: BaseException) -> str:
     if not match:
         return ""
     parts = [p for p in match.groups() if p]
-    if not parts:
-        return ""
-    return " Try again in about " + " ".join(parts) + "."
+    return (" Try again in about " + " ".join(parts) + ".") if parts else ""
 
 
 def _guess_provider(exc: BaseException) -> str:
-    msg = str(exc)
-    lower = msg.lower()
+    lower = str(exc).lower()
     explicit = re.search(r"last was (\w+)", lower)
     if explicit:
         return explicit.group(1)
@@ -74,9 +73,10 @@ def _guess_provider(exc: BaseException) -> str:
 def _format_model_failure(exc: BaseException, *, partial_tools: bool = False) -> str:
     """Plain-language Ace> message so the user knows why chat stopped."""
     if _is_token_limit_error(exc):
-        retry = _retry_hint(exc)
-        provider = _guess_provider(exc)
-        head = f"Failed: {provider} hit its token/rate limit.{retry}"
+        head = (
+            f"Failed: {_guess_provider(exc)} hit its token/rate limit."
+            f"{_retry_hint(exc)}"
+        )
         if partial_tools:
             return (
                 f"Ace> {head}\n"
@@ -95,68 +95,6 @@ def _format_model_failure(exc: BaseException, *, partial_tools: bool = False) ->
             "status or repeat the request."
         )
     return f"Ace> Model error: {exc}"
-
-
-SYSTEM_PROMPT = """You are the Ace Job Agent Copilot.
-
-Your job is to listen to the user, update application states, clean up manual folders,
-and permanently learn new behavioral rules via tools.
-
-You may ONLY use these tools:
-- find_companies (fuzzy lookup — use when the company is unclear or Ambiguous)
-- mark_application_submitted
-- cleanup_manual_folder
-- memorize_new_rule (ALWAYS use this for behavioral / form / filter / tailor instructions)
-- update_config_preference (allowlisted config.yaml SYSTEM settings only)
-
-Tool routing (critical):
-- config.yaml = search locations, fit scores, workers, headless — NOT form text.
-- lessons_learned / memorize_new_rule = "when you apply…", notice period, phone/PIN
-  wording, don't-apply filters, resume/cover instructions.
-- If unsure between config vs behavior → memorize_new_rule.
-
-Few-shot examples:
-Example 1: User says "Only look in Pune."
-  → Action: update_config_preference(target_key="search_preferences.locations", new_value="Pune")
-
-Example 2: User says "When asked for notice period, put 2 weeks."
-  → Action: memorize_new_rule(category="APPLY_BEHAVIOR",
-       rule_text="When asked for notice period, always input 1-14 days",
-       enforcement_level="HARD")
-
-Example 3: User says "Never apply to unpaid roles."
-  → Action: memorize_new_rule(category="JOB_FILTERING",
-       rule_text="Never apply to unpaid roles.",
-       enforcement_level="HARD")
-
-Example 4: User says "i applied midbrain"
-  → Action: mark_application_submitted(company_name="midbrain") AND
-            cleanup_manual_folder(company_name="midbrain") in one turn
-
-Company name understanding:
-- Partial names OK ("midbrain"); tools fuzzy-resolve. Prefer mark+cleanup together
-  on clear apply/submit intents. find_companies only if unclear/Ambiguous.
-- If find_companies (or mark/cleanup) says Ambiguous, ask the user which candidate.
-
-Dynamic Preference Engine:
-- HARD = dealbreaker; SOFT = -15 fit penalty.
-- When memorizing, set enforcement_level to HARD for absolute dealbreakers
-  (e.g. WhatsApp community, unpaid, must relocate abroad).
-- Set enforcement_level to SOFT for fluid tastes (e.g. prefer remote, avoid tiny startups).
-
-STRICTLY FORBIDDEN:
-- Deleting source code, wiping the SQLite database, or resetting the agent's core memory.
-- If the user asks to "reset everything", "wipe memory", "delete all rules", or
-  "forget your training", you MUST refuse in plain language and call NO tools.
-- Never invent a shell/SQL/file tool. You do not have them.
-- Wipe DB / delete source / invent shell-SQL tools / "reset all memory".
-
-Self-correction:
-- If a tool returns "Tool execution failed: …", fix the arguments or choose a different
-  allowed tool. Do not invent non-allowlisted config keys or tools that do not exist.
-
-Be concise. After tools run, summarize what changed.
-"""
 
 
 @dataclass(frozen=True)

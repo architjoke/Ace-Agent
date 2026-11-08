@@ -9,7 +9,15 @@ from pathlib import Path
 
 from src.core.settings import get_settings
 
-VALID_STATUSES = frozenset({"SUCCESS", "FAILED", "MANUAL_ACTION"})
+VALID_STATUSES = frozenset(
+    {
+        "SUCCESS",
+        "FAILED",
+        "MANUAL_ACTION",
+        "ALREADY_APPLIED",
+        "FAILED_TIMEOUT_OR_STUCK",
+    }
+)
 VALID_OUTCOMES = frozenset(
     {"PENDING", "REJECTED", "INTERVIEW_INVITE", "ASSESSMENT", "UNCLEAR", "SELECTED"}
 )
@@ -102,6 +110,58 @@ def has_applied(job_url: str, db_path: Path | None = None) -> bool:
             (url,),
         ).fetchone()
     return row is not None
+
+
+def has_successful_apply(job_url: str, db_path: Path | None = None) -> bool:
+    """True if this job_url already has status SUCCESS."""
+    url = (job_url or "").strip()
+    if not url:
+        return False
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM applications WHERE job_url = ? AND status = 'SUCCESS' LIMIT 1",
+            (url,),
+        ).fetchone()
+    return row is not None
+
+
+def has_successful_company_apply(
+    company: str,
+    *,
+    within_days: int = 30,
+    db_path: Path | None = None,
+) -> bool:
+    """True if a SUCCESS apply exists for this company within within_days."""
+    needle = _norm_company(company)
+    if not needle:
+        return False
+    days = max(1, int(within_days))
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT company, timestamp FROM applications
+            WHERE status = 'SUCCESS'
+            ORDER BY id DESC
+            LIMIT 500
+            """
+        ).fetchall()
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        if _norm_company(str(row["company"] or "")) != needle:
+            continue
+        ts_raw = str(row["timestamp"] or "").strip()
+        if not ts_raw:
+            return True
+        try:
+            ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age_days = (now - ts).total_seconds() / 86400.0
+            if age_days <= days:
+                return True
+        except ValueError:
+            return True
+    return False
 
 
 def log_application(
@@ -323,11 +383,15 @@ def application_counts(db_path: Path | None = None) -> dict[str, int]:
     staged = by_status.get("SUCCESS", 0)
     manual = by_status.get("MANUAL_ACTION", 0)
     failed = by_status.get("FAILED", 0)
+    already = by_status.get("ALREADY_APPLIED", 0)
+    stuck = by_status.get("FAILED_TIMEOUT_OR_STUCK", 0)
     return {
         "staged_ready": staged,
         "manual_action": manual,
         "failed": failed,
-        "attempted": staged + manual + failed,
+        "already_applied": already,
+        "failed_timeout_or_stuck": stuck,
+        "attempted": staged + manual + failed + already + stuck,
         "unique_companies": int(companies or 0),
         "pending_outcomes": int(pending_outcomes or 0),
         **{f"status_{k.lower()}": v for k, v in by_status.items()},

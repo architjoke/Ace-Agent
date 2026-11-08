@@ -20,6 +20,7 @@ from src.core.discovery import (
 )
 from src.core.evaluate import evaluate_fit
 from src.core.executor import (
+    AlreadyAppliedError,
     ApplicationBlockedError,
     ApplicationTimeoutError,
     APPLY_RESUME_FILENAME,
@@ -29,7 +30,13 @@ from src.core.executor import (
     unique_apply_pdf,
 )
 from src.core.fallback import generate_manual_package
-from src.core.memory import has_applied, init_db, log_application
+from src.core.memory import (
+    has_applied,
+    has_successful_apply,
+    has_successful_company_apply,
+    init_db,
+    log_application,
+)
 from src.core.queue import enqueue_apply, init_queue, queue_counts
 from src.core.settings import get_settings, reload_settings
 from src.core.config import OUTPUT_DIR, PROJECT_ROOT
@@ -185,10 +192,30 @@ async def apply_job(
     cleanup_linkedin_resume: bool = False,
     job_url_direct: str = "",
 ) -> str:
-    """Browser-only apply. Returns success|fallback|failed."""
+    """Browser-only apply. Returns success|fallback|failed|already_applied|timeout."""
     skip_browser = is_aggregator_listing(job_url) and not is_applyable_url(
         job_url_direct or ""
     )
+
+    # Phase 1A: DB fast-fail before Chromium.
+    if has_successful_apply(job_url):
+        reason = "db_success_url"
+    elif has_successful_company_apply(company):
+        reason = "db_success_company_30d"
+    else:
+        reason = ""
+    if reason:
+        logger.info("Skipping %s — already SUCCESS in memory (%s)", company, reason)
+        log_application(
+            company,
+            job_url,
+            track,
+            "ALREADY_APPLIED",
+            error_log=reason,
+            jd_text=jd_text,
+            tailored_yaml_snapshot=yaml_snapshot,
+        )
+        return "already_applied"
 
     try:
         if skip_browser:
@@ -220,7 +247,35 @@ async def apply_job(
             _cleanup_tailored_artifacts(company, pdf_path)
             return "success"
         raise RuntimeError("execute_application returned False")
-    except (ApplicationBlockedError, ApplicationTimeoutError, Exception) as exc:
+    except AlreadyAppliedError as exc:
+        logger.info("[skip] Already applied %s — %s", company, exc)
+        log_application(
+            company,
+            job_url,
+            track,
+            "ALREADY_APPLIED",
+            error_log=str(exc),
+            jd_text=jd_text,
+            tailored_yaml_snapshot=yaml_snapshot,
+        )
+        return "already_applied"
+    except ApplicationTimeoutError as exc:
+        logger.warning(
+            "[timeout] %s stuck/timeout — skipping Manual_Action (%s)",
+            company,
+            exc,
+        )
+        log_application(
+            company,
+            job_url,
+            track,
+            "FAILED_TIMEOUT_OR_STUCK",
+            error_log=f"{type(exc).__name__}: {exc}",
+            jd_text=jd_text,
+            tailored_yaml_snapshot=yaml_snapshot,
+        )
+        return "timeout"
+    except (ApplicationBlockedError, Exception) as exc:
         logger.warning(
             "[!] Could not auto-submit %s — Manual_Action package. (%s: %s)",
             company,

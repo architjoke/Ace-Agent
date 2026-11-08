@@ -12,19 +12,26 @@ import yaml
 from browser_use import Agent, ChatGoogle
 from browser_use.browser.profile import BrowserProfile
 
+from src.core.prompts import (
+    BROWSER_SYSTEM_EXTENSION,
+    TASK_AUTO,
+    TASK_LINKEDIN_CLEANUP,
+    TASK_REVIEW,
+)
 from src.core.reflect import load_lessons
 from src.core.settings import get_settings
+from src.core.utils import env_truthy
 
 logger = logging.getLogger(__name__)
 
 from src.core.llm_router import gemini_browser_model_name
 
 MODEL = gemini_browser_model_name()
-# Easy Apply defaults (Workday/ATS get a higher budget via URL heuristics).
-DEFAULT_TIMEOUT_SECONDS = int(os.environ.get("ACE_BROWSER_USE_TIMEOUT_SECONDS", "420"))
-DEFAULT_MAX_STEPS = int(os.environ.get("ACE_BROWSER_USE_MAX_STEPS", "50"))
-WORKDAY_TIMEOUT_SECONDS = int(os.environ.get("ACE_WORKDAY_TIMEOUT_SECONDS", "900"))
-WORKDAY_MAX_STEPS = int(os.environ.get("ACE_WORKDAY_MAX_STEPS", "120"))
+# Easy Apply defaults (Workday/ATS get a modestly higher budget via URL heuristics).
+DEFAULT_TIMEOUT_SECONDS = int(os.environ.get("ACE_BROWSER_USE_TIMEOUT_SECONDS", "180"))
+DEFAULT_MAX_STEPS = int(os.environ.get("ACE_BROWSER_USE_MAX_STEPS", "10"))
+WORKDAY_TIMEOUT_SECONDS = int(os.environ.get("ACE_WORKDAY_TIMEOUT_SECONDS", "300"))
+WORKDAY_MAX_STEPS = int(os.environ.get("ACE_WORKDAY_MAX_STEPS", "20"))
 SUBMITTED_TOKEN = "APPLICATION_SUBMITTED"
 READY_TOKEN = "READY_FOR_REVIEW"  # legacy / dry-run only
 CLEANUP_TOKEN = "LINKEDIN_RESUME_DELETED"
@@ -75,78 +82,6 @@ _BLOCK_MARKERS = (
     "unusual traffic",
 )
 
-_TASK_TEMPLATE_AUTO = """Navigate to {job_url}.
-
-You are AUTONOMOUSLY APPLYING for this job.
-
-## Resume — ALWAYS upload from disk (never reuse LinkedIn library)
-Absolute path (ONLY this file):
-{pdf_abs_path}
-On-screen name must show: {pdf_stem}
-
-### LinkedIn Easy Apply — mandatory resume steps
-1) Click Easy Apply.
-2) On the Resume step you MUST:
-   - Do NOT select any already-listed resume — even one with the same display name.
-   - Always click **Upload resume** / **Upload file** / **Replace** (fresh file from disk).
-   - Use upload_file with path = {pdf_abs_path}.
-   - Confirm the attached file shows as "{pdf_filename}" / "{pdf_stem}".
-3) Only then click Next through remaining questions.
-4) On Review, confirm that same file is attached, then **Submit application**.
-5) Wait for confirmation ("Application submitted" / "Your application was sent").
-
-### Other ATS (Indeed / Greenhouse / Lever / Workday / Keka / careers pages)
-Always upload {pdf_abs_path} via the file input — never reuse a previously saved CV.
-
-## Form filling (mandatory)
-Use the APPLICATION FORM ANSWERS block below for every matching field.
-- Phone: use phone_country_code + phone_national / phone_display (never invent another country).
-- Notice / availability / join date: use notice_period / earliest_join_date (never claim same-day join unless forced — then pick within that window).
-- Address / pincode / ZIP / postal: use the listed city, state, country, pincode fields.
-- Do not invent street/house numbers if not listed — use city/state/PIN/country.
-- Never fabricate salary history, foreign citizenship, or security-clearance eligibility.
-
-## HARD RULES
-- ALWAYS upload from the disk path above — never click a previously listed LinkedIn resume.
-- NEVER click Next/Submit until "{pdf_stem}" is visibly attached from this upload.
-- On CAPTCHA / Cloudflare / login wall you cannot clear: stop and describe the blocker.
-- SCAM ABORT: If the form/JD asks to join a WhatsApp group/community/channel, or is a
-  "training and placement" internship that asks for any fee/amount/deposit — STOP.
-  Do NOT submit. Describe the scam signal and leave (treat as blocked).
-- After real confirmation UI, output exactly: {submitted_token}
-"""
-
-_TASK_TEMPLATE_REVIEW = """Navigate to {job_url}.
-
-ALWAYS upload resume from disk (never select an old LinkedIn resume):
-{pdf_abs_path}
-On-screen name should be: {pdf_filename}
-
-## Form filling (mandatory)
-Use the APPLICATION FORM ANSWERS block below for phone, notice/join window,
-address/pincode, and other listed fields. Do not invent unsupported facts.
-
-DO NOT click final Submit. When filled + OUR file is attached, output: {ready_token}
-"""
-
-_TASK_TEMPLATE_LINKEDIN_CLEANUP = """Go to LinkedIn Job application settings / Resumes library:
-{resumes_url}
-
-Goal: DELETE the agent-uploaded resume named exactly:
-{pdf_filename}
-
-Steps:
-1) Open Resumes (Jobs → Preferences → Job application settings → Resumes).
-2) Find "{pdf_filename}" in the uploaded list (exact agent upload name).
-3) Delete / Remove ONLY that file.
-4) NEVER delete these permanent resumes (user keep-list):
-{keep_list}
-5) When "{pdf_filename}" is gone (or already absent), output exactly: {cleanup_token}
-
-Abort on CAPTCHA. Do not touch any other resume.
-"""
-
-
 class ApplicationBlockedError(RuntimeError):
     """Raised when the browser agent is permanently blocked (CAPTCHA / hard wall)."""
 
@@ -155,9 +90,12 @@ class ApplicationTimeoutError(TimeoutError):
     """Raised when the browser agent exceeds the allowed wall-clock timeout."""
 
 
+class AlreadyAppliedError(RuntimeError):
+    """Raised when DB or DOM indicates this job was already applied to."""
+
+
 def _auto_submit_enabled() -> bool:
-    raw = (os.environ.get("ACE_AUTO_SUBMIT") or "1").strip().lower()
-    return raw not in {"0", "false", "no", "off"}
+    return env_truthy("ACE_AUTO_SUBMIT", "1")
 
 
 def _keep_resume_names() -> list[str]:
@@ -242,14 +180,11 @@ def _browser_profile(user_data_dir: Path | str | None = None) -> BrowserProfile:
                     pass
         except OSError:
             pass
-    # keep_alive=True: reuse one Chromium window across applies (no open/close flash).
-    keep = (os.environ.get("ACE_BROWSER_KEEP_ALIVE") or "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
+    # keep_alive default OFF — tear down Chromium after each apply (anti-zombie).
+    # Google/LinkedIn cookies still persist via user_data_dir on disk.
+    keep = env_truthy("ACE_BROWSER_KEEP_ALIVE", "0")
     from src.core.network import browser_proxy_settings
+    from src.playbooks._common import CHROMIUM_STEALTH_ARGS, pick_chrome_user_agent
 
     proxy = browser_proxy_settings()
     if proxy is not None:
@@ -260,6 +195,14 @@ def _browser_profile(user_data_dir: Path | str | None = None) -> BrowserProfile:
         headless=settings.browser_headless,
         keep_alive=keep,
         proxy=proxy,
+        args=list(CHROMIUM_STEALTH_ARGS),
+        user_agent=pick_chrome_user_agent(),
+        # Leave allowed_domains unset so accounts.google.com OAuth popups work.
+        cross_origin_iframes=True,
+        # Fluidity: take control on DOM-ready; do not wait on tracking pixels.
+        minimum_wait_page_load_time=0.1,
+        wait_for_network_idle_page_load_time=0.15,
+        wait_between_actions=0.05,
     )
 
 
@@ -391,6 +334,159 @@ def _reached_token(history, token: str, *, pdf_stem: str = "") -> bool:
     return history.is_done() and any(m in lower for m in markers)
 
 
+STUCK_OBSERVATION = (
+    "[SYSTEM] Your last actions had no effect. A modal may be blocking the screen, "
+    "or the element is unclickable. Re-evaluate the screen and attempt an alternate "
+    "route, or look for a Close/X button."
+)
+
+
+class _StuckStateTracker:
+    """Detect unchanged URL+DOM fingerprints across consecutive agent steps."""
+
+    def __init__(self, agent_ref: dict) -> None:
+        self._agent_ref = agent_ref
+        self._last_fp: str | None = None
+        self._same_streak = 0
+        self._stuck_events = 0
+
+    def _fingerprint(self, browser_state) -> str:
+        url = ""
+        for attr in ("url", "current_page_url", "page_url"):
+            val = getattr(browser_state, attr, None)
+            if val:
+                url = str(val)
+                break
+        if not url:
+            try:
+                url = str(getattr(browser_state, "tabs", "") or "")[:200]
+            except Exception:
+                url = ""
+        n_els = 0
+        for attr in ("selector_map", "interacted_element", "elements", "dom_items"):
+            val = getattr(browser_state, attr, None)
+            if val is None:
+                continue
+            try:
+                n_els = len(val)
+                break
+            except TypeError:
+                continue
+        # Fallback: hash a short string representation of interactive summary
+        extra = ""
+        summary = getattr(browser_state, "element_tree", None) or getattr(
+            browser_state, "dom_state", None
+        )
+        if summary is not None:
+            extra = str(type(summary).__name__) + str(hash(str(summary)[:800]) % 10_000_000)
+        return f"{url}|{n_els}|{extra}"
+
+    def _inject_observation(self, agent: Agent | None) -> bool:
+        if agent is None:
+            return False
+        mm = getattr(agent, "message_manager", None) or getattr(agent, "state", None)
+        # Try common browser-use injection points
+        for target_name in ("message_manager", "state"):
+            target = getattr(agent, target_name, None)
+            if target is None:
+                continue
+            for meth_name in (
+                "add_message",
+                "add_state_message",
+                "add_new_task",
+                "add_context",
+            ):
+                meth = getattr(target, meth_name, None)
+                if not callable(meth):
+                    continue
+                try:
+                    meth(STUCK_OBSERVATION)
+                    return True
+                except TypeError:
+                    try:
+                        meth(role="system", content=STUCK_OBSERVATION)
+                        return True
+                    except Exception:
+                        continue
+                except Exception:
+                    continue
+        # Last resort: append to task string for next reasoning turn visibility
+        try:
+            if hasattr(agent, "task") and isinstance(agent.task, str):
+                if STUCK_OBSERVATION not in agent.task:
+                    agent.task = f"{agent.task}\n\n{STUCK_OBSERVATION}"
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def __call__(self, browser_state, model_output, step_number: int) -> None:
+        fp = self._fingerprint(browser_state)
+        if self._last_fp is not None and fp == self._last_fp:
+            self._same_streak += 1
+        else:
+            self._same_streak = 0
+        self._last_fp = fp
+
+        # Unchanged for 2 consecutive steps after an action → stuck
+        if self._same_streak < 2:
+            return
+
+        self._stuck_events += 1
+        agent = self._agent_ref.get("agent")
+        injected = self._inject_observation(agent)
+        logger.warning(
+            "Stuck-state detected (streak=%s events=%s step=%s injected=%s fp=%s)",
+            self._same_streak,
+            self._stuck_events,
+            step_number,
+            injected,
+            fp[:160],
+        )
+        # After 2 stuck detections (≈4 identical fingerprints), fail fast
+        if self._stuck_events >= 2:
+            raise ApplicationTimeoutError(
+                "stuck_state: URL/DOM fingerprint unchanged across repeated steps"
+            )
+
+
+async def _force_close_agent(agent: Agent | None, user_data_dir: Path | str | None) -> None:
+    """Best-effort Chromium teardown so the next job starts clean."""
+    if agent is not None:
+        for attr in ("close", "stop"):
+            fn = getattr(agent, attr, None)
+            if callable(fn):
+                try:
+                    result = fn()
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception:
+                    logger.debug("agent.%s teardown failed", attr, exc_info=True)
+        browser = getattr(agent, "browser", None) or getattr(agent, "browser_session", None)
+        if browser is not None:
+            for attr in ("close", "kill", "stop"):
+                fn = getattr(browser, attr, None)
+                if callable(fn):
+                    try:
+                        result = fn()
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception:
+                        logger.debug("browser.%s teardown failed", attr, exc_info=True)
+    # Clear Chromium singleton locks so the next launch is not blocked.
+    try:
+        profile = Path(user_data_dir) if user_data_dir else Path(get_settings().browser_user_data_dir)
+        profile = profile.expanduser().resolve()
+        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            lock = profile / name
+            try:
+                lock.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except Exception:
+        logger.debug("profile lock clear failed", exc_info=True)
+
+
 async def _run_agent(
     task: str,
     file_paths: list[str],
@@ -401,19 +497,34 @@ async def _run_agent(
 ) -> object:
     api_key = _api_key()
     llm = _build_llm(api_key)
-    agent = Agent(
+    agent_ref: dict = {"agent": None}
+    stuck = _StuckStateTracker(agent_ref)
+    agent: Agent | None = Agent(
         task=task,
         llm=llm,
         browser_profile=_browser_profile(user_data_dir),
         use_vision=True,
         available_file_paths=file_paths,
         max_failures=8,
+        max_actions_per_step=12,
+        extend_system_message=BROWSER_SYSTEM_EXTENSION,
+        register_new_step_callback=stuck,
     )
+    agent_ref["agent"] = agent
     wall = int(timeout_seconds if timeout_seconds is not None else DEFAULT_TIMEOUT_SECONDS)
-    return await asyncio.wait_for(
-        agent.run(max_steps=max_steps),
-        timeout=wall,
-    )
+    try:
+        return await asyncio.wait_for(
+            agent.run(max_steps=max_steps),
+            timeout=wall,
+        )
+    except ApplicationTimeoutError:
+        raise
+    except TimeoutError as exc:
+        raise ApplicationTimeoutError(
+            f"browser-use agent timed out after {wall}s"
+        ) from exc
+    finally:
+        await _force_close_agent(agent, user_data_dir)
 
 
 async def cleanup_linkedin_uploaded_resume(
@@ -429,7 +540,7 @@ async def cleanup_linkedin_uploaded_resume(
     keep = _keep_resume_names()
     keep_list = "\n".join(f"  - {name}" for name in keep)
     filename = APPLY_RESUME_FILENAME
-    task = _TASK_TEMPLATE_LINKEDIN_CLEANUP.format(
+    task = TASK_LINKEDIN_CLEANUP.format(
         resumes_url=LINKEDIN_RESUMES_URL,
         pdf_filename=filename,
         keep_list=keep_list,
@@ -444,8 +555,8 @@ async def cleanup_linkedin_uploaded_resume(
         history = await _run_agent(
             task,
             [],
-            max_steps=40,
-            timeout_seconds=300,
+            max_steps=12,
+            timeout_seconds=180,
             user_data_dir=user_data_dir,
         )
     except TimeoutError:
@@ -464,6 +575,50 @@ async def cleanup_linkedin_uploaded_resume(
             filename,
         )
     return ok
+
+
+async def _run_ats_playbook(
+    kind: str,
+    job_url: str,
+    pdf_path: Path,
+    master_path: Path,
+    *,
+    user_data_dir: Path | str | None = None,
+) -> bool:
+    """Dispatch to the DOM playbook for a classified ATS kind."""
+    logger.info("ATS router → %s playbook for %s", kind, job_url)
+    if kind == "greenhouse":
+        from src.playbooks.greenhouse import run_greenhouse
+
+        return await asyncio.to_thread(
+            run_greenhouse,
+            job_url,
+            pdf_path,
+            master_path,
+            user_data_dir=user_data_dir,
+        )
+    if kind in {"lever", "ashby"}:
+        from src.playbooks.lever import run_lever
+
+        return await asyncio.to_thread(
+            run_lever,
+            job_url,
+            pdf_path,
+            master_path,
+            user_data_dir=user_data_dir,
+            ats=kind,
+        )
+    if kind == "workday":
+        from src.playbooks.workday import run_workday
+
+        return await asyncio.to_thread(
+            run_workday,
+            job_url,
+            pdf_path,
+            master_path,
+            user_data_dir=user_data_dir,
+        )
+    return False
 
 
 async def execute_application(
@@ -499,60 +654,73 @@ async def execute_application(
         else ("linkedin.com" in job_url.lower())
     )
 
+    # Phase 1B: DOM fast-fail before playbook / Gemini token burn.
+    from src.core.already_applied import probe_already_applied
+
+    already = await asyncio.to_thread(
+        probe_already_applied, job_url, user_data_dir=user_data_dir
+    )
+    if already:
+        raise AlreadyAppliedError(f"DOM already-applied signal at {job_url[:160]}")
+
     from src.playbooks import PlaybookFallback, classify_ats
 
     kind = classify_ats(job_url)
+    # Known ATS: deterministic playbooks first (fast). Semantic/Gemini only as fallback.
     if do_submit and kind in {"greenhouse", "lever", "ashby", "workday"}:
         try:
-            ok = False
-            if kind == "greenhouse":
-                from src.playbooks.greenhouse import run_greenhouse
-
-                logger.info("ATS router → greenhouse playbook for %s", job_url)
-                ok = await asyncio.to_thread(
-                    run_greenhouse,
-                    job_url,
-                    pdf_path,
-                    master_path,
-                    user_data_dir=user_data_dir,
-                )
-            elif kind in {"lever", "ashby"}:
-                from src.playbooks.lever import run_lever
-
-                logger.info("ATS router → %s playbook for %s", kind, job_url)
-                ok = await asyncio.to_thread(
-                    run_lever,
-                    job_url,
-                    pdf_path,
-                    master_path,
-                    user_data_dir=user_data_dir,
-                    ats=kind,
-                )
-            elif kind == "workday":
-                from src.playbooks.workday import run_workday
-
-                logger.info("ATS router → workday playbook for %s", job_url)
-                ok = await asyncio.to_thread(
-                    run_workday,
-                    job_url,
-                    pdf_path,
-                    master_path,
-                    user_data_dir=user_data_dir,
-                )
+            ok = await _run_ats_playbook(
+                kind, job_url, pdf_path, master_path, user_data_dir=user_data_dir
+            )
             if ok:
                 logger.info("%s playbook succeeded for %s", kind, job_url)
                 return True
         except (TimeoutError, PlaybookFallback) as exc:
             logger.warning(
-                "ATS playbook stuck → Gemini handoff (kind=%s, reason=%s)",
+                "ATS playbook stuck → semantic/Gemini handoff (kind=%s, reason=%s)",
                 kind,
                 exc,
             )
+            try:
+                from src.core.proxy_session import ProxySessionManager
+
+                mgr = ProxySessionManager()
+                if mgr.available() and mgr.rotate():
+                    ok_retry = await _run_ats_playbook(
+                        kind, job_url, pdf_path, master_path, user_data_dir=user_data_dir
+                    )
+                    if ok_retry:
+                        logger.info(
+                            "%s playbook succeeded after proxy rotate for %s",
+                            kind,
+                            job_url,
+                        )
+                        return True
+            except Exception:
+                logger.debug("Playbook proxy-rotate retry skipped", exc_info=True)
         except Exception:
             logger.exception(
-                "ATS playbook crashed (kind=%s) — falling back to Gemini vision",
+                "ATS playbook crashed (kind=%s) — falling back",
                 kind,
             )
+
+    # Groq semantic DOM for unknown ATS / after playbook miss — before Gemini vision.
+    if do_submit:
+        try:
+            from src.core.semantic_dom import try_semantic_apply
+
+            semantic_ok = await asyncio.to_thread(
+                try_semantic_apply,
+                job_url,
+                pdf_path,
+                master_path,
+                user_data_dir=user_data_dir,
+            )
+            if semantic_ok:
+                logger.info("Semantic DOM apply succeeded for %s", job_url[:160])
+                return True
+        except Exception:
+            logger.exception("Semantic DOM apply crashed — continuing to Gemini")
 
     return await _execute_with_browser_use(
         job_url,
@@ -586,7 +754,7 @@ async def _execute_with_browser_use(
     max_steps, timeout_sec = _step_budget(job_url)
 
     if do_submit:
-        task = _TASK_TEMPLATE_AUTO.format(
+        task = TASK_AUTO.format(
             job_url=job_url,
             pdf_abs_path=pdf_abs,
             pdf_stem=pdf_stem,
@@ -595,7 +763,7 @@ async def _execute_with_browser_use(
         )
         win_token = SUBMITTED_TOKEN
     else:
-        task = _TASK_TEMPLATE_REVIEW.format(
+        task = TASK_REVIEW.format(
             job_url=job_url,
             pdf_abs_path=pdf_abs,
             pdf_filename=pdf_filename,

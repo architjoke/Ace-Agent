@@ -9,7 +9,8 @@ langchain-nvidia-ai-endpoints
 langgraph
 langchain-core
 rendercv
-playwright
+# Drop-in Playwright fork with rebrowser anti-detect patches (import stays `playwright`).
+rebrowser-playwright
 browser-use
 pyyaml
 pandas
