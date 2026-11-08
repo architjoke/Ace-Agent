@@ -89,7 +89,9 @@ browser:
   # Sticky proxy for Chromium: set PROXY_URL in .env (re-run ace login after changing it).
   user_data_dir: data/browser_profile
   profile_directory: Default
+  # Overnight unattended: set true (or ACE_BROWSER_HEADLESS=1 / headless_mode: true).
   headless: false
+  # headless_mode: false  # alias for headless
   # Parallel Chromium windows (cloned profiles w1…wN). Each keeps one window alive.
   # Use 1 for calm single-window UX; 2–3 for throughput. Override: ACE_BROWSER_WORKERS.
   workers: 2

@@ -1,0 +1,14 @@
+cv:
+  name: Ada Lovelace
+  email: ada@example.com
+  phone: "+1 555 0100"
+  location: London, UK
+application_answers:
+  first_name: Ada
+  last_name: Lovelace
+  full_name: Ada Lovelace
+  email: ada@example.com
+  phone_display: "+1 555 0100"
+  full_location: London, UK
+  linkedin_url: https://www.linkedin.com/in/ada
+  github_url: https://github.com/ada

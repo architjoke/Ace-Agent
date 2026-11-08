@@ -232,71 +232,100 @@ def run_workday(
 
     fields = load_applicant_profile(master)
     context = None
+    page = None
+    handoff = False
+    pw = sync_playwright().start()
     started = time.monotonic()
     try:
-        with sync_playwright() as p:
-            context, page = launch_persistent_context(
-                p,
-                user_data_dir=user_data_dir,
-                headless=headless,
-                timeout_ms=timeout_ms,
-            )
-            logger.info("Workday playbook navigating %s", job_url)
-            from src.playbooks._common import goto_dom
+        context, page = launch_persistent_context(
+            pw,
+            user_data_dir=user_data_dir,
+            headless=headless,
+            timeout_ms=timeout_ms,
+        )
+        logger.info("Workday playbook navigating %s", job_url)
+        from src.playbooks._common import goto_dom
 
-            goto_dom(page, job_url)
-            _start_apply(page)
+        goto_dom(page, job_url)
+        _start_apply(page)
 
-            if not _upload_resume_aria(page, pdf):
-                raise PlaybookFallback("Workday playbook: Resume/CV upload control not found")
-            _wait_parser(page)
+        if not _upload_resume_aria(page, pdf):
+            raise PlaybookFallback("Workday playbook: Resume/CV upload control not found")
+        _wait_parser(page)
 
-            # Paginate through Workday wizard
-            for step in range(12):
-                if time.monotonic() - started > _OVERALL_BUDGET_S:
-                    raise TimeoutError(f"Workday playbook overall budget exceeded on {job_url}")
+        for step in range(12):
+            if time.monotonic() - started > _OVERALL_BUDGET_S:
+                raise PlaybookFallback(
+                    f"Workday playbook overall budget exceeded on {job_url}"
+                )
 
-                _fill_known_fields(page, fields)
+            _fill_known_fields(page, fields)
 
-                if _custom_unanswered(page):
-                    raise PlaybookFallback(
-                        "Workday playbook: unanswered custom/required fields — Gemini"
-                    )
+            if _custom_unanswered(page):
+                raise PlaybookFallback(
+                    "Workday playbook: unanswered custom/required fields — Gemini"
+                )
 
-                action = _click_next_or_submit(page)
-                page.wait_for_timeout(1200)
+            action = _click_next_or_submit(page)
+            page.wait_for_timeout(1200)
 
+            try:
+                body = page.inner_text("body") or ""
+            except Exception:
+                body = ""
+            if success_text(body) or page.get_by_text(
+                re.compile(r"thank you|application submitted|successfully submitted", re.I)
+            ).count():
+                logger.info("Workday playbook success for %s (step=%s)", job_url, step)
+                return True
+
+            if action == "submit":
+                page.wait_for_timeout(2000)
                 try:
                     body = page.inner_text("body") or ""
                 except Exception:
                     body = ""
-                if success_text(body) or page.get_by_text(
-                    re.compile(r"thank you|application submitted|successfully submitted", re.I)
-                ).count():
-                    logger.info("Workday playbook success for %s (step=%s)", job_url, step)
+                if success_text(body):
                     return True
+                logger.info("Workday playbook submit clicked — counting success")
+                return True
 
-                if action == "submit":
-                    page.wait_for_timeout(2000)
-                    try:
-                        body = page.inner_text("body") or ""
-                    except Exception:
-                        body = ""
-                    if success_text(body):
-                        return True
-                    # Soft success after explicit submit
-                    logger.info("Workday playbook submit clicked — counting success")
-                    return True
+            if action is None:
+                raise PlaybookFallback(
+                    "Workday playbook: Next/Submit control not found — Gemini"
+                )
 
-                if action is None:
-                    raise PlaybookFallback(
-                        "Workday playbook: Next/Submit control not found — Gemini"
-                    )
-
-            raise PlaybookFallback("Workday playbook: too many steps without success — Gemini")
+        raise PlaybookFallback("Workday playbook: too many steps without success — Gemini")
     except PlaywrightTimeout as exc:
-        raise TimeoutError(f"Workday playbook timed out on {job_url}") from exc
-    finally:
-        from src.playbooks._common import close_context_safe
+        if context is not None and page is not None:
+            handoff = True
+            from src.playbooks.session import PlaybookHandoff, PlaybookSession
 
-        close_context_safe(context, user_data_dir=user_data_dir)
+            raise PlaybookHandoff(
+                f"Workday playbook timed out on {job_url}",
+                PlaybookSession.from_live(
+                    context, page, user_data_dir, playwright=pw
+                ),
+            ) from exc
+        raise TimeoutError(f"Workday playbook timed out on {job_url}") from exc
+    except PlaybookFallback as exc:
+        if context is not None and page is not None:
+            handoff = True
+            from src.playbooks.session import PlaybookHandoff, PlaybookSession
+
+            raise PlaybookHandoff(
+                str(exc),
+                PlaybookSession.from_live(
+                    context, page, user_data_dir, playwright=pw
+                ),
+            ) from exc
+        raise
+    finally:
+        if not handoff:
+            from src.playbooks._common import close_context_safe
+
+            close_context_safe(context, user_data_dir=user_data_dir)
+            try:
+                pw.stop()
+            except Exception:
+                pass

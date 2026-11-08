@@ -86,6 +86,19 @@ def _dig(data: dict, *keys: str, default: Any = None) -> Any:
     return cur
 
 
+def _resolve_headless(raw: dict[str, Any]) -> bool:
+    """Unify ACE_BROWSER_HEADLESS, browser.headless, and browser.headless_mode."""
+    env = (os.environ.get("ACE_BROWSER_HEADLESS") or "").strip().lower()
+    if env in {"1", "true", "yes", "on"}:
+        return True
+    if env in {"0", "false", "no", "off"}:
+        return False
+    browser = raw.get("browser") if isinstance(raw.get("browser"), dict) else {}
+    if "headless_mode" in browser:
+        return bool(browser.get("headless_mode"))
+    return bool(browser.get("headless", False))
+
+
 def load_settings(config_path: Path | None = None) -> Settings:
     ensure_runtime_dirs()
     if config_path is None:
@@ -154,7 +167,7 @@ def load_settings(config_path: Path | None = None) -> Settings:
         browser_profile_directory=str(
             _dig(raw, "browser", "profile_directory", default="Default") or "Default"
         ),
-        browser_headless=bool(_dig(raw, "browser", "headless", default=False)),
+        browser_headless=_resolve_headless(raw),
         browser_workers=max(
             1,
             min(

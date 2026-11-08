@@ -34,6 +34,24 @@ BROWSER_SYSTEM_EXTENSION = (
 # Back-compat alias
 AUTH_SYSTEM_EXTENSION = BROWSER_SYSTEM_EXTENSION
 
+TASK_HANDOFF = """HANDOFF MODE: You have been injected into an active application form. The previous
+script completed the initial steps but got stuck. Do not navigate away. Look at the
+current modal, resolve the missing fields or errors, and click Next/Submit. Prefer
+the open dialog; do not reload the job page.
+
+## Resume (upload from disk if a file input is present)
+Absolute path: {pdf_abs_path}
+On-screen name should show: {pdf_stem}
+
+## Form filling
+Use APPLICATION FORM ANSWERS when matching fields appear.
+Do not invent facts.
+
+## HARD RULES
+- Stay on the current modal/tab — do not open a new job URL.
+- After real confirmation UI, output exactly: {submitted_token}
+"""
+
 TASK_AUTO = """Navigate to {job_url}.
 
 You are AUTONOMOUSLY APPLYING for this job.

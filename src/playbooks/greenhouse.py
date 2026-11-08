@@ -155,35 +155,48 @@ def run_greenhouse(
     proxy = playwright_proxy_dict()
     fields = _load_profile(master)
 
-    browser = None
     context = None
+    page = None
+    handoff = False
+    pw = sync_playwright().start()
     try:
-        with sync_playwright() as p:
-            from src.playbooks._common import CHROMIUM_STEALTH_ARGS, pick_chrome_user_agent
+        from src.core.browser_identity import pinned_user_agent, pinned_viewport
+        from src.playbooks._common import CHROMIUM_STEALTH_ARGS
 
-            launch_kwargs: dict[str, Any] = {
-                "user_data_dir": str(profile),
-                "headless": use_headless,
-                "args": list(CHROMIUM_STEALTH_ARGS),
-                "user_agent": pick_chrome_user_agent(),
-            }
-            if proxy:
-                launch_kwargs["proxy"] = proxy
-            # Persistent context keeps LinkedIn/Gmail cookies
-            context = p.chromium.launch_persistent_context(**launch_kwargs)
-            page = context.pages[0] if context.pages else context.new_page()
-            page.set_default_timeout(timeout_ms)
+        launch_kwargs: dict[str, Any] = {
+            "user_data_dir": str(profile),
+            "headless": use_headless,
+            "args": list(CHROMIUM_STEALTH_ARGS),
+            "user_agent": pinned_user_agent(user_data_dir=profile),
+            "viewport": pinned_viewport(),
+        }
+        if proxy:
+            launch_kwargs["proxy"] = proxy
+        context = pw.chromium.launch_persistent_context(**launch_kwargs)
+        page = context.pages[0] if context.pages else context.new_page()
+        page.set_default_timeout(timeout_ms)
 
-            logger.info("Greenhouse playbook navigating %s", job_url)
-            from src.playbooks._common import goto_dom
+        logger.info("Greenhouse playbook navigating %s", job_url)
+        from src.playbooks._common import goto_dom
 
-            goto_dom(page, job_url)
+        goto_dom(page, job_url)
 
-            # Open application form if still on job description
+        # Only open the form when identity fields are not already present.
+        # Avoid clicking "Submit application" on boards that land on the form URL.
+        form_ready = False
+        try:
+            form_ready = bool(
+                page.locator(
+                    "#first_name, input[name='job_application[first_name]'], "
+                    "input[type='email'], #email"
+                ).count()
+            )
+        except Exception:
+            form_ready = False
+        if not form_ready:
             for label in (
                 "Apply",
                 "Apply for this job",
-                "Submit application",
                 "Start application",
             ):
                 btn = page.get_by_role("button", name=re.compile(label, re.I))
@@ -200,143 +213,166 @@ def run_greenhouse(
                 except Exception:
                     continue
 
-            filled_any = False
-            filled_any |= _fill_first(
+        filled_any = False
+        filled_any |= _fill_first(
+            page,
+            [
+                "#first_name",
+                "input[name='job_application[first_name]']",
+                "input[autocomplete='given-name']",
+                "input[name*='first_name' i]",
+            ],
+            fields["first_name"],
+        )
+        filled_any |= _fill_first(
+            page,
+            [
+                "#last_name",
+                "input[name='job_application[last_name]']",
+                "input[autocomplete='family-name']",
+                "input[name*='last_name' i]",
+            ],
+            fields["last_name"],
+        )
+        filled_any |= _fill_first(
+            page,
+            [
+                "#email",
+                "input[name='job_application[email]']",
+                "input[type='email']",
+                "input[autocomplete='email']",
+            ],
+            fields["email"],
+        )
+        filled_any |= _fill_first(
+            page,
+            [
+                "#phone",
+                "input[name='job_application[phone]']",
+                "input[type='tel']",
+                "input[autocomplete='tel']",
+            ],
+            fields["phone"],
+        )
+        if fields["location"]:
+            _fill_first(
                 page,
                 [
-                    "#first_name",
-                    "input[name='job_application[first_name]']",
-                    "input[autocomplete='given-name']",
-                    "input[name*='first_name' i]",
+                    "#job_application_location",
+                    "input[name='job_application[location]']",
+                    "input[placeholder*='Location' i]",
                 ],
-                fields["first_name"],
+                fields["location"],
             )
-            filled_any |= _fill_first(
+        if fields["linkedin"]:
+            _fill_first(
                 page,
                 [
-                    "#last_name",
-                    "input[name='job_application[last_name]']",
-                    "input[autocomplete='family-name']",
-                    "input[name*='last_name' i]",
+                    "input[name*='linkedin' i]",
+                    "input[id*='linkedin' i]",
                 ],
-                fields["last_name"],
+                fields["linkedin"],
             )
-            filled_any |= _fill_first(
-                page,
-                [
-                    "#email",
-                    "input[name='job_application[email]']",
-                    "input[type='email']",
-                    "input[autocomplete='email']",
-                ],
-                fields["email"],
-            )
-            filled_any |= _fill_first(
-                page,
-                [
-                    "#phone",
-                    "input[name='job_application[phone]']",
-                    "input[type='tel']",
-                    "input[autocomplete='tel']",
-                ],
-                fields["phone"],
-            )
-            if fields["location"]:
-                _fill_first(
-                    page,
-                    [
-                        "#job_application_location",
-                        "input[name='job_application[location]']",
-                        "input[placeholder*='Location' i]",
-                    ],
-                    fields["location"],
-                )
-            if fields["linkedin"]:
-                _fill_first(
-                    page,
-                    [
-                        "input[name*='linkedin' i]",
-                        "input[id*='linkedin' i]",
-                    ],
-                    fields["linkedin"],
-                )
 
-            uploaded = _upload_resume(page, pdf)
-            if not uploaded:
-                raise PlaybookFallback("Greenhouse playbook: resume file input not found")
-            if not filled_any and not fields["email"]:
-                raise PlaybookFallback("Greenhouse playbook: no profile fields to fill")
+        uploaded = _upload_resume(page, pdf)
+        if not uploaded:
+            raise PlaybookFallback("Greenhouse playbook: resume file input not found")
+        if not filled_any and not fields["email"]:
+            raise PlaybookFallback("Greenhouse playbook: no profile fields to fill")
 
-            if _has_unanswered_custom(page):
-                raise PlaybookFallback(
-                    "Greenhouse playbook: unanswered custom/required fields — Gemini"
-                )
+        if _has_unanswered_custom(page):
+            raise PlaybookFallback(
+                "Greenhouse playbook: unanswered custom/required fields — Gemini"
+            )
 
-            # Submit / continue
-            submitted = False
-            for name in (
-                "Submit application",
-                "Submit Application",
-                "Submit",
-                "Apply",
-                "Send application",
+        submitted = False
+        for name in (
+            "Submit application",
+            "Submit Application",
+            "Submit",
+            "Apply",
+            "Send application",
+        ):
+            btn = page.get_by_role("button", name=re.compile(rf"^{re.escape(name)}$", re.I))
+            try:
+                if btn.count() and btn.first.is_visible():
+                    btn.first.click(timeout=8000)
+                    submitted = True
+                    break
+            except Exception:
+                continue
+        if not submitted:
+            for sel in (
+                "input[type='submit']",
+                "button[type='submit']",
+                "#submit_app",
             ):
-                btn = page.get_by_role("button", name=re.compile(rf"^{re.escape(name)}$", re.I))
                 try:
-                    if btn.count() and btn.first.is_visible():
-                        btn.first.click(timeout=8000)
+                    loc = page.locator(sel).first
+                    if loc.count() and loc.is_visible():
+                        loc.click(timeout=8000)
                         submitted = True
                         break
                 except Exception:
                     continue
-            if not submitted:
-                # Fallback CSS
-                for sel in (
-                    "input[type='submit']",
-                    "button[type='submit']",
-                    "#submit_app",
-                ):
-                    try:
-                        loc = page.locator(sel).first
-                        if loc.count() and loc.is_visible():
-                            loc.click(timeout=8000)
-                            submitted = True
-                            break
-                    except Exception:
-                        continue
 
-            if not submitted:
-                raise PlaybookFallback("Greenhouse playbook: submit control not found")
+        if not submitted:
+            raise PlaybookFallback("Greenhouse playbook: submit control not found")
 
-            page.wait_for_timeout(2000)
-            body = ""
-            try:
-                body = (page.inner_text("body") or "").lower()
-            except Exception:
-                pass
-            success_markers = (
-                "thank you for applying",
-                "application submitted",
-                "thanks for applying",
-                "we have received your application",
-                "application received",
-            )
-            if any(m in body for m in success_markers):
-                logger.info("Greenhouse playbook success for %s", job_url)
-                return True
-
-            # Some boards stay on same page without clear thank-you — treat soft success
-            # only if no obvious error
-            if "error" in body and "required" in body:
-                raise PlaybookFallback("Greenhouse playbook: validation errors after submit")
-            logger.info(
-                "Greenhouse playbook submitted without clear thank-you — counting success"
-            )
+        page.wait_for_timeout(2000)
+        body = ""
+        try:
+            body = (page.inner_text("body") or "").lower()
+        except Exception:
+            pass
+        success_markers = (
+            "thank you for applying",
+            "application submitted",
+            "thanks for applying",
+            "we have received your application",
+            "application received",
+        )
+        if any(m in body for m in success_markers):
+            logger.info("Greenhouse playbook success for %s", job_url)
             return True
 
-    except PlaywrightTimeout as exc:
-        raise TimeoutError(f"Greenhouse playbook timed out on {job_url}") from exc
-    finally:
-        from src.playbooks._common import close_context_safe
+        if "error" in body and "required" in body:
+            raise PlaybookFallback("Greenhouse playbook: validation errors after submit")
+        logger.info(
+            "Greenhouse playbook submitted without clear thank-you — counting success"
+        )
+        return True
 
-        close_context_safe(context, user_data_dir=user_data_dir)
+    except PlaywrightTimeout as exc:
+        if context is not None and page is not None:
+            handoff = True
+            from src.playbooks.session import PlaybookHandoff, PlaybookSession
+
+            raise PlaybookHandoff(
+                f"Greenhouse playbook timed out on {job_url}",
+                PlaybookSession.from_live(
+                    context, page, user_data_dir or profile, playwright=pw
+                ),
+            ) from exc
+        raise TimeoutError(f"Greenhouse playbook timed out on {job_url}") from exc
+    except PlaybookFallback as exc:
+        if context is not None and page is not None:
+            handoff = True
+            from src.playbooks.session import PlaybookHandoff, PlaybookSession
+
+            raise PlaybookHandoff(
+                str(exc),
+                PlaybookSession.from_live(
+                    context, page, user_data_dir or profile, playwright=pw
+                ),
+            ) from exc
+        raise
+    finally:
+        if not handoff:
+            from src.playbooks._common import close_context_safe
+
+            close_context_safe(context, user_data_dir=user_data_dir or profile)
+            try:
+                pw.stop()
+            except Exception:
+                pass

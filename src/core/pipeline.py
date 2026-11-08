@@ -24,6 +24,7 @@ from src.core.executor import (
     ApplicationBlockedError,
     ApplicationTimeoutError,
     APPLY_RESUME_FILENAME,
+    RequiresHumanInterventionError,
     SUBMITTED_TOKEN,
     cleanup_linkedin_uploaded_resume,
     execute_application,
@@ -192,7 +193,7 @@ async def apply_job(
     cleanup_linkedin_resume: bool = False,
     job_url_direct: str = "",
 ) -> str:
-    """Browser-only apply. Returns success|fallback|failed|already_applied|timeout."""
+    """Browser-only apply. Returns success|fallback|failed|already_applied|timeout|requires_human."""
     skip_browser = is_aggregator_listing(job_url) and not is_applyable_url(
         job_url_direct or ""
     )
@@ -259,6 +260,22 @@ async def apply_job(
             tailored_yaml_snapshot=yaml_snapshot,
         )
         return "already_applied"
+    except RequiresHumanInterventionError as exc:
+        logger.warning(
+            "[human] %s needs intervention — skipping Manual_Action (%s)",
+            company,
+            exc,
+        )
+        log_application(
+            company,
+            job_url,
+            track,
+            "REQUIRES_HUMAN_INTERVENTION",
+            error_log=f"{type(exc).__name__}: {exc}",
+            jd_text=jd_text,
+            tailored_yaml_snapshot=yaml_snapshot,
+        )
+        return "requires_human"
     except ApplicationTimeoutError as exc:
         logger.warning(
             "[timeout] %s stuck/timeout — skipping Manual_Action (%s)",

@@ -27,10 +27,17 @@ def _is_ashby(job_url: str) -> bool:
 
 
 def _click_apply(page) -> None:
+    # Skip if the apply form is already visible (direct /apply URLs).
+    try:
+        if page.locator(
+            'input[name="name"], input[name="email"], input[type="email"]'
+        ).count():
+            return
+    except Exception:
+        pass
     for pattern in (
         r"^Apply$",
         r"Apply for this job",
-        r"Submit application",
         r"Start application",
         r"Apply now",
     ):
@@ -182,51 +189,80 @@ def run_lever(
     ashby = (ats == "ashby") or _is_ashby(job_url)
     fields = load_applicant_profile(master)
     context = None
+    page = None
+    handoff = False
+    pw = sync_playwright().start()
     try:
-        with sync_playwright() as p:
-            context, page = launch_persistent_context(
-                p,
-                user_data_dir=user_data_dir,
-                headless=headless,
-                timeout_ms=timeout_ms,
+        context, page = launch_persistent_context(
+            pw,
+            user_data_dir=user_data_dir,
+            headless=headless,
+            timeout_ms=timeout_ms,
+        )
+        kind = "ashby" if ashby else "lever"
+        logger.info("%s playbook navigating %s", kind.capitalize(), job_url)
+        from src.playbooks._common import goto_dom
+
+        goto_dom(page, job_url)
+        _click_apply(page)
+
+        filled = _fill_ashby(page, fields) if ashby else _fill_lever(page, fields)
+        uploaded = upload_resume_file(page, pdf)
+        if not uploaded:
+            raise PlaybookFallback(f"{kind} playbook: resume file input not found")
+        if not filled and not fields.get("email"):
+            raise PlaybookFallback(f"{kind} playbook: no profile fields filled")
+
+        if _unanswered_custom(page):
+            raise PlaybookFallback(
+                f"{kind} playbook: unanswered custom/required fields — Gemini"
             )
-            kind = "ashby" if ashby else "lever"
-            logger.info("%s playbook navigating %s", kind.capitalize(), job_url)
-            from src.playbooks._common import goto_dom
 
-            goto_dom(page, job_url)
-            _click_apply(page)
+        if not _submit(page):
+            raise PlaybookFallback(f"{kind} playbook: submit control not found")
 
-            filled = _fill_ashby(page, fields) if ashby else _fill_lever(page, fields)
-            uploaded = upload_resume_file(page, pdf)
-            if not uploaded:
-                raise PlaybookFallback(f"{kind} playbook: resume file input not found")
-            if not filled and not fields.get("email"):
-                raise PlaybookFallback(f"{kind} playbook: no profile fields filled")
-
-            if _unanswered_custom(page):
-                raise PlaybookFallback(
-                    f"{kind} playbook: unanswered custom/required fields — Gemini"
-                )
-
-            if not _submit(page):
-                raise PlaybookFallback(f"{kind} playbook: submit control not found")
-
-            page.wait_for_timeout(2000)
-            try:
-                body = page.inner_text("body") or ""
-            except Exception:
-                body = ""
-            if success_text(body):
-                logger.info("%s playbook success for %s", kind, job_url)
-                return True
-            if "required" in body.lower() and "error" in body.lower():
-                raise PlaybookFallback(f"{kind} playbook: validation errors after submit")
-            logger.info("%s playbook submitted without clear thank-you — counting success", kind)
+        page.wait_for_timeout(2000)
+        try:
+            body = page.inner_text("body") or ""
+        except Exception:
+            body = ""
+        if success_text(body):
+            logger.info("%s playbook success for %s", kind, job_url)
             return True
+        if "required" in body.lower() and "error" in body.lower():
+            raise PlaybookFallback(f"{kind} playbook: validation errors after submit")
+        logger.info("%s playbook submitted without clear thank-you — counting success", kind)
+        return True
     except PlaywrightTimeout as exc:
-        raise TimeoutError(f"Lever/Ashby playbook timed out on {job_url}") from exc
-    finally:
-        from src.playbooks._common import close_context_safe
+        if context is not None and page is not None:
+            handoff = True
+            from src.playbooks.session import PlaybookHandoff, PlaybookSession
 
-        close_context_safe(context, user_data_dir=user_data_dir)
+            raise PlaybookHandoff(
+                f"Lever/Ashby playbook timed out on {job_url}",
+                PlaybookSession.from_live(
+                    context, page, user_data_dir, playwright=pw
+                ),
+            ) from exc
+        raise TimeoutError(f"Lever/Ashby playbook timed out on {job_url}") from exc
+    except PlaybookFallback as exc:
+        if context is not None and page is not None:
+            handoff = True
+            from src.playbooks.session import PlaybookHandoff, PlaybookSession
+
+            raise PlaybookHandoff(
+                str(exc),
+                PlaybookSession.from_live(
+                    context, page, user_data_dir, playwright=pw
+                ),
+            ) from exc
+        raise
+    finally:
+        if not handoff:
+            from src.playbooks._common import close_context_safe
+
+            close_context_safe(context, user_data_dir=user_data_dir)
+            try:
+                pw.stop()
+            except Exception:
+                pass

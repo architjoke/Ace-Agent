@@ -15,6 +15,7 @@ from browser_use.browser.profile import BrowserProfile
 from src.core.prompts import (
     BROWSER_SYSTEM_EXTENSION,
     TASK_AUTO,
+    TASK_HANDOFF,
     TASK_LINKEDIN_CLEANUP,
     TASK_REVIEW,
 )
@@ -92,6 +93,10 @@ class ApplicationTimeoutError(TimeoutError):
 
 class AlreadyAppliedError(RuntimeError):
     """Raised when DB or DOM indicates this job was already applied to."""
+
+
+class RequiresHumanInterventionError(RuntimeError):
+    """Playbook + CDP handoff failed — soft-fail without Manual_Action package."""
 
 
 def _auto_submit_enabled() -> bool:
@@ -183,12 +188,18 @@ def _browser_profile(user_data_dir: Path | str | None = None) -> BrowserProfile:
     # keep_alive default OFF — tear down Chromium after each apply (anti-zombie).
     # Google/LinkedIn cookies still persist via user_data_dir on disk.
     keep = env_truthy("ACE_BROWSER_KEEP_ALIVE", "0")
+    from src.core.browser_identity import (
+        pinned_device_scale_factor,
+        pinned_user_agent,
+        pinned_viewport,
+    )
     from src.core.network import browser_proxy_settings
-    from src.playbooks._common import CHROMIUM_STEALTH_ARGS, pick_chrome_user_agent
+    from src.playbooks._common import CHROMIUM_STEALTH_ARGS
 
     proxy = browser_proxy_settings()
     if proxy is not None:
         logger.info("BrowserProfile sticky proxy enabled (PROXY_URL / network.proxies)")
+    vp = pinned_viewport()
     return BrowserProfile(
         user_data_dir=str(profile_dir),
         profile_directory=settings.browser_profile_directory,
@@ -196,10 +207,31 @@ def _browser_profile(user_data_dir: Path | str | None = None) -> BrowserProfile:
         keep_alive=keep,
         proxy=proxy,
         args=list(CHROMIUM_STEALTH_ARGS),
-        user_agent=pick_chrome_user_agent(),
+        user_agent=pinned_user_agent(user_data_dir=profile_dir),
+        window_size=vp,
+        device_scale_factor=pinned_device_scale_factor(),
         # Leave allowed_domains unset so accounts.google.com OAuth popups work.
         cross_origin_iframes=True,
         # Fluidity: take control on DOM-ready; do not wait on tracking pixels.
+        minimum_wait_page_load_time=0.1,
+        wait_for_network_idle_page_load_time=0.15,
+        wait_between_actions=0.05,
+    )
+
+
+def _browser_profile_cdp(cdp_url: str) -> BrowserProfile:
+    """Attach browser-use to an already-running playbook Chromium via CDP."""
+    from src.core.browser_identity import pinned_device_scale_factor, pinned_viewport
+
+    vp = pinned_viewport()
+    return BrowserProfile(
+        cdp_url=cdp_url,
+        is_local=True,
+        keep_alive=True,
+        headless=get_settings().browser_headless,
+        window_size=vp,
+        device_scale_factor=pinned_device_scale_factor(),
+        cross_origin_iframes=True,
         minimum_wait_page_load_time=0.1,
         wait_for_network_idle_page_load_time=0.15,
         wait_between_actions=0.05,
@@ -450,18 +482,25 @@ class _StuckStateTracker:
             )
 
 
+async def _detach_agent(agent: Agent | None) -> None:
+    """Stop the browser-use agent client without assuming Chromium is gone."""
+    if agent is None:
+        return
+    for attr in ("close", "stop"):
+        fn = getattr(agent, attr, None)
+        if callable(fn):
+            try:
+                result = fn()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                logger.debug("agent.%s detach failed", attr, exc_info=True)
+
+
 async def _force_close_agent(agent: Agent | None, user_data_dir: Path | str | None) -> None:
     """Best-effort Chromium teardown so the next job starts clean."""
+    await _detach_agent(agent)
     if agent is not None:
-        for attr in ("close", "stop"):
-            fn = getattr(agent, attr, None)
-            if callable(fn):
-                try:
-                    result = fn()
-                    if asyncio.iscoroutine(result):
-                        await result
-                except Exception:
-                    logger.debug("agent.%s teardown failed", attr, exc_info=True)
         browser = getattr(agent, "browser", None) or getattr(agent, "browser_session", None)
         if browser is not None:
             for attr in ("close", "kill", "stop"):
@@ -494,15 +533,18 @@ async def _run_agent(
     max_steps: int,
     timeout_seconds: int | None = None,
     user_data_dir: Path | str | None = None,
+    browser_profile: BrowserProfile | None = None,
+    teardown: bool = True,
 ) -> object:
     api_key = _api_key()
     llm = _build_llm(api_key)
     agent_ref: dict = {"agent": None}
     stuck = _StuckStateTracker(agent_ref)
+    profile = browser_profile or _browser_profile(user_data_dir)
     agent: Agent | None = Agent(
         task=task,
         llm=llm,
-        browser_profile=_browser_profile(user_data_dir),
+        browser_profile=profile,
         use_vision=True,
         available_file_paths=file_paths,
         max_failures=8,
@@ -524,7 +566,11 @@ async def _run_agent(
             f"browser-use agent timed out after {wall}s"
         ) from exc
     finally:
-        await _force_close_agent(agent, user_data_dir)
+        if teardown:
+            await _force_close_agent(agent, user_data_dir)
+        else:
+            # CDP handoff: detach agent client; PlaybookSession still owns Chromium.
+            await _detach_agent(agent)
 
 
 async def cleanup_linkedin_uploaded_resume(
@@ -618,7 +664,98 @@ async def _run_ats_playbook(
             master_path,
             user_data_dir=user_data_dir,
         )
+    if kind == "linkedin":
+        from src.playbooks.linkedin import run_linkedin
+
+        return await asyncio.to_thread(
+            run_linkedin,
+            job_url,
+            pdf_path,
+            master_path,
+            user_data_dir=user_data_dir,
+        )
     return False
+
+
+async def _execute_cdp_handoff(
+    session,
+    reason: str,
+    job_url: str,
+    pdf_path: Path,
+    master_path: Path,
+) -> bool:
+    """Inject Gemini into the open playbook Chromium via CDP; always close session."""
+    pdf_abs = os.path.abspath(str(pdf_path))
+    pdf_stem = pdf_path.stem
+    cdp_url = getattr(session, "cdp_url", None)
+    if not cdp_url:
+        from src.playbooks.session import read_cdp_url
+
+        cdp_url = read_cdp_url(session.user_data_dir, wait_s=3.0)
+        session.cdp_url = cdp_url
+
+    succeeded = False
+    try:
+        if not cdp_url:
+            logger.warning(
+                "CDP handoff missing DevTools port (%s) — soft-fail", reason
+            )
+            raise RequiresHumanInterventionError(
+                f"No CDP endpoint for handoff: {reason}"
+            )
+
+        form_answers = _application_answers_block(master_path)
+        max_steps, timeout_sec = _step_budget(job_url)
+        task = TASK_HANDOFF.format(
+            pdf_abs_path=pdf_abs,
+            pdf_stem=pdf_stem,
+            submitted_token=SUBMITTED_TOKEN,
+        )
+        form_block = f"\n\n{form_answers}\n" if form_answers else ""
+        task = f"{task}{form_block}\n\nHandoff reason: {reason}"
+
+        logger.info(
+            "CDP Gemini handoff for %s (cdp=%s, reason=%s)",
+            job_url[:160],
+            cdp_url,
+            reason,
+        )
+        history = await _run_agent(
+            task,
+            [pdf_abs],
+            max_steps=max_steps,
+            timeout_seconds=timeout_sec,
+            user_data_dir=session.user_data_dir,
+            browser_profile=_browser_profile_cdp(cdp_url),
+            teardown=False,
+        )
+        if _reached_token(history, SUBMITTED_TOKEN, pdf_stem=pdf_stem):
+            logger.info("CDP handoff verified %s for %s", SUBMITTED_TOKEN, job_url[:160])
+            succeeded = True
+            return True
+        raise RequiresHumanInterventionError(
+            f"CDP handoff did not verify submit after: {reason}"
+        )
+    except RequiresHumanInterventionError:
+        raise
+    except ApplicationTimeoutError as exc:
+        raise RequiresHumanInterventionError(
+            f"CDP handoff timed out: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise RequiresHumanInterventionError(
+            f"CDP handoff failed ({type(exc).__name__}: {exc})"
+        ) from exc
+    finally:
+        if not succeeded:
+            try:
+                await asyncio.to_thread(session.discard_modal)
+            except Exception:
+                logger.debug("modal discard failed", exc_info=True)
+        try:
+            await asyncio.to_thread(session.close)
+        except Exception:
+            logger.debug("playbook session close failed", exc_info=True)
 
 
 async def execute_application(
@@ -632,9 +769,9 @@ async def execute_application(
 ) -> bool:
     """Apply via ATS playbook when possible, else browser-use Gemini vision.
 
-    Greenhouse / Lever / Ashby / Workday DOM playbooks run first (no vision
-    tokens). On TimeoutError / PlaybookFallback the Chromium profile is closed
-    and Gemini takes over with the same user_data_dir cookies.
+    Greenhouse / Lever / Ashby / Workday / LinkedIn DOM playbooks run first.
+    On PlaybookHandoff the same Chromium stays open and Gemini attaches via CDP.
+    Cold Gemini (user_data_dir launch) runs when there is no live handoff session.
     """
     pdf_path = Path(tailored_pdf_path).expanduser().resolve()
     master_path = Path(master_yaml_path).expanduser().resolve()
@@ -663,11 +800,20 @@ async def execute_application(
     if already:
         raise AlreadyAppliedError(f"DOM already-applied signal at {job_url[:160]}")
 
-    from src.playbooks import PlaybookFallback, classify_ats
+    from src.playbooks import PlaybookFallback, resolve_ats_kind
+    from src.playbooks.session import PlaybookHandoff
 
-    kind = classify_ats(job_url)
-    # Known ATS: deterministic playbooks first (fast). Semantic/Gemini only as fallback.
-    if do_submit and kind in {"greenhouse", "lever", "ashby", "workday"}:
+    kind = await asyncio.to_thread(
+        resolve_ats_kind, job_url, user_data_dir=user_data_dir
+    )
+    # Known ATS (+ LinkedIn Easy Apply): deterministic playbooks first.
+    if do_submit and kind in {
+        "greenhouse",
+        "lever",
+        "ashby",
+        "workday",
+        "linkedin",
+    }:
         try:
             ok = await _run_ats_playbook(
                 kind, job_url, pdf_path, master_path, user_data_dir=user_data_dir
@@ -675,9 +821,24 @@ async def execute_application(
             if ok:
                 logger.info("%s playbook succeeded for %s", kind, job_url)
                 return True
+        except AlreadyAppliedError:
+            raise
+        except PlaybookHandoff as handoff:
+            logger.warning(
+                "ATS playbook stuck → CDP Gemini (kind=%s, reason=%s)",
+                kind,
+                handoff.reason,
+            )
+            return await _execute_cdp_handoff(
+                handoff.session,
+                handoff.reason,
+                job_url,
+                pdf_path,
+                master_path,
+            )
         except (TimeoutError, PlaybookFallback) as exc:
             logger.warning(
-                "ATS playbook stuck → semantic/Gemini handoff (kind=%s, reason=%s)",
+                "ATS playbook stuck → semantic/Gemini cold path (kind=%s, reason=%s)",
                 kind,
                 exc,
             )
@@ -696,6 +857,18 @@ async def execute_application(
                             job_url,
                         )
                         return True
+            except PlaybookHandoff as handoff:
+                logger.warning(
+                    "ATS playbook stuck after rotate → CDP Gemini (kind=%s)",
+                    kind,
+                )
+                return await _execute_cdp_handoff(
+                    handoff.session,
+                    handoff.reason,
+                    job_url,
+                    pdf_path,
+                    master_path,
+                )
             except Exception:
                 logger.debug("Playbook proxy-rotate retry skipped", exc_info=True)
         except Exception:

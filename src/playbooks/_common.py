@@ -14,23 +14,16 @@ logger = logging.getLogger(__name__)
 CHROMIUM_STEALTH_ARGS: list[str] = [
     "--disable-blink-features=AutomationControlled",
     "--disable-infobars",
+    # Ephemeral CDP port for Gemini hot-swap (DevToolsActivePort in profile dir).
+    "--remote-debugging-port=0",
 ]
 
-_CHROME_USER_AGENTS: tuple[str, ...] = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/130.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36",
-)
-
-
 def pick_chrome_user_agent() -> str:
-    """Stable-enough desktop Chrome UA (rotates lightly per process)."""
-    import random
+    """Back-compat alias — always returns the pinned (non-random) UA."""
+    from src.core.browser_identity import pinned_user_agent
 
-    return random.choice(_CHROME_USER_AGENTS)
+    return pinned_user_agent()
+
 
 # DOM-ready navigation — ignore tracking-pixel networkidle hangs.
 GOTO_DOM_TIMEOUT_MS = 15_000
@@ -143,17 +136,31 @@ def launch_persistent_context(
     profile.mkdir(parents=True, exist_ok=True)
     clear_profile_locks(profile)
 
+    from src.core.browser_identity import (
+        pinned_device_scale_factor,
+        pinned_user_agent,
+        pinned_viewport,
+        webdriver_stealth_script,
+    )
+
     use_headless = settings.browser_headless if headless is None else bool(headless)
     proxy_cfg = proxy if proxy is not None else playwright_proxy_dict()
+    vp = pinned_viewport()
     launch_kwargs: dict[str, Any] = {
         "user_data_dir": str(profile),
         "headless": use_headless,
         "args": list(CHROMIUM_STEALTH_ARGS),
-        "user_agent": pick_chrome_user_agent(),
+        "user_agent": pinned_user_agent(user_data_dir=profile),
+        "viewport": vp,
+        "device_scale_factor": pinned_device_scale_factor(),
     }
     if proxy_cfg:
         launch_kwargs["proxy"] = proxy_cfg
     context = playwright.chromium.launch_persistent_context(**launch_kwargs)
+    try:
+        context.add_init_script(webdriver_stealth_script())
+    except Exception:
+        logger.debug("webdriver stealth init_script failed", exc_info=True)
     page = context.pages[0] if context.pages else context.new_page()
     page.set_default_timeout(timeout_ms)
     return context, page

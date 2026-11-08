@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>LinkedIn Easy Apply Mock</title>
+</head>
+<body>
+  <main>
+    <h1>Product Engineer</h1>
+    <button type="button" id="easy-apply">Easy Apply</button>
+    <dialog id="apply-modal" open style="display:none">
+      <form method="dialog" aria-label="Easy Apply">
+        <label for="phone">Phone</label>
+        <input id="phone" name="phone" type="tel" autocomplete="tel" />
+
+        <label for="city">City</label>
+        <input id="city" name="city" autocomplete="address-level2" />
+
+        <label for="resume">Resume</label>
+        <input id="resume" type="file" name="resume" />
+
+        <button type="button" id="submit-app">Submit application</button>
+        <button type="button" id="discard">Discard</button>
+      </form>
+    </dialog>
+  </main>
+  <script>
+    var modal = document.getElementById("apply-modal");
+    document.getElementById("easy-apply").addEventListener("click", function () {
+      modal.style.display = "block";
+      modal.setAttribute("open", "");
+    });
+    document.getElementById("submit-app").addEventListener("click", function () {
+      document.body.innerHTML = "<main><p>Your application was sent</p><p>Application submitted</p></main>";
+    });
+    document.getElementById("discard").addEventListener("click", function () {
+      modal.style.display = "none";
+      modal.removeAttribute("open");
+    });
+  </script>
+</body>
+</html>

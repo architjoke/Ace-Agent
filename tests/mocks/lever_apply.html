@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Lever Apply Mock</title>
+</head>
+<body>
+  <main>
+    <h1>Backend Engineer</h1>
+    <form id="application" aria-label="Application form">
+      <label for="name">Full name</label>
+      <input id="name" name="name" autocomplete="name" />
+
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" autocomplete="email" />
+
+      <label for="phone">Phone</label>
+      <input id="phone" name="phone" type="tel" autocomplete="tel" />
+
+      <label for="linkedin">LinkedIn</label>
+      <input id="linkedin" name="urls[LinkedIn]" />
+
+      <label for="resume">Resume</label>
+      <input id="resume" type="file" name="resume" />
+
+      <button type="button" id="submit">Submit application</button>
+    </form>
+  </main>
+  <script>
+    document.getElementById("submit").addEventListener("click", function () {
+      document.body.innerHTML = "<main><p>Thank you for applying</p><p>Application received</p></main>";
+    });
+  </script>
+</body>
+</html>

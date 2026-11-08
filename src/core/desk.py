@@ -121,6 +121,7 @@ def format_status() -> str:
             f"Manual Action (couldn't submit): {counts['manual_action']} (folders: {len(manuals)})",
             f"Already applied (skipped): {counts.get('already_applied', 0)}",
             f"Timeout/stuck:            {counts.get('failed_timeout_or_stuck', 0)}",
+            f"Needs human (soft-fail):  {counts.get('requires_human_intervention', 0)}",
             f"Failed:                   {counts['failed']}",
             f"Total attempted:          {counts['attempted']}",
             f"Awaiting recruiter reply: {counts['pending_outcomes']}",
