@@ -49,7 +49,7 @@ _SENIOR_PATTERNS = (
 
 
 class FitAssessment(BaseModel):
-    """Structured LLM judgment of candidate↔JD fit."""
+    """Structured LLM judgment of candidate↔JD fit + compensation extract."""
 
     fit_score: int = Field(
         ...,
@@ -85,6 +85,26 @@ class FitAssessment(BaseModel):
         default="",
         description="Best track for this JD among SDE, AI, ML (or empty).",
     )
+    company_provided_salary: bool = Field(
+        default=False,
+        description="True if the JD states any salary/CTC/stipend figure.",
+    )
+    salary_min: float = Field(
+        default=0.0,
+        description="Lower bound as written (INR). Use lakhs as absolute if JD says LPA.",
+    )
+    salary_max: float = Field(
+        default=0.0,
+        description="Upper bound as written (INR). Same units as salary_min.",
+    )
+    salary_format: str = Field(
+        default="ANNUAL",
+        description="ANNUAL | MONTHLY | STIPEND as stated in the JD.",
+    )
+    includes_equity_or_bonus: bool = Field(
+        default=False,
+        description="True if equity, RSUs, variable pay, or joining bonus is mentioned.",
+    )
 
 
 class FitResult(TypedDict):
@@ -95,6 +115,12 @@ class FitResult(TypedDict):
     matched_skills: list[str]
     missing_must_haves: list[str]
     recommended_track: str
+    company_provided_salary: bool
+    salary_min: float
+    salary_max: float
+    salary_format: str
+    includes_equity_or_bonus: bool
+    jd_salary_format: str
 
 
 def _reject(rule: str, reason: str) -> FitResult:
@@ -248,6 +274,12 @@ def _salvage_fit_from_text(raw: Any) -> dict[str, Any]:
             "matched_skills": list(data.get("matched_skills") or []),
             "missing_must_haves": list(data.get("missing_must_haves") or []),
             "recommended_track": str(data.get("recommended_track") or ""),
+            "company_provided_salary": bool(data.get("company_provided_salary") or False),
+            "salary_min": float(data.get("salary_min") or 0),
+            "salary_max": float(data.get("salary_max") or 0),
+            "salary_format": str(data.get("salary_format") or "ANNUAL"),
+            "includes_equity_or_bonus": bool(data.get("includes_equity_or_bonus") or False),
+            "jd_salary_format": str(data.get("jd_salary_format") or data.get("salary_format") or "ANNUAL"),
         }
 
 
@@ -305,6 +337,7 @@ def evaluate_fit(
         matched = [str(x) for x in (assessment.get("matched_skills") or [])]
         missing = [str(x) for x in (assessment.get("missing_must_haves") or [])]
         track = str(assessment.get("recommended_track") or "").strip().upper()
+        comp_raw = assessment
     else:
         score = int(assessment.fit_score)
         reason = str(assessment.reason).strip()
@@ -312,6 +345,7 @@ def evaluate_fit(
         matched = [str(x) for x in (assessment.matched_skills or [])]
         missing = [str(x) for x in (assessment.missing_must_haves or [])]
         track = str(assessment.recommended_track or "").strip().upper()
+        comp_raw = assessment.model_dump()
 
     if rule_broken:
         score = 0
@@ -349,6 +383,9 @@ def evaluate_fit(
             logger.exception("SOFT preference gate crashed — continuing")
 
     passed = score >= min_score and not rule_broken
+    from src.core.salary_engine import compensation_from_fit
+
+    compensation = compensation_from_fit(comp_raw)
     logger.info(
         "Fit triage score=%s passed=%s rule_broken=%s track=%s matched=%s — %s",
         score,
@@ -366,4 +403,14 @@ def evaluate_fit(
         "matched_skills": matched,
         "missing_must_haves": missing,
         "recommended_track": track,
+        "company_provided_salary": bool(compensation.get("company_provided_salary")),
+        "salary_min": float(compensation.get("salary_min") or 0),
+        "salary_max": float(compensation.get("salary_max") or 0),
+        "salary_format": str(compensation.get("salary_format") or "ANNUAL"),
+        "includes_equity_or_bonus": bool(compensation.get("includes_equity_or_bonus")),
+        "jd_salary_format": str(
+            compensation.get("jd_salary_format")
+            or compensation.get("salary_format")
+            or "ANNUAL"
+        ),
     }

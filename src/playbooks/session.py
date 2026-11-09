@@ -110,3 +110,27 @@ class PlaybookHandoff(Exception):
         super().__init__(reason)
         self.session = session
         self.reason = reason
+
+
+def raise_handoff(
+    reason: str,
+    *,
+    context: Any,
+    page: Any,
+    user_data_dir: Path | str | None,
+    playwright: Any = None,
+    cause: BaseException | None = None,
+    fallback: BaseException | None = None,
+) -> None:
+    """Raise PlaybookHandoff when live; else raise fallback or cause. Never returns."""
+    if context is not None and page is not None:
+        session = PlaybookSession.from_live(
+            context, page, user_data_dir, playwright=playwright
+        )
+        err = PlaybookHandoff(reason, session)
+        raise err from cause
+    if fallback is not None:
+        raise fallback from cause
+    if cause is not None:
+        raise cause
+    raise RuntimeError(reason)

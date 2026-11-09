@@ -47,7 +47,12 @@ def goto_dom(page, url: str, *, timeout_ms: int = GOTO_DOM_TIMEOUT_MS) -> None:
             ) from reload_exc
 
 
-def load_applicant_profile(master_yaml_path: Path) -> dict[str, Any]:
+def load_applicant_profile(
+    master_yaml_path: Path,
+    *,
+    yaml_snapshot: str | None = None,
+    jd_text: str | None = None,
+) -> dict[str, Any]:
     data = yaml.safe_load(master_yaml_path.read_text(encoding="utf-8")) or {}
     if not isinstance(data, dict):
         return {}
@@ -56,6 +61,16 @@ def load_applicant_profile(master_yaml_path: Path) -> dict[str, Any]:
         if isinstance(data.get("application_answers"), dict)
         else {}
     )
+    try:
+        from src.core.salary import inject_salary_answers
+
+        answers = inject_salary_answers(
+            answers if isinstance(answers, dict) else {},
+            jd_text=jd_text,
+            yaml_snapshot=yaml_snapshot,
+        )
+    except Exception:
+        answers = answers if isinstance(answers, dict) else {}
     cv = data.get("cv") if isinstance(data.get("cv"), dict) else {}
     name = str(cv.get("name") or answers.get("full_name") or "").strip()
     parts = name.split(None, 1)
@@ -90,6 +105,8 @@ def load_applicant_profile(master_yaml_path: Path) -> dict[str, Any]:
         "country": str(answers.get("country") or "India").strip(),
         "linkedin": str(answers.get("linkedin_url") or "").strip(),
         "github": str(answers.get("github_url") or "").strip(),
+        "expected_ctc": str(answers.get("expected_ctc") or "").strip(),
+        "salary_expectation": str(answers.get("salary_expectation") or "").strip(),
     }
 
 

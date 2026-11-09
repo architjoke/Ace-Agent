@@ -24,6 +24,7 @@ from src.core.executor import (
     ApplicationBlockedError,
     ApplicationTimeoutError,
     APPLY_RESUME_FILENAME,
+    JobClosedError,
     RequiresHumanInterventionError,
     SUBMITTED_TOKEN,
     cleanup_linkedin_uploaded_resume,
@@ -139,6 +140,12 @@ def triage_job(
         "description": description,
         "job_url_direct": str(job.get("job_url_direct") or ""),
         "raw": job,
+        "company_provided_salary": bool(fit.get("company_provided_salary")),
+        "salary_min": float(fit.get("salary_min") or 0),
+        "salary_max": float(fit.get("salary_max") or 0),
+        "salary_format": str(fit.get("salary_format") or "ANNUAL"),
+        "includes_equity_or_bonus": bool(fit.get("includes_equity_or_bonus")),
+        "jd_salary_format": str(fit.get("jd_salary_format") or "ANNUAL"),
     }
 
 
@@ -158,6 +165,11 @@ def tailor_job(
             master_yaml,
             company=company,
             job_track=job_track,
+        )
+        from src.core.salary_engine import compensation_from_fit, embed_compensation
+
+        yaml_snapshot = embed_compensation(
+            yaml_snapshot, compensation_from_fit(triage)
         )
         logger.info("Tailored PDF ready (%s): %s", job_track or "GENERAL", pdf_path)
         apply_pdf = unique_apply_pdf(pdf_path, company)
@@ -193,7 +205,7 @@ async def apply_job(
     cleanup_linkedin_resume: bool = False,
     job_url_direct: str = "",
 ) -> str:
-    """Browser-only apply. Returns success|fallback|failed|already_applied|timeout|requires_human."""
+    """Browser-only apply. Returns success|fallback|failed|already_applied|timeout|requires_human|job_closed."""
     skip_browser = is_aggregator_listing(job_url) and not is_applyable_url(
         job_url_direct or ""
     )
@@ -229,6 +241,8 @@ async def apply_job(
             master_yaml,
             cleanup_linkedin_resume=cleanup_linkedin_resume,
             user_data_dir=user_data_dir,
+            yaml_snapshot=yaml_snapshot,
+            jd_text=jd_text,
         )
         if ok:
             logger.info(
@@ -260,6 +274,18 @@ async def apply_job(
             tailored_yaml_snapshot=yaml_snapshot,
         )
         return "already_applied"
+    except JobClosedError as exc:
+        logger.info("[skip] Job closed/missing %s — %s", company, exc)
+        log_application(
+            company,
+            job_url,
+            track,
+            "JOB_CLOSED",
+            error_log=str(exc),
+            jd_text=jd_text,
+            tailored_yaml_snapshot=yaml_snapshot,
+        )
+        return "job_closed"
     except RequiresHumanInterventionError as exc:
         logger.warning(
             "[human] %s needs intervention — skipping Manual_Action (%s)",

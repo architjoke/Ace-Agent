@@ -98,7 +98,7 @@ def plan_semantic_actions(
     """Ask Groq/text failover for a compact action list keyed by ace id."""
     if not elements:
         return []
-    from src.core.llm_router import invoke_with_failover
+    from src.core.llm_router import DEFAULT_GROQ_FALLBACK_MODEL, invoke_with_failover
     from src.core.llm_text import message_text
 
     slim = [
@@ -126,7 +126,13 @@ def plan_semantic_actions(
         f"ELEMENTS: {json.dumps(slim, ensure_ascii=False)[:6000]}\n"
     )
     try:
-        raw = invoke_with_failover("triage", prompt, temperature=0)
+        # Role "semantic": Groq-first short JSON; prefer 20b for TPM headroom.
+        raw = invoke_with_failover(
+            "semantic",
+            prompt,
+            temperature=0,
+            model=DEFAULT_GROQ_FALLBACK_MODEL,
+        )
         text = message_text(getattr(raw, "content", raw) if raw is not None else "")
     except Exception:
         logger.exception("semantic plan LLM failed")

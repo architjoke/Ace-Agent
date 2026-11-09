@@ -20,7 +20,8 @@ application_answers:
   require_visa_sponsorship_india: "No"
   willing_to_relocate_india: "Yes"
   preferred_work_mode: "Remote, hybrid, or on-site"
-  expected_ctc: "As per company norms"
+  expected_ctc: "₹6,00,000 – ₹7,00,000 per annum"
+  salary_expectation: "₹6,00,000 – ₹7,00,000 per annum"
   how_did_you_hear: "LinkedIn"
 
 cv:

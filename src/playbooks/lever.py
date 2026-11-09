@@ -174,6 +174,7 @@ def run_lever(
     headless: bool | None = None,
     timeout_ms: int = _DEFAULT_TIMEOUT_MS,
     ats: str | None = None,
+    yaml_snapshot: str | None = None,
 ) -> bool:
     """Fill Lever (or Ashby) apply form. Raises TimeoutError / PlaybookFallback."""
     from playwright.sync_api import TimeoutError as PlaywrightTimeout
@@ -187,7 +188,7 @@ def run_lever(
         raise FileNotFoundError(f"master.yaml not found: {master}")
 
     ashby = (ats == "ashby") or _is_ashby(job_url)
-    fields = load_applicant_profile(master)
+    fields = load_applicant_profile(master, yaml_snapshot=yaml_snapshot)
     context = None
     page = None
     handoff = False
@@ -204,6 +205,12 @@ def run_lever(
         from src.playbooks._common import goto_dom
 
         goto_dom(page, job_url)
+        from src.core.job_closed import page_shows_job_closed
+
+        if page_shows_job_closed(page):
+            from src.core.executor import JobClosedError
+
+            raise JobClosedError(f"Lever/Ashby job closed/missing at {job_url[:160]}")
         _click_apply(page)
 
         filled = _fill_ashby(page, fields) if ashby else _fill_lever(page, fields)
@@ -234,29 +241,30 @@ def run_lever(
         logger.info("%s playbook submitted without clear thank-you — counting success", kind)
         return True
     except PlaywrightTimeout as exc:
-        if context is not None and page is not None:
-            handoff = True
-            from src.playbooks.session import PlaybookHandoff, PlaybookSession
+        from src.playbooks.session import raise_handoff
 
-            raise PlaybookHandoff(
-                f"Lever/Ashby playbook timed out on {job_url}",
-                PlaybookSession.from_live(
-                    context, page, user_data_dir, playwright=pw
-                ),
-            ) from exc
-        raise TimeoutError(f"Lever/Ashby playbook timed out on {job_url}") from exc
+        handoff = context is not None and page is not None
+        raise_handoff(
+            f"Lever/Ashby playbook timed out on {job_url}",
+            context=context,
+            page=page,
+            user_data_dir=user_data_dir,
+            playwright=pw,
+            cause=exc,
+            fallback=TimeoutError(f"Lever/Ashby playbook timed out on {job_url}"),
+        )
     except PlaybookFallback as exc:
-        if context is not None and page is not None:
-            handoff = True
-            from src.playbooks.session import PlaybookHandoff, PlaybookSession
+        from src.playbooks.session import raise_handoff
 
-            raise PlaybookHandoff(
-                str(exc),
-                PlaybookSession.from_live(
-                    context, page, user_data_dir, playwright=pw
-                ),
-            ) from exc
-        raise
+        handoff = context is not None and page is not None
+        raise_handoff(
+            str(exc),
+            context=context,
+            page=page,
+            user_data_dir=user_data_dir,
+            playwright=pw,
+            cause=exc,
+        )
     finally:
         if not handoff:
             from src.playbooks._common import close_context_safe

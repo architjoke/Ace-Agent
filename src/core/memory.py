@@ -17,6 +17,7 @@ VALID_STATUSES = frozenset(
         "ALREADY_APPLIED",
         "FAILED_TIMEOUT_OR_STUCK",
         "REQUIRES_HUMAN_INTERVENTION",
+        "JOB_CLOSED",
     }
 )
 VALID_OUTCOMES = frozenset(
@@ -387,6 +388,7 @@ def application_counts(db_path: Path | None = None) -> dict[str, int]:
     already = by_status.get("ALREADY_APPLIED", 0)
     stuck = by_status.get("FAILED_TIMEOUT_OR_STUCK", 0)
     human = by_status.get("REQUIRES_HUMAN_INTERVENTION", 0)
+    closed = by_status.get("JOB_CLOSED", 0)
     return {
         "staged_ready": staged,
         "manual_action": manual,
@@ -394,7 +396,8 @@ def application_counts(db_path: Path | None = None) -> dict[str, int]:
         "already_applied": already,
         "failed_timeout_or_stuck": stuck,
         "requires_human_intervention": human,
-        "attempted": staged + manual + failed + already + stuck + human,
+        "job_closed": closed,
+        "attempted": staged + manual + failed + already + stuck + human + closed,
         "unique_companies": int(companies or 0),
         "pending_outcomes": int(pending_outcomes or 0),
         **{f"status_{k.lower()}": v for k, v in by_status.items()},

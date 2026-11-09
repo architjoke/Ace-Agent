@@ -120,6 +120,7 @@ def run_greenhouse(
     user_data_dir: Path | str | None = None,
     headless: bool | None = None,
     timeout_ms: int = _DEFAULT_TIMEOUT_MS,
+    yaml_snapshot: str | None = None,
 ) -> bool:
     """Fill a Greenhouse board form via Playwright DOM.
 
@@ -153,6 +154,7 @@ def run_greenhouse(
 
     use_headless = settings.browser_headless if headless is None else bool(headless)
     proxy = playwright_proxy_dict()
+    _ = yaml_snapshot  # accepted for playbook kwargs parity; no salary fields yet
     fields = _load_profile(master)
 
     context = None
@@ -180,6 +182,12 @@ def run_greenhouse(
         from src.playbooks._common import goto_dom
 
         goto_dom(page, job_url)
+        from src.core.job_closed import page_shows_job_closed
+
+        if page_shows_job_closed(page):
+            from src.core.executor import JobClosedError
+
+            raise JobClosedError(f"Greenhouse job closed/missing at {job_url[:160]}")
 
         # Only open the form when identity fields are not already present.
         # Avoid clicking "Submit application" on boards that land on the form URL.
@@ -344,29 +352,30 @@ def run_greenhouse(
         return True
 
     except PlaywrightTimeout as exc:
-        if context is not None and page is not None:
-            handoff = True
-            from src.playbooks.session import PlaybookHandoff, PlaybookSession
+        from src.playbooks.session import raise_handoff
 
-            raise PlaybookHandoff(
-                f"Greenhouse playbook timed out on {job_url}",
-                PlaybookSession.from_live(
-                    context, page, user_data_dir or profile, playwright=pw
-                ),
-            ) from exc
-        raise TimeoutError(f"Greenhouse playbook timed out on {job_url}") from exc
+        handoff = context is not None and page is not None
+        raise_handoff(
+            f"Greenhouse playbook timed out on {job_url}",
+            context=context,
+            page=page,
+            user_data_dir=user_data_dir or profile,
+            playwright=pw,
+            cause=exc,
+            fallback=TimeoutError(f"Greenhouse playbook timed out on {job_url}"),
+        )
     except PlaybookFallback as exc:
-        if context is not None and page is not None:
-            handoff = True
-            from src.playbooks.session import PlaybookHandoff, PlaybookSession
+        from src.playbooks.session import raise_handoff
 
-            raise PlaybookHandoff(
-                str(exc),
-                PlaybookSession.from_live(
-                    context, page, user_data_dir or profile, playwright=pw
-                ),
-            ) from exc
-        raise
+        handoff = context is not None and page is not None
+        raise_handoff(
+            str(exc),
+            context=context,
+            page=page,
+            user_data_dir=user_data_dir or profile,
+            playwright=pw,
+            cause=exc,
+        )
     finally:
         if not handoff:
             from src.playbooks._common import close_context_safe

@@ -15,7 +15,7 @@ from src.playbooks._common import (
     load_applicant_profile,
     success_text,
 )
-from src.playbooks.session import PlaybookHandoff, PlaybookSession
+from src.playbooks.session import raise_handoff
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +142,7 @@ def run_linkedin(
     *,
     user_data_dir: Path | str | None = None,
     headless: bool | None = None,
+    yaml_snapshot: str | None = None,
 ) -> bool:
     """Easy Apply state machine. Raises TimeoutError / PlaybookHandoff / AlreadyAppliedError."""
     from playwright.sync_api import TimeoutError as PlaywrightTimeout
@@ -154,7 +155,7 @@ def run_linkedin(
     if not master.is_file():
         raise FileNotFoundError(f"master.yaml not found: {master}")
 
-    answers = load_applicant_profile(master)
+    answers = load_applicant_profile(master, yaml_snapshot=yaml_snapshot)
     context = None
     page = None
     handoff = False
@@ -169,6 +170,12 @@ def run_linkedin(
         )
         logger.info("LinkedIn playbook navigating %s", job_url)
         goto_dom(page, job_url)
+        from src.core.job_closed import page_shows_job_closed
+
+        if page_shows_job_closed(page):
+            from src.core.executor import JobClosedError
+
+            raise JobClosedError(f"LinkedIn job closed/missing at {job_url[:160]}")
 
         if _already_applied_visible(page):
             from src.core.executor import AlreadyAppliedError
@@ -219,23 +226,26 @@ def run_linkedin(
             "linkedin playbook: too many steps without submit — Gemini"
         )
     except PlaywrightTimeout as exc:
-        if context is not None and page is not None:
-            handoff = True
-            session = PlaybookSession.from_live(
-                context, page, user_data_dir, playwright=pw
-            )
-            raise PlaybookHandoff(
-                f"linkedin playbook timed out on {job_url}", session
-            ) from exc
-        raise TimeoutError(f"linkedin playbook timed out on {job_url}") from exc
+        handoff = context is not None and page is not None
+        raise_handoff(
+            f"linkedin playbook timed out on {job_url}",
+            context=context,
+            page=page,
+            user_data_dir=user_data_dir,
+            playwright=pw,
+            cause=exc,
+            fallback=TimeoutError(f"linkedin playbook timed out on {job_url}"),
+        )
     except PlaybookFallback as exc:
-        if context is not None and page is not None:
-            handoff = True
-            session = PlaybookSession.from_live(
-                context, page, user_data_dir, playwright=pw
-            )
-            raise PlaybookHandoff(str(exc), session) from exc
-        raise
+        handoff = context is not None and page is not None
+        raise_handoff(
+            str(exc),
+            context=context,
+            page=page,
+            user_data_dir=user_data_dir,
+            playwright=pw,
+            cause=exc,
+        )
     finally:
         if not handoff:
             close_context_safe(context, user_data_dir=user_data_dir)

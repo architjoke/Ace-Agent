@@ -218,6 +218,7 @@ def run_workday(
     user_data_dir: Path | str | None = None,
     headless: bool | None = None,
     timeout_ms: int = _DEFAULT_TIMEOUT_MS,
+    yaml_snapshot: str | None = None,
 ) -> bool:
     """Workday multi-step apply via ARIA. Raises TimeoutError / PlaybookFallback."""
     from playwright.sync_api import TimeoutError as PlaywrightTimeout
@@ -230,7 +231,7 @@ def run_workday(
     if not master.is_file():
         raise FileNotFoundError(f"master.yaml not found: {master}")
 
-    fields = load_applicant_profile(master)
+    fields = load_applicant_profile(master, yaml_snapshot=yaml_snapshot)
     context = None
     page = None
     handoff = False
@@ -247,6 +248,12 @@ def run_workday(
         from src.playbooks._common import goto_dom
 
         goto_dom(page, job_url)
+        from src.core.job_closed import page_shows_job_closed
+
+        if page_shows_job_closed(page):
+            from src.core.executor import JobClosedError
+
+            raise JobClosedError(f"Workday job closed/missing at {job_url[:160]}")
         _start_apply(page)
 
         if not _upload_resume_aria(page, pdf):
@@ -297,29 +304,30 @@ def run_workday(
 
         raise PlaybookFallback("Workday playbook: too many steps without success — Gemini")
     except PlaywrightTimeout as exc:
-        if context is not None and page is not None:
-            handoff = True
-            from src.playbooks.session import PlaybookHandoff, PlaybookSession
+        from src.playbooks.session import raise_handoff
 
-            raise PlaybookHandoff(
-                f"Workday playbook timed out on {job_url}",
-                PlaybookSession.from_live(
-                    context, page, user_data_dir, playwright=pw
-                ),
-            ) from exc
-        raise TimeoutError(f"Workday playbook timed out on {job_url}") from exc
+        handoff = context is not None and page is not None
+        raise_handoff(
+            f"Workday playbook timed out on {job_url}",
+            context=context,
+            page=page,
+            user_data_dir=user_data_dir,
+            playwright=pw,
+            cause=exc,
+            fallback=TimeoutError(f"Workday playbook timed out on {job_url}"),
+        )
     except PlaybookFallback as exc:
-        if context is not None and page is not None:
-            handoff = True
-            from src.playbooks.session import PlaybookHandoff, PlaybookSession
+        from src.playbooks.session import raise_handoff
 
-            raise PlaybookHandoff(
-                str(exc),
-                PlaybookSession.from_live(
-                    context, page, user_data_dir, playwright=pw
-                ),
-            ) from exc
-        raise
+        handoff = context is not None and page is not None
+        raise_handoff(
+            str(exc),
+            context=context,
+            page=page,
+            user_data_dir=user_data_dir,
+            playwright=pw,
+            cause=exc,
+        )
     finally:
         if not handoff:
             from src.playbooks._common import close_context_safe

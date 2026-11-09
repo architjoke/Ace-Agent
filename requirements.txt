@@ -6,6 +6,8 @@ langchain-groq
 groq>=0.30.0,<1.0.0
 langchain-ollama
 langchain-nvidia-ai-endpoints
+langchain-cohere
+langchain-openai
 langgraph
 langchain-core
 rendercv

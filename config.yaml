@@ -1,15 +1,18 @@
 # Ace Job Agent — user preferences (edit freely; no code changes needed)
 #
-# Hybrid LLM architecture
-#   browser-use (apply)  → Gemini vision/DOM ONLY
-#   draft/triage/fallback → Groq → NVIDIA → Ollama (env pins prefer head, keep chain)
-#   reflect/inbox         → Ollama → Groq → NVIDIA
+# Multi-model LLM architecture
+#   browser-use (apply) → Gemini vision/DOM ONLY (+ CDP handoff)
+#   draft/fallback      → OpenAI → NVIDIA → Ollama
+#   triage (fit)        → Cohere → NVIDIA → Ollama
+#   semantic DOM        → Groq → NVIDIA
+#   reflect/inbox       → Ollama → NVIDIA → Cohere
 # Env ACE_*_PROVIDER / ACE_ALLOW_GEMINI_TEXT always override this block.
 
 llm:
-  draft: groq
-  triage: groq
-  fallback: groq
+  draft: openai
+  triage: cohere
+  fallback: openai
+  semantic: groq
   reflect: ollama
   inbox: ollama
   allow_gemini_text: false

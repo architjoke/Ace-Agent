@@ -95,6 +95,10 @@ class AlreadyAppliedError(RuntimeError):
     """Raised when DB or DOM indicates this job was already applied to."""
 
 
+class JobClosedError(RuntimeError):
+    """Raised when the job posting is closed / missing (does not exist)."""
+
+
 class RequiresHumanInterventionError(RuntimeError):
     """Playbook + CDP handoff failed — soft-fail without Manual_Action package."""
 
@@ -110,7 +114,12 @@ def _keep_resume_names() -> list[str]:
     return list(_DEFAULT_KEEP_RESUMES)
 
 
-def _application_answers_block(master_path: Path) -> str:
+def _application_answers_block(
+    master_path: Path,
+    *,
+    jd_text: str | None = None,
+    yaml_snapshot: str | None = None,
+) -> str:
     """Extract application_answers from master.yaml for the browser prompt."""
     try:
         data = yaml.safe_load(master_path.read_text(encoding="utf-8")) or {}
@@ -122,11 +131,20 @@ def _application_answers_block(master_path: Path) -> str:
     answers = data.get("application_answers")
     if not isinstance(answers, dict) or not answers:
         return ""
+    from src.core.salary import inject_salary_answers
+
+    answers = inject_salary_answers(
+        answers, jd_text=jd_text, yaml_snapshot=yaml_snapshot
+    )
     lines = ["## APPLICATION FORM ANSWERS (authoritative — use these on the form)"]
     for key, value in answers.items():
         if value is None or value == "":
             continue
         lines.append(f"- {key}: {value}")
+    lines.append(
+        "- salary_rule: Always enter expected salary as INR per annum "
+        "(never monthly unless the field label forces monthly — then divide annual by 12)."
+    )
     return "\n".join(lines)
 
 
@@ -630,51 +648,27 @@ async def _run_ats_playbook(
     master_path: Path,
     *,
     user_data_dir: Path | str | None = None,
+    yaml_snapshot: str | None = None,
 ) -> bool:
     """Dispatch to the DOM playbook for a classified ATS kind."""
     logger.info("ATS router → %s playbook for %s", kind, job_url)
+    kwargs: dict = {
+        "user_data_dir": user_data_dir,
+        "yaml_snapshot": yaml_snapshot,
+    }
     if kind == "greenhouse":
-        from src.playbooks.greenhouse import run_greenhouse
+        from src.playbooks.greenhouse import run_greenhouse as run
+    elif kind in {"lever", "ashby"}:
+        from src.playbooks.lever import run_lever as run
 
-        return await asyncio.to_thread(
-            run_greenhouse,
-            job_url,
-            pdf_path,
-            master_path,
-            user_data_dir=user_data_dir,
-        )
-    if kind in {"lever", "ashby"}:
-        from src.playbooks.lever import run_lever
-
-        return await asyncio.to_thread(
-            run_lever,
-            job_url,
-            pdf_path,
-            master_path,
-            user_data_dir=user_data_dir,
-            ats=kind,
-        )
-    if kind == "workday":
-        from src.playbooks.workday import run_workday
-
-        return await asyncio.to_thread(
-            run_workday,
-            job_url,
-            pdf_path,
-            master_path,
-            user_data_dir=user_data_dir,
-        )
-    if kind == "linkedin":
-        from src.playbooks.linkedin import run_linkedin
-
-        return await asyncio.to_thread(
-            run_linkedin,
-            job_url,
-            pdf_path,
-            master_path,
-            user_data_dir=user_data_dir,
-        )
-    return False
+        kwargs["ats"] = kind
+    elif kind == "workday":
+        from src.playbooks.workday import run_workday as run
+    elif kind == "linkedin":
+        from src.playbooks.linkedin import run_linkedin as run
+    else:
+        return False
+    return await asyncio.to_thread(run, job_url, pdf_path, master_path, **kwargs)
 
 
 async def _execute_cdp_handoff(
@@ -683,6 +677,9 @@ async def _execute_cdp_handoff(
     job_url: str,
     pdf_path: Path,
     master_path: Path,
+    *,
+    yaml_snapshot: str | None = None,
+    jd_text: str | None = None,
 ) -> bool:
     """Inject Gemini into the open playbook Chromium via CDP; always close session."""
     pdf_abs = os.path.abspath(str(pdf_path))
@@ -704,7 +701,9 @@ async def _execute_cdp_handoff(
                 f"No CDP endpoint for handoff: {reason}"
             )
 
-        form_answers = _application_answers_block(master_path)
+        form_answers = _application_answers_block(
+            master_path, jd_text=jd_text, yaml_snapshot=yaml_snapshot
+        )
         max_steps, timeout_sec = _step_budget(job_url)
         task = TASK_HANDOFF.format(
             pdf_abs_path=pdf_abs,
@@ -766,6 +765,8 @@ async def execute_application(
     auto_submit: bool | None = None,
     cleanup_linkedin_resume: bool | None = None,
     user_data_dir: Path | str | None = None,
+    yaml_snapshot: str | None = None,
+    jd_text: str | None = None,
 ) -> bool:
     """Apply via ATS playbook when possible, else browser-use Gemini vision.
 
@@ -792,12 +793,14 @@ async def execute_application(
     )
 
     # Phase 1B: DOM fast-fail before playbook / Gemini token burn.
-    from src.core.already_applied import probe_already_applied
+    from src.core.job_closed import probe_job_page
 
-    already = await asyncio.to_thread(
-        probe_already_applied, job_url, user_data_dir=user_data_dir
+    probe = await asyncio.to_thread(
+        probe_job_page, job_url, user_data_dir=user_data_dir
     )
-    if already:
+    if probe == "closed":
+        raise JobClosedError(f"Job closed or page does not exist at {job_url[:160]}")
+    if probe == "already_applied":
         raise AlreadyAppliedError(f"DOM already-applied signal at {job_url[:160]}")
 
     from src.playbooks import PlaybookFallback, resolve_ats_kind
@@ -816,12 +819,19 @@ async def execute_application(
     }:
         try:
             ok = await _run_ats_playbook(
-                kind, job_url, pdf_path, master_path, user_data_dir=user_data_dir
+                kind,
+                job_url,
+                pdf_path,
+                master_path,
+                user_data_dir=user_data_dir,
+                yaml_snapshot=yaml_snapshot,
             )
             if ok:
                 logger.info("%s playbook succeeded for %s", kind, job_url)
                 return True
         except AlreadyAppliedError:
+            raise
+        except JobClosedError:
             raise
         except PlaybookHandoff as handoff:
             logger.warning(
@@ -835,6 +845,8 @@ async def execute_application(
                 job_url,
                 pdf_path,
                 master_path,
+                yaml_snapshot=yaml_snapshot,
+                jd_text=jd_text,
             )
         except (TimeoutError, PlaybookFallback) as exc:
             logger.warning(
@@ -848,7 +860,12 @@ async def execute_application(
                 mgr = ProxySessionManager()
                 if mgr.available() and mgr.rotate():
                     ok_retry = await _run_ats_playbook(
-                        kind, job_url, pdf_path, master_path, user_data_dir=user_data_dir
+                        kind,
+                        job_url,
+                        pdf_path,
+                        master_path,
+                        user_data_dir=user_data_dir,
+                        yaml_snapshot=yaml_snapshot,
                     )
                     if ok_retry:
                         logger.info(
@@ -868,6 +885,8 @@ async def execute_application(
                     job_url,
                     pdf_path,
                     master_path,
+                    yaml_snapshot=yaml_snapshot,
+                    jd_text=jd_text,
                 )
             except Exception:
                 logger.debug("Playbook proxy-rotate retry skipped", exc_info=True)
@@ -902,6 +921,8 @@ async def execute_application(
         auto_submit=do_submit,
         cleanup_linkedin_resume=do_cleanup,
         user_data_dir=user_data_dir,
+        yaml_snapshot=yaml_snapshot,
+        jd_text=jd_text,
     )
 
 
@@ -913,6 +934,8 @@ async def _execute_with_browser_use(
     auto_submit: bool,
     cleanup_linkedin_resume: bool,
     user_data_dir: Path | str | None = None,
+    yaml_snapshot: str | None = None,
+    jd_text: str | None = None,
 ) -> bool:
     """Drive browser-use through the apply form (Gemini vision/DOM)."""
     pdf_abs = os.path.abspath(str(pdf_path))
@@ -922,7 +945,9 @@ async def _execute_with_browser_use(
     do_cleanup = bool(cleanup_linkedin_resume)
 
     master_preview = master_path.read_text(encoding="utf-8")
-    form_answers = _application_answers_block(master_path)
+    form_answers = _application_answers_block(
+        master_path, jd_text=jd_text, yaml_snapshot=yaml_snapshot
+    )
     lessons = load_lessons()
     max_steps, timeout_sec = _step_budget(job_url)
 

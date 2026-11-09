@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import re
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -103,48 +102,5 @@ def page_shows_already_applied(page) -> bool:
     return False
 
 
-def probe_already_applied(
-    job_url: str,
-    *,
-    user_data_dir: Path | str | None = None,
-    timeout_ms: int = 15_000,
-) -> bool:
-    """Open job_url with profile cookies; True if already applied. Always closes context."""
-    url = (job_url or "").strip()
-    if not url:
-        return False
-
-    from playwright.sync_api import sync_playwright
-
-    from src.playbooks._common import goto_dom, launch_persistent_context
-
-    context = None
-    try:
-        with sync_playwright() as p:
-            context, page = launch_persistent_context(
-                p,
-                user_data_dir=user_data_dir,
-                timeout_ms=timeout_ms,
-            )
-            try:
-                goto_dom(page, url, timeout_ms=timeout_ms)
-                page.wait_for_timeout(400)
-                hit = page_shows_already_applied(page)
-                if hit:
-                    logger.info("DOM fast-fail: already applied detected at %s", url[:160])
-                return hit
-            finally:
-                try:
-                    context.close()
-                except Exception:
-                    logger.exception("Failed to close already-applied probe context")
-                context = None
-    except Exception:
-        logger.warning("Already-applied DOM probe failed for %s — continuing apply", url[:160])
-        return False
-    finally:
-        if context is not None:
-            try:
-                context.close()
-            except Exception:
-                pass
+# probe_already_applied removed — use src.core.job_closed.probe_job_page
+# (closed + already-applied in one Chromium open).

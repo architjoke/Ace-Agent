@@ -32,8 +32,6 @@ BROWSER_SYSTEM_EXTENSION = (
 )
 
 # Back-compat alias
-AUTH_SYSTEM_EXTENSION = BROWSER_SYSTEM_EXTENSION
-
 TASK_HANDOFF = """HANDOFF MODE: You have been injected into an active application form. The previous
 script completed the initial steps but got stuck. Do not navigate away. Look at the
 current modal, resolve the missing fields or errors, and click Next/Submit. Prefer
@@ -82,6 +80,11 @@ Use the APPLICATION FORM ANSWERS block below for every matching field.
 - Address / pincode / ZIP / postal: use the listed city, state, country, pincode fields.
 - Do not invent street/house numbers if not listed — use city/state/PIN/country.
 - Never fabricate salary history, foreign citizenship, or security-clearance eligibility.
+- Expected salary / CTC / compensation: ALWAYS use the annual INR figure from APPLICATION FORM ANSWERS
+  (default band ₹6,00,000–₹7,00,000 per annum). If the field is monthly, enter annual÷12.
+  If the JD posts a salary range, stay inside that range when possible, still as per annum.
+- JOB CLOSED: If the page says the job does not exist, is closed, expired, filled, or no longer
+  available — STOP immediately. Do not apply. Describe the closed signal.
 
 ## HARD RULES
 - ALWAYS upload from the disk path above — never click a previously listed LinkedIn resume.
@@ -220,6 +223,14 @@ Only if ALL hard rules pass, score skill/project fit from 1–100:
 - High scores require overlap on repeated JD hard skills + relevant projects.
 - Do NOT invent experience. A role needing mostly unsupported stack should score <60.
 
+## COMPENSATION EXTRACT (always fill — even if fit_score is 0)
+- company_provided_salary: true only if JD states pay/CTC/stipend/salary numbers.
+- salary_min / salary_max: numeric bounds as written. If JD says "6-8 LPA", use
+  600000 and 800000 (INR). If monthly stipend "25000", use 25000 and set format MONTHLY.
+- salary_format: ANNUAL | MONTHLY | STIPEND (as the JD states).
+- includes_equity_or_bonus: true if equity, RSU, variable, or joining bonus is mentioned.
+- If no pay info: company_provided_salary=false, min=0, max=0, format=ANNUAL, equity=false.
+
 Return structured fields only.
 
 ## Job Description
@@ -236,7 +247,8 @@ Return structured fields only.
 EVALUATE_FIT_JSON_HINT = (
     "\n\nReply with ONLY a JSON object with keys: "
     "fit_score, reason, rule_broken, matched_skills, "
-    "missing_must_haves, recommended_track."
+    "missing_must_haves, recommended_track, company_provided_salary, "
+    "salary_min, salary_max, salary_format, includes_equity_or_bonus."
 )
 
 # ── Tailor draft ────────────────────────────────────────────────────
