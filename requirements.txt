@@ -1,5 +1,5 @@
 python-jobspy
-google-genai
+google-genai>=2.34.0,<3.0.0
 langchain-google-genai
 langchain-groq
 # Keep groq<1 for langchain-groq; browser-use pins groq==1.0.0 but Gemini path does not need it.
@@ -13,7 +13,8 @@ langchain-core
 rendercv
 # Drop-in Playwright fork with rebrowser anti-detect patches (import stays `playwright`).
 rebrowser-playwright
-browser-use
+# Pin — unpinned resolves can pull ancient 0.5.x; Gemini apply path needs 0.13+.
+browser-use>=0.13.14
 pyyaml
 pandas
 pydantic
