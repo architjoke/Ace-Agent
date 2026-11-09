@@ -28,11 +28,9 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 load_dotenv(REPO / ".env")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
-)
+from src.core.security import install_redacting_logging
+
+install_redacting_logging()
 logger = logging.getLogger("ace_cli")
 
 
@@ -45,6 +43,26 @@ def _start_worker(max_results: int | None, cycle_sleep: int) -> int:
         return 0
 
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from src.core.logutil import env_max_bytes, rotate_if_oversized
+
+        rotate_if_oversized(LOG_FILE, max_bytes=env_max_bytes("ACE_LOG_MAX_BYTES"))
+    except Exception as exc:
+        logger.debug("Log rotation skipped: %s", exc)
+
+    # If previous worker died, reclaim CLAIMED rows before spawning a new one.
+    try:
+        from src.core.queue import reclaim_orphaned_claims
+
+        stats = reclaim_orphaned_claims()
+        if stats.get("retried") or stats.get("abandoned"):
+            print(
+                f"Reclaimed orphaned queue claims: "
+                f"retry={stats.get('retried', 0)} abandoned={stats.get('abandoned', 0)}"
+            )
+    except Exception as exc:
+        logger.warning("Orphan reclaim on start failed: %s", exc)
+
     # Clone login profile → w1..wn and clear Chromium singleton locks.
     try:
         from src.core.browser_pool import clear_singleton_locks, clone_profiles_from_master

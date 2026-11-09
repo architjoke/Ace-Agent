@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 import time
 from datetime import datetime, timezone
@@ -12,8 +13,17 @@ from pathlib import Path
 from typing import Any, Callable, Awaitable
 
 from src.core.config import PROJECT_ROOT, WORKER_STATUS
-from src.core.queue import claim_next, mark_done, queue_counts, requeue_stale_claims
+from src.core.host_limiter import HostRateLimiter
+from src.core.queue import (
+    WAIT_SENTINEL_KEY,
+    claim_next,
+    mark_done,
+    queue_counts,
+    reclaim_orphaned_claims,
+    requeue_stale_claims,
+)
 from src.core.settings import get_settings
+from src.core.utils import env_truthy
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +191,16 @@ class LinkedInRateLimiter:
 ApplyFn = Callable[..., Awaitable[str]]
 
 
+_BROWSER_CRASH_NEEDLES = (
+    "target closed",
+    "browser has been closed",
+    "chromium",
+    "disconnected",
+    "protocol error",
+    "browsercontext",
+)
+
+
 async def browser_worker_loop(
     worker_id: str,
     *,
@@ -189,16 +209,26 @@ async def browser_worker_loop(
     stop_event: asyncio.Event,
     producers_done: asyncio.Event,
     linkedin_limiter: LinkedInRateLimiter | None = None,
+    host_limiter: HostRateLimiter | None = None,
     idle_poll_sec: float = 1.5,
     launch_stagger_sec: float = 0.0,
 ) -> dict[str, int]:
     """Pull READY queue items until producers finish and the queue is empty."""
     from src.core.executor import ApplicationBlockedError, ApplicationTimeoutError
 
+    # Pool default: warm Chromium keep-alive unless user explicitly set 0.
+    user_keep_alive_pin = (
+        os.environ["ACE_BROWSER_KEEP_ALIVE"]
+        if "ACE_BROWSER_KEEP_ALIVE" in os.environ
+        else None
+    )
+    os.environ.setdefault("ACE_BROWSER_KEEP_ALIVE", "1")
+
     profile = worker_profile_dir(worker_id)
     clear_singleton_locks(profile)
     counts = {"success": 0, "fallback": 0, "failed": 0, "skipped": 0}
     update_one_worker(worker_id, status="idle", company="", profile=str(profile))
+    force_cold_next = False
 
     # Stagger first Chromium launch so 3 windows don't slam open together.
     if launch_stagger_sec > 0:
@@ -208,13 +238,25 @@ async def browser_worker_loop(
     while True:
         if stop_event.is_set():
             break
-        item = claim_next(worker_id)
+        from src.core.telemetry import time_stage
+
+        with time_stage("queue_claim_wait_ms", worker=worker_id):
+            item = claim_next(worker_id, host_limiter=host_limiter)
         if item is None:
             if producers_done.is_set():
                 # READY empty → peers own any remaining CLAIMED rows; we can stop.
                 if queue_counts().get("READY", 0) == 0:
                     break
             await asyncio.sleep(idle_poll_sec)
+            continue
+
+        if WAIT_SENTINEL_KEY in item and "id" not in item:
+            wait_s = min(30.0, float(item.get(WAIT_SENTINEL_KEY) or 1.0))
+            logger.info("[%s] all peeked hosts cooling — sleep %.1fs", worker_id, wait_s)
+            with time_stage(
+                "queue_claim_wait_ms", worker=worker_id, wait_sentinel=True
+            ):
+                await asyncio.sleep(wait_s)
             continue
 
         company = str(item.get("company") or "Unknown")
@@ -224,6 +266,9 @@ async def browser_worker_loop(
         pdf_path = str(item.get("pdf_path") or "")
         yaml_snapshot = str(item.get("yaml_snapshot") or "")
         qid = int(item["id"])
+
+        if host_limiter is not None:
+            host_limiter.mark_dispatched(job_url)
 
         update_one_worker(
             worker_id, status="busy", company=company, job_url=job_url[:180]
@@ -238,6 +283,15 @@ async def browser_worker_loop(
 
         if "linkedin.com" in job_url.lower() and linkedin_limiter is not None:
             await linkedin_limiter.acquire()
+
+        if force_cold_next:
+            os.environ["ACE_BROWSER_KEEP_ALIVE"] = "0"
+            clear_singleton_locks(profile)
+            force_cold_next = False
+        elif user_keep_alive_pin is not None:
+            os.environ["ACE_BROWSER_KEEP_ALIVE"] = user_keep_alive_pin
+        else:
+            os.environ["ACE_BROWSER_KEEP_ALIVE"] = "1"
 
         try:
             outcome = await apply_fn(
@@ -260,11 +314,42 @@ async def browser_worker_loop(
                 exc,
             )
             outcome = "failed"
+            err_l = f"{type(exc).__name__} {exc}".lower()
+            if any(n in err_l for n in _BROWSER_CRASH_NEEDLES):
+                force_cold_next = True
+                try:
+                    from src.core.browser_warmup import invalidate_slot
+
+                    invalidate_slot(profile)
+                except Exception:
+                    logger.debug("[%s] slot invalidate after crash failed", worker_id, exc_info=True)
 
         counts[outcome] = counts.get(outcome, 0) + 1
         mark_done(qid, error_log=outcome)
         update_one_worker(worker_id, status="idle", company="", last_outcome=outcome)
 
+        # Between warm jobs, avoid panic lock clears that race a live Chromium.
+        if not env_truthy("ACE_BROWSER_KEEP_ALIVE", "1") or force_cold_next:
+            clear_singleton_locks(profile)
+            if force_cold_next:
+                try:
+                    from src.core.browser_warmup import invalidate_slot
+
+                    invalidate_slot(profile)
+                except Exception:
+                    logger.debug("[%s] cold slot invalidate failed", worker_id, exc_info=True)
+
+    # Normal pool exit: soft-blank so the next hunt cycle reuses Chromium.
+    # Crash/TTL still invalidate; process exit uses close_all_slots (atexit/SIGTERM).
+    try:
+        from src.core.browser_warmup import blank_slot, invalidate_slot
+
+        if env_truthy("ACE_BROWSER_KEEP_ALIVE", "1"):
+            blank_slot(profile)
+        else:
+            invalidate_slot(profile)
+    except Exception:
+        logger.debug("[%s] exit slot cleanup failed", worker_id, exc_info=True)
     update_one_worker(worker_id, status="stopped", company="")
     logger.info("[%s] worker exit counts=%s", worker_id, counts)
     return counts
@@ -283,6 +368,10 @@ async def run_browser_pool(
     settings = get_settings()
     n = int(n_workers if n_workers is not None else settings.browser_workers)
     n = max(1, min(8, n))
+    try:
+        reclaim_orphaned_claims()
+    except Exception:
+        logger.exception("Pool startup orphan reclaim failed")
     requeue_stale_claims()
     clone_profiles_from_master(n)
     stop = stop_event or asyncio.Event()
@@ -293,6 +382,7 @@ async def run_browser_pool(
             else settings.linkedin_max_per_hour
         )
     )
+    host_lim = HostRateLimiter()
     tasks = [
         asyncio.create_task(
             browser_worker_loop(
@@ -302,13 +392,22 @@ async def run_browser_pool(
                 stop_event=stop,
                 producers_done=producers_done,
                 linkedin_limiter=lim,
+                host_limiter=host_lim,
                 launch_stagger_sec=float(i - 1) * 2.5,
             ),
             name=f"browser-w{i}",
         )
         for i in range(1, n + 1)
     ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        try:
+            from src.core.browser_warmup import blank_all_slots
+
+            blank_all_slots()
+        except Exception:
+            logger.debug("blank_all_slots after pool failed", exc_info=True)
     merged = {"success": 0, "fallback": 0, "failed": 0, "skipped": 0}
     for r in results:
         if isinstance(r, dict):

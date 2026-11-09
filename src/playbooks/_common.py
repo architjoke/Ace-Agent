@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, unquote, urlparse
 
 import yaml
 
@@ -18,6 +20,12 @@ CHROMIUM_STEALTH_ARGS: list[str] = [
     "--remote-debugging-port=0",
 ]
 
+_TRACKING_Q = frozenset(
+    {"ref", "source", "gh_src", "trk", "trkinfo", "lipi", "originalSubdomain"}
+)
+_TRACKING_Q_RE = re.compile(r"^utm_", re.I)
+
+
 def pick_chrome_user_agent() -> str:
     """Back-compat alias — always returns the pinned (non-random) UA."""
     from src.core.browser_identity import pinned_user_agent
@@ -29,8 +37,83 @@ def pick_chrome_user_agent() -> str:
 GOTO_DOM_TIMEOUT_MS = 15_000
 
 
-def goto_dom(page, url: str, *, timeout_ms: int = GOTO_DOM_TIMEOUT_MS) -> None:
-    """Navigate with wait_until=domcontentloaded; one reload retry on timeout."""
+def try_cdp_assist(cdp_assist, reason: str) -> bool:
+    """Invoke optional sync CDP assist callback; False on missing/failure."""
+    if cdp_assist is None:
+        return False
+    try:
+        return bool(cdp_assist(str(reason or "stuck")))
+    except Exception:
+        logger.debug("cdp_assist raised", exc_info=True)
+        return False
+
+
+def _norm_host(host: str) -> str:
+    h = (host or "").lower().removeprefix("www.")
+    return h
+
+
+def _host_peers(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    if a.endswith(".greenhouse.io") and b.endswith(".greenhouse.io"):
+        return True
+    if a.endswith(".myworkdayjobs.com") and b.endswith(".myworkdayjobs.com"):
+        return a == b
+    # lever ↔ ashby only with matching path job token (checked in urls_equivalent)
+    return False
+
+
+def _filter_q(query: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for k, v in parse_qsl(query or "", keep_blank_values=True):
+        lk = k.lower()
+        if lk in _TRACKING_Q or _TRACKING_Q_RE.match(lk):
+            continue
+        out[lk] = v
+    return out
+
+
+def urls_equivalent(current: str, target: str) -> bool:
+    """True when current page is already the target job (redirects / utm / trailing slash)."""
+    try:
+        c, t = urlparse((current or "").strip()), urlparse((target or "").strip())
+    except Exception:
+        return False
+    if not t.netloc or not c.netloc:
+        return False
+    ch, th = _norm_host(c.hostname or ""), _norm_host(t.hostname or "")
+    lever_ashby = {ch, th} <= {"jobs.lever.co", "jobs.ashbyhq.com"} and ch != th
+    if not (_host_peers(ch, th) or lever_ashby):
+        return False
+    cp = unquote((c.path or "/").rstrip("/") or "/")
+    tp = unquote((t.path or "/").rstrip("/") or "/")
+    if lever_ashby:
+        # require last path segment (job id) equal
+        if (cp.rsplit("/", 1)[-1] or "") != (tp.rsplit("/", 1)[-1] or ""):
+            return False
+    elif not (cp == tp or cp.startswith(tp + "/")):
+        return False
+    tq, cq = _filter_q(t.query), _filter_q(c.query)
+    return all(cq.get(k) == v for k, v in tq.items())
+
+
+def goto_dom(
+    page,
+    url: str,
+    *,
+    timeout_ms: int = GOTO_DOM_TIMEOUT_MS,
+    force: bool = False,
+) -> None:
+    """Navigate with wait_until=domcontentloaded; skip if already on equivalent URL."""
+    if not force:
+        try:
+            cur = page.url or ""
+        except Exception:
+            cur = ""
+        if cur and urls_equivalent(cur, url):
+            logger.debug("goto_dom skip — already on %s", (cur or "")[:160])
+            return
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
     except Exception as first_exc:
@@ -170,14 +253,25 @@ def launch_persistent_context(
         "user_agent": pinned_user_agent(user_data_dir=profile),
         "viewport": vp,
         "device_scale_factor": pinned_device_scale_factor(),
+        # Zero-Trust: no downloads; no geo/camera/mic grants.
+        "accept_downloads": False,
+        "permissions": [],
     }
     if proxy_cfg:
         launch_kwargs["proxy"] = proxy_cfg
-    context = playwright.chromium.launch_persistent_context(**launch_kwargs)
+    from src.core.telemetry import time_stage
+
+    with time_stage("chromium_startup_ms", profile=str(profile)):
+        context = playwright.chromium.launch_persistent_context(**launch_kwargs)
     try:
         context.add_init_script(webdriver_stealth_script())
     except Exception:
         logger.debug("webdriver stealth init_script failed", exc_info=True)
+    try:
+        # Belt-and-suspenders if the browser still prompts for media/geo.
+        context.clear_permissions()
+    except Exception:
+        logger.debug("clear_permissions unavailable", exc_info=True)
     page = context.pages[0] if context.pages else context.new_page()
     page.set_default_timeout(timeout_ms)
     return context, page

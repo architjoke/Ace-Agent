@@ -40,8 +40,8 @@ from src.core.memory import (
     log_application,
 )
 from src.core.queue import enqueue_apply, init_queue, queue_counts
-from src.core.settings import get_settings, reload_settings
-from src.core.config import OUTPUT_DIR, PROJECT_ROOT
+from src.core.settings import reload_settings
+from src.core.config import PROJECT_ROOT
 from src.core.tailor import _safe_dir_name, optimize_resume
 
 logger = logging.getLogger("ace_agent")
@@ -82,13 +82,14 @@ def triage_job(
     min_fit: int,
 ) -> dict[str, Any] | None:
     """Fit triage. Returns enriched job dict or None if dropped/skipped/failed."""
+    from src.core.utils import minify_jd
+
     company = str(job.get("company") or "Unknown").strip() or "Unknown"
     title = str(job.get("title") or "").strip()
     track = str(job.get("track") or "").strip()
     job_url = pick_apply_url(job)
-    description = str(job.get("description") or "").strip()
+    description = minify_jd(str(job.get("description") or "").strip())
 
-    print(company)
     logger.info(
         "Triage [%s] %s @ %s → %s",
         track or "?",
@@ -165,6 +166,7 @@ def tailor_job(
             master_yaml,
             company=company,
             job_track=job_track,
+            job_title=str(triage.get("title") or ""),
         )
         from src.core.salary_engine import compensation_from_fit, embed_compensation
 
@@ -369,7 +371,7 @@ async def _produce_one(
     master_yaml: Path,
     master_text: str,
     min_fit: int,
-    tailor_sem: asyncio.Semaphore,
+    produce_sem: asyncio.Semaphore,
     groq_sem: asyncio.Semaphore,
     counts: dict[str, int],
     target: int,
@@ -378,7 +380,7 @@ async def _produce_one(
 ) -> None:
     if stop_produce.is_set():
         return
-    async with tailor_sem:
+    async with produce_sem:
         if stop_produce.is_set():
             return
         triage = await asyncio.to_thread(triage_job, job, master_text, min_fit)
@@ -406,9 +408,37 @@ async def _produce_one(
         )
         if target > 0:
             async with target_lock:
-                appliedish = counts.get("queued", 0)
-                if appliedish >= target:
+                if counts.get("queued", 0) >= target:
                     stop_produce.set()
+
+
+def _env_int(name: str, default: int) -> int:
+    import os
+
+    try:
+        return max(1, int((os.environ.get(name) or str(default)).strip()))
+    except ValueError:
+        return default
+
+
+async def _wait_queue_warm(
+    *,
+    threshold: int,
+    producers_done: asyncio.Event,
+    poll_sec: float = 0.25,
+) -> None:
+    """Block until READY≥threshold or producers finished (avoids eternal wait)."""
+    while True:
+        if queue_counts().get("READY", 0) >= threshold:
+            logger.info("Queue warm — READY≥%s; starting browser pool", threshold)
+            return
+        if producers_done.is_set():
+            logger.info(
+                "Producers done before warm threshold (%s); starting browser pool",
+                threshold,
+            )
+            return
+        await asyncio.sleep(poll_sec)
 
 
 async def run_parallel(
@@ -440,18 +470,20 @@ async def run_parallel(
     tracks = settings.tracks or None
     min_fit = settings.minimum_fit_score
     target = int(target_companies) if target_companies and target_companies > 0 else 0
-    tailor_workers = max(1, int(settings.tailor_workers))
+    produce_n = _env_int("ACE_PRODUCER_CONCURRENCY", 15)
+    warm_n = _env_int("ACE_QUEUE_WARM_THRESHOLD", 5)
     browser_workers = max(1, int(settings.browser_workers))
     groq_slots = max(1, int(settings.groq_concurrency))
 
     logger.info(
-        "Parallel hunt near %s — %s/track fit≥%s | tailor=%s groq=%s browsers=%s%s",
+        "Parallel hunt near %s — %s/track fit≥%s | produce=%s groq=%s browsers=%s warm≥%s%s",
         loc,
         per_track,
         min_fit,
-        tailor_workers,
+        produce_n,
         groq_slots,
         browser_workers,
+        warm_n,
         f", stop after {target} queued" if target else "",
     )
 
@@ -481,7 +513,7 @@ async def run_parallel(
         "skipped": 0,
         "queued": 0,
     }
-    tailor_sem = asyncio.Semaphore(tailor_workers)
+    produce_sem = asyncio.Semaphore(produce_n)
     groq_sem = asyncio.Semaphore(groq_slots)
     stop_produce = asyncio.Event()
     producers_done = asyncio.Event()
@@ -492,15 +524,16 @@ async def run_parallel(
         counts[outcome] = counts.get(outcome, 0) + 1
         return outcome
 
-    pool_task = asyncio.create_task(
-        run_browser_pool(
+    async def _start_pool_when_warm() -> dict:
+        await _wait_queue_warm(threshold=warm_n, producers_done=producers_done)
+        return await run_browser_pool(
             master_yaml=master_yaml,
             apply_fn=_apply_wrapper,
             n_workers=browser_workers,
             producers_done=producers_done,
-        ),
-        name="browser-pool",
-    )
+        )
+
+    pool_task = asyncio.create_task(_start_pool_when_warm(), name="browser-pool")
 
     produce_tasks = [
         asyncio.create_task(
@@ -509,7 +542,7 @@ async def run_parallel(
                 master_yaml,
                 master_text,
                 min_fit,
-                tailor_sem,
+                produce_sem,
                 groq_sem,
                 counts,
                 target,

@@ -24,11 +24,9 @@ from src.core.memory import has_applied
 from src.core.pipeline import apply_job, run_parallel, tailor_job, triage_job
 from src.core.settings import get_settings
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
-)
+from src.core.security import install_redacting_logging
+
+install_redacting_logging()
 logger = logging.getLogger("ace_agent")
 
 

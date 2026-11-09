@@ -121,18 +121,24 @@ def run_greenhouse(
     headless: bool | None = None,
     timeout_ms: int = _DEFAULT_TIMEOUT_MS,
     yaml_snapshot: str | None = None,
+    context=None,
+    page=None,
+    cdp_assist=None,
+    **kwargs,
 ) -> bool:
     """Fill a Greenhouse board form via Playwright DOM.
 
     Raises TimeoutError / PlaybookFallback on failure so caller can Gemini-fallback.
-    Always closes the browser to release the Chromium profile lock.
+    Owned launches close Chromium; warm slots only reset context state.
     """
     from playwright.sync_api import TimeoutError as PlaywrightTimeout
     from playwright.sync_api import sync_playwright
 
     from src.core.network import playwright_proxy_dict
     from src.core.settings import get_settings
+    from src.playbooks._common import try_cdp_assist
 
+    _ = kwargs
     pdf = Path(pdf_path).expanduser().resolve()
     master = Path(master_yaml_path).expanduser().resolve()
     if not pdf.is_file():
@@ -144,39 +150,47 @@ def run_greenhouse(
     profile = Path(user_data_dir) if user_data_dir else Path(settings.browser_user_data_dir)
     profile = profile.expanduser().resolve()
     profile.mkdir(parents=True, exist_ok=True)
-    # Clear singleton locks so Playwright can attach
-    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
-        lock = profile / name
-        try:
-            lock.unlink(missing_ok=True)
-        except OSError:
-            pass
 
     use_headless = settings.browser_headless if headless is None else bool(headless)
     proxy = playwright_proxy_dict()
     _ = yaml_snapshot  # accepted for playbook kwargs parity; no salary fields yet
     fields = _load_profile(master)
 
-    context = None
-    page = None
+    owned = context is None
     handoff = False
-    pw = sync_playwright().start()
+    pw = None
+    if owned:
+        # Clear singleton locks so Playwright can attach
+        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            lock = profile / name
+            try:
+                lock.unlink(missing_ok=True)
+            except OSError:
+                pass
+        pw = sync_playwright().start()
     try:
-        from src.core.browser_identity import pinned_user_agent, pinned_viewport
-        from src.playbooks._common import CHROMIUM_STEALTH_ARGS
+        if owned:
+            from src.core.browser_identity import pinned_user_agent, pinned_viewport
+            from src.playbooks._common import CHROMIUM_STEALTH_ARGS
 
-        launch_kwargs: dict[str, Any] = {
-            "user_data_dir": str(profile),
-            "headless": use_headless,
-            "args": list(CHROMIUM_STEALTH_ARGS),
-            "user_agent": pinned_user_agent(user_data_dir=profile),
-            "viewport": pinned_viewport(),
-        }
-        if proxy:
-            launch_kwargs["proxy"] = proxy
-        context = pw.chromium.launch_persistent_context(**launch_kwargs)
-        page = context.pages[0] if context.pages else context.new_page()
-        page.set_default_timeout(timeout_ms)
+            launch_kwargs: dict[str, Any] = {
+                "user_data_dir": str(profile),
+                "headless": use_headless,
+                "args": list(CHROMIUM_STEALTH_ARGS),
+                "user_agent": pinned_user_agent(user_data_dir=profile),
+                "viewport": pinned_viewport(),
+                "accept_downloads": False,
+                "permissions": [],
+            }
+            if proxy:
+                launch_kwargs["proxy"] = proxy
+            context = pw.chromium.launch_persistent_context(**launch_kwargs)
+            try:
+                context.clear_permissions()
+            except Exception:
+                pass
+            page = context.pages[0] if context.pages else context.new_page()
+            page.set_default_timeout(timeout_ms)
 
         logger.info("Greenhouse playbook navigating %s", job_url)
         from src.playbooks._common import goto_dom
@@ -284,14 +298,20 @@ def run_greenhouse(
 
         uploaded = _upload_resume(page, pdf)
         if not uploaded:
-            raise PlaybookFallback("Greenhouse playbook: resume file input not found")
+            reason = "Greenhouse playbook: resume file input not found"
+            if try_cdp_assist(cdp_assist, reason) and _upload_resume(page, pdf):
+                pass
+            else:
+                raise PlaybookFallback(reason)
         if not filled_any and not fields["email"]:
             raise PlaybookFallback("Greenhouse playbook: no profile fields to fill")
 
         if _has_unanswered_custom(page):
-            raise PlaybookFallback(
-                "Greenhouse playbook: unanswered custom/required fields — Gemini"
-            )
+            reason = "Greenhouse playbook: unanswered custom/required fields — Gemini"
+            if try_cdp_assist(cdp_assist, reason) and not _has_unanswered_custom(page):
+                pass
+            else:
+                raise PlaybookFallback(reason)
 
         submitted = False
         for name in (
@@ -325,7 +345,27 @@ def run_greenhouse(
                     continue
 
         if not submitted:
-            raise PlaybookFallback("Greenhouse playbook: submit control not found")
+            reason = "Greenhouse playbook: submit control not found"
+            if try_cdp_assist(cdp_assist, reason):
+                for name in (
+                    "Submit application",
+                    "Submit Application",
+                    "Submit",
+                    "Apply",
+                    "Send application",
+                ):
+                    btn = page.get_by_role(
+                        "button", name=re.compile(rf"^{re.escape(name)}$", re.I)
+                    )
+                    try:
+                        if btn.count() and btn.first.is_visible():
+                            btn.first.click(timeout=8000)
+                            submitted = True
+                            break
+                    except Exception:
+                        continue
+            if not submitted:
+                raise PlaybookFallback(reason)
 
         page.wait_for_timeout(2000)
         body = ""
@@ -378,10 +418,19 @@ def run_greenhouse(
         )
     finally:
         if not handoff:
-            from src.playbooks._common import close_context_safe
+            if owned:
+                from src.playbooks._common import close_context_safe
 
-            close_context_safe(context, user_data_dir=user_data_dir or profile)
-            try:
-                pw.stop()
-            except Exception:
-                pass
+                close_context_safe(context, user_data_dir=user_data_dir or profile)
+                if pw is not None:
+                    try:
+                        pw.stop()
+                    except Exception:
+                        pass
+            else:
+                from src.core.browser_warmup import reset_context_state
+
+                try:
+                    reset_context_state(context, page)
+                except Exception:
+                    logger.debug("warm greenhouse reset failed", exc_info=True)

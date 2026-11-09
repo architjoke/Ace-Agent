@@ -175,11 +175,18 @@ def run_lever(
     timeout_ms: int = _DEFAULT_TIMEOUT_MS,
     ats: str | None = None,
     yaml_snapshot: str | None = None,
+    context=None,
+    page=None,
+    cdp_assist=None,
+    **kwargs,
 ) -> bool:
     """Fill Lever (or Ashby) apply form. Raises TimeoutError / PlaybookFallback."""
     from playwright.sync_api import TimeoutError as PlaywrightTimeout
     from playwright.sync_api import sync_playwright
 
+    from src.playbooks._common import try_cdp_assist
+
+    _ = kwargs
     pdf = Path(pdf_path).expanduser().resolve()
     master = Path(master_yaml_path).expanduser().resolve()
     if not pdf.is_file():
@@ -189,17 +196,19 @@ def run_lever(
 
     ashby = (ats == "ashby") or _is_ashby(job_url)
     fields = load_applicant_profile(master, yaml_snapshot=yaml_snapshot)
-    context = None
-    page = None
+    owned = context is None
     handoff = False
-    pw = sync_playwright().start()
+    pw = None
+    if owned:
+        pw = sync_playwright().start()
     try:
-        context, page = launch_persistent_context(
-            pw,
-            user_data_dir=user_data_dir,
-            headless=headless,
-            timeout_ms=timeout_ms,
-        )
+        if owned:
+            context, page = launch_persistent_context(
+                pw,
+                user_data_dir=user_data_dir,
+                headless=headless,
+                timeout_ms=timeout_ms,
+            )
         kind = "ashby" if ashby else "lever"
         logger.info("%s playbook navigating %s", kind.capitalize(), job_url)
         from src.playbooks._common import goto_dom
@@ -216,17 +225,27 @@ def run_lever(
         filled = _fill_ashby(page, fields) if ashby else _fill_lever(page, fields)
         uploaded = upload_resume_file(page, pdf)
         if not uploaded:
-            raise PlaybookFallback(f"{kind} playbook: resume file input not found")
+            reason = f"{kind} playbook: resume file input not found"
+            if try_cdp_assist(cdp_assist, reason) and upload_resume_file(page, pdf):
+                pass
+            else:
+                raise PlaybookFallback(reason)
         if not filled and not fields.get("email"):
             raise PlaybookFallback(f"{kind} playbook: no profile fields filled")
 
         if _unanswered_custom(page):
-            raise PlaybookFallback(
-                f"{kind} playbook: unanswered custom/required fields — Gemini"
-            )
+            reason = f"{kind} playbook: unanswered custom/required fields — Gemini"
+            if try_cdp_assist(cdp_assist, reason) and not _unanswered_custom(page):
+                pass
+            else:
+                raise PlaybookFallback(reason)
 
         if not _submit(page):
-            raise PlaybookFallback(f"{kind} playbook: submit control not found")
+            reason = f"{kind} playbook: submit control not found"
+            if try_cdp_assist(cdp_assist, reason) and _submit(page):
+                pass
+            else:
+                raise PlaybookFallback(reason)
 
         page.wait_for_timeout(2000)
         try:
@@ -267,10 +286,19 @@ def run_lever(
         )
     finally:
         if not handoff:
-            from src.playbooks._common import close_context_safe
+            if owned:
+                from src.playbooks._common import close_context_safe
 
-            close_context_safe(context, user_data_dir=user_data_dir)
-            try:
-                pw.stop()
-            except Exception:
-                pass
+                close_context_safe(context, user_data_dir=user_data_dir)
+                if pw is not None:
+                    try:
+                        pw.stop()
+                    except Exception:
+                        pass
+            else:
+                from src.core.browser_warmup import reset_context_state
+
+                try:
+                    reset_context_state(context, page)
+                except Exception:
+                    logger.debug("warm lever reset failed", exc_info=True)

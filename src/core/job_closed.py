@@ -46,7 +46,6 @@ def page_shows_job_closed(page) -> bool:
         except Exception:
             body = ""
     text = f"{title}\n{body or ''}"
-    # Prefer short error pages — avoid false positives in long JD prose.
     if _CLOSED_RE.search(text):
         if len(text) < 6000 or re.search(
             r"does\s+not\s+exist|404|no\s+longer\s+available|job\s+closed",
@@ -57,45 +56,58 @@ def page_shows_job_closed(page) -> bool:
     return False
 
 
+def probe_on_page(page, job_url: str, *, timeout_ms: int = 15_000) -> JobProbeResult:
+    """Closed / already-applied / ok on an existing warm page (no launch/close)."""
+    url = (job_url or "").strip()
+    if not url or page is None:
+        return "ok"
+    from src.core.already_applied import page_shows_already_applied
+    from src.playbooks._common import goto_dom
+
+    try:
+        goto_dom(page, url, timeout_ms=timeout_ms)
+        page.wait_for_timeout(400)
+        if page_shows_job_closed(page):
+            logger.info("DOM fast-fail: job closed/missing at %s", url[:160])
+            return "closed"
+        if page_shows_already_applied(page):
+            logger.info("DOM fast-fail: already applied at %s", url[:160])
+            return "already_applied"
+        return "ok"
+    except Exception:
+        logger.warning("Job-page DOM probe failed for %s — continuing apply", url[:160])
+        return "ok"
+
+
 def probe_job_page(
     job_url: str,
     *,
     user_data_dir: Path | str | None = None,
     timeout_ms: int = 15_000,
+    page=None,
 ) -> JobProbeResult:
-    """Single Chromium open: closed → already-applied → ok. Always closes context."""
+    """Probe closed/already-applied. Pass ``page`` to reuse warm Chromium."""
+    if page is not None:
+        return probe_on_page(page, job_url, timeout_ms=timeout_ms)
+
     url = (job_url or "").strip()
     if not url:
         return "ok"
 
     from playwright.sync_api import sync_playwright
 
-    from src.core.already_applied import page_shows_already_applied
-    from src.playbooks._common import goto_dom, launch_persistent_context
+    from src.playbooks._common import close_context_safe, launch_persistent_context
 
     context = None
     try:
         with sync_playwright() as p:
-            context, page = launch_persistent_context(
-                p,
-                user_data_dir=user_data_dir,
-                timeout_ms=timeout_ms,
+            context, pg = launch_persistent_context(
+                p, user_data_dir=user_data_dir, timeout_ms=timeout_ms
             )
             try:
-                goto_dom(page, url, timeout_ms=timeout_ms)
-                page.wait_for_timeout(400)
-                if page_shows_job_closed(page):
-                    logger.info("DOM fast-fail: job closed/missing at %s", url[:160])
-                    return "closed"
-                if page_shows_already_applied(page):
-                    logger.info("DOM fast-fail: already applied at %s", url[:160])
-                    return "already_applied"
-                return "ok"
+                return probe_on_page(pg, url, timeout_ms=timeout_ms)
             finally:
-                try:
-                    context.close()
-                except Exception:
-                    logger.exception("Failed to close job-page probe context")
+                close_context_safe(context, user_data_dir=user_data_dir)
                 context = None
     except Exception:
         logger.warning("Job-page DOM probe failed for %s — continuing apply", url[:160])
@@ -103,6 +115,6 @@ def probe_job_page(
     finally:
         if context is not None:
             try:
-                context.close()
+                close_context_safe(context, user_data_dir=user_data_dir)
             except Exception:
                 pass

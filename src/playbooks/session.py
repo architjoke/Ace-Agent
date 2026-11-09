@@ -88,9 +88,22 @@ class PlaybookSession:
         except Exception:
             pass
 
+    def detach(self) -> None:
+        """Yield tab back to Playwright — auth-safe reset, Chromium stays alive."""
+        from src.core.browser_warmup import reset_context_state
+
+        if self.context is None:
+            return
+        try:
+            self.page = reset_context_state(self.context, self.page)
+        except Exception:
+            logger.debug("warm detach reset failed", exc_info=True)
+
     def close(self) -> None:
+        """Hard teardown (fatal / keep_alive=0). Prefer ``detach`` on warm path."""
         from src.playbooks._common import close_context_safe
 
+        self.detach()
         close_context_safe(self.context, user_data_dir=self.user_data_dir)
         self.context = None
         self.page = None

@@ -219,11 +219,18 @@ def run_workday(
     headless: bool | None = None,
     timeout_ms: int = _DEFAULT_TIMEOUT_MS,
     yaml_snapshot: str | None = None,
+    context=None,
+    page=None,
+    cdp_assist=None,
+    **kwargs,
 ) -> bool:
     """Workday multi-step apply via ARIA. Raises TimeoutError / PlaybookFallback."""
     from playwright.sync_api import TimeoutError as PlaywrightTimeout
     from playwright.sync_api import sync_playwright
 
+    from src.playbooks._common import try_cdp_assist
+
+    _ = kwargs
     pdf = Path(pdf_path).expanduser().resolve()
     master = Path(master_yaml_path).expanduser().resolve()
     if not pdf.is_file():
@@ -232,18 +239,20 @@ def run_workday(
         raise FileNotFoundError(f"master.yaml not found: {master}")
 
     fields = load_applicant_profile(master, yaml_snapshot=yaml_snapshot)
-    context = None
-    page = None
+    owned = context is None
     handoff = False
-    pw = sync_playwright().start()
+    pw = None
+    if owned:
+        pw = sync_playwright().start()
     started = time.monotonic()
     try:
-        context, page = launch_persistent_context(
-            pw,
-            user_data_dir=user_data_dir,
-            headless=headless,
-            timeout_ms=timeout_ms,
-        )
+        if owned:
+            context, page = launch_persistent_context(
+                pw,
+                user_data_dir=user_data_dir,
+                headless=headless,
+                timeout_ms=timeout_ms,
+            )
         logger.info("Workday playbook navigating %s", job_url)
         from src.playbooks._common import goto_dom
 
@@ -257,7 +266,11 @@ def run_workday(
         _start_apply(page)
 
         if not _upload_resume_aria(page, pdf):
-            raise PlaybookFallback("Workday playbook: Resume/CV upload control not found")
+            reason = "Workday playbook: Resume/CV upload control not found"
+            if try_cdp_assist(cdp_assist, reason) and _upload_resume_aria(page, pdf):
+                pass
+            else:
+                raise PlaybookFallback(reason)
         _wait_parser(page)
 
         for step in range(12):
@@ -269,9 +282,11 @@ def run_workday(
             _fill_known_fields(page, fields)
 
             if _custom_unanswered(page):
-                raise PlaybookFallback(
-                    "Workday playbook: unanswered custom/required fields — Gemini"
-                )
+                reason = "Workday playbook: unanswered custom/required fields — Gemini"
+                if try_cdp_assist(cdp_assist, reason) and not _custom_unanswered(page):
+                    pass
+                else:
+                    raise PlaybookFallback(reason)
 
             action = _click_next_or_submit(page)
             page.wait_for_timeout(1200)
@@ -298,9 +313,10 @@ def run_workday(
                 return True
 
             if action is None:
-                raise PlaybookFallback(
-                    "Workday playbook: Next/Submit control not found — Gemini"
-                )
+                reason = "Workday playbook: Next/Submit control not found — Gemini"
+                if try_cdp_assist(cdp_assist, reason):
+                    continue
+                raise PlaybookFallback(reason)
 
         raise PlaybookFallback("Workday playbook: too many steps without success — Gemini")
     except PlaywrightTimeout as exc:
@@ -330,10 +346,19 @@ def run_workday(
         )
     finally:
         if not handoff:
-            from src.playbooks._common import close_context_safe
+            if owned:
+                from src.playbooks._common import close_context_safe
 
-            close_context_safe(context, user_data_dir=user_data_dir)
-            try:
-                pw.stop()
-            except Exception:
-                pass
+                close_context_safe(context, user_data_dir=user_data_dir)
+                if pw is not None:
+                    try:
+                        pw.stop()
+                    except Exception:
+                        pass
+            else:
+                from src.core.browser_warmup import reset_context_state
+
+                try:
+                    reset_context_state(context, page)
+                except Exception:
+                    logger.debug("warm workday reset failed", exc_info=True)

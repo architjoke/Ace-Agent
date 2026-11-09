@@ -64,7 +64,9 @@ resumes/**
 !resumes/README.md
 
 # ── Logs & temp ──────────────────────────────────────────────────
+# Covers agent.log, output/ace_worker.log, and any other runtime logs.
 *.log
+agent.log
 *.tmp
 *.bak
 .cache/

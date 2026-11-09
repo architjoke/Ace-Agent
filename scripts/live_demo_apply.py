@@ -1,5 +1,7 @@
 """Live demo: tailor + auto-submit a few career jobs (headed browser).
 
+# debug only — not part of the production ace CLI / daemon path.
+
 Usage (from repo root):
   python scripts/live_demo_apply.py
   python scripts/live_demo_apply.py --limit 3

@@ -16,6 +16,7 @@ from langchain_core.tools import tool
 from src.core.config import CONFIG_YAML, OUTPUT_DIR, PROJECT_ROOT, ensure_runtime_dirs
 from src.core.memory import _connect, _norm_company, init_db
 from src.core.preferences import memorize_preference
+from src.core.security import validate_safe_path
 from src.core.settings import reload_settings
 
 logger = logging.getLogger(__name__)
@@ -48,13 +49,14 @@ def _safe_dir_name(name: str) -> str:
 
 def _assert_under(path: Path, root: Path) -> Path:
     """Resolve path and require it stays strictly under root (no escape)."""
+    # Global project jail first, then tighten to the caller's subtree.
+    path_r = validate_safe_path(path)
     root_r = root.resolve()
-    path_r = path.expanduser().resolve()
     try:
         path_r.relative_to(root_r)
     except ValueError as exc:
         raise PermissionError(
-            f"Path jail violation: {path_r} is outside {root_r}"
+            f"Sandbox Violation: {path_r} is outside {root_r}"
         ) from exc
     return path_r
 
@@ -368,7 +370,7 @@ def update_config_preference(target_key: str, new_value: str) -> str:
             f"Key {key!r} is not in the allowlist. Allowed keys: [{allowed}]"
         )
 
-    path = CONFIG_YAML
+    path = validate_safe_path(CONFIG_YAML, allow_config_yaml=True)
     if not path.is_file():
         raise ValueError(f"config.yaml missing at {path}")
 
@@ -414,6 +416,7 @@ def update_config_preference(target_key: str, new_value: str) -> str:
         coerced = val_s
 
     old = _dig_set(raw, key, coerced)
+    path = validate_safe_path(path, allow_config_yaml=True)
     path.write_text(
         yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
         encoding="utf-8",

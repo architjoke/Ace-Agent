@@ -6,13 +6,14 @@ langchain-groq
 groq>=0.30.0,<1.0.0
 langchain-ollama
 langchain-nvidia-ai-endpoints
-langchain-cohere
-langchain-openai
+langchain-cohere>=0.4.0
+cohere>=5.0.0,<6.0.0
+langchain-openai>=0.3.0
 langgraph
 langchain-core
 rendercv
 # Drop-in Playwright fork with rebrowser anti-detect patches (import stays `playwright`).
-rebrowser-playwright
+rebrowser-playwright>=1.49.0
 # Pin — unpinned resolves can pull ancient 0.5.x; Gemini apply path needs 0.13+.
 browser-use>=0.13.14
 pyyaml
@@ -24,3 +25,5 @@ spacy
 python-dotenv
 schedule
 pypdf
+# Test runner (async tests use asyncio.run — pytest-asyncio optional).
+pytest>=8.0.0

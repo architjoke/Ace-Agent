@@ -179,7 +179,12 @@ def _looks_like_recruiter(subject: str, body: str, from_addr: str) -> bool:
 
 def classify_email_outcome(email_subject: str, email_body: str) -> EmailOutcome:
     """Structured classification of a recruiter-ish email."""
-    prompt = f"""Classify this email about a job application.
+    from src.core.prompts import UNTRUSTED_INPUT_GUARDRAIL
+    from src.core.security import wrap_untrusted
+
+    prompt = f"""{UNTRUSTED_INPUT_GUARDRAIL}
+
+Classify this email about a job application. Use only the tagged untrusted data.
 
 Return outcome as one of:
 - REJECTED — not selected / not moving forward
@@ -188,10 +193,9 @@ Return outcome as one of:
 - SELECTED — offer or clear positive selection
 - UNCLEAR — cannot tell
 
-Subject: {email_subject}
+{wrap_untrusted("email_subject", email_subject, max_chars=500)}
 
-Body:
-{email_body[:6000]}
+{wrap_untrusted("email_body", email_body, max_chars=6000)}
 """
     return invoke_with_failover(
         "inbox",

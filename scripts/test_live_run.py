@@ -1,5 +1,7 @@
 """Isolated critical-path dry-runs.
 
+# debug only — not part of the production ace CLI / daemon path.
+
 Usage (from repo root):
   python scripts/test_live_run.py
   python scripts/test_live_run.py --full

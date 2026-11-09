@@ -10,6 +10,7 @@ from pathlib import Path
 from src.core.llm_router import invoke_with_failover
 from src.core.llm_text import message_text
 from src.core.memory import recent_failures, recent_rejections
+from src.core.security import validate_safe_path
 from src.core.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -44,7 +45,7 @@ def lessons_path() -> Path:
 
 
 def _ensure_lessons_file() -> Path:
-    path = lessons_path()
+    path = validate_safe_path(lessons_path())
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.is_file():
         if _SEED_LESSONS.is_file():
@@ -54,7 +55,7 @@ def _ensure_lessons_file() -> Path:
                 "# Lessons Learned (agent self-training)\n\n",
                 encoding="utf-8",
             )
-    return path
+    return validate_safe_path(path)
 
 
 def load_lessons() -> str:
@@ -64,7 +65,7 @@ def load_lessons() -> str:
 
 
 def _append_rules(title: str, rules: str, incident_count: int) -> None:
-    path = _ensure_lessons_file()
+    path = validate_safe_path(_ensure_lessons_file())
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     section = f"\n\n## {title} {stamp} ({incident_count} incidents)\n\n{rules}\n"
     with path.open("a", encoding="utf-8") as fh:

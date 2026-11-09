@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 from pathlib import Path
 
@@ -121,6 +120,7 @@ def format_status() -> str:
             f"Manual Action (couldn't submit): {counts['manual_action']} (folders: {len(manuals)})",
             f"Already applied (skipped): {counts.get('already_applied', 0)}",
             f"Timeout/stuck:            {counts.get('failed_timeout_or_stuck', 0)}",
+            f"Interrupted (reclaim):    {counts.get('failed_interrupted', 0)}",
             f"Needs human (soft-fail):  {counts.get('requires_human_intervention', 0)}",
             f"Job closed/missing:       {counts.get('job_closed', 0)}",
             f"Failed:                   {counts['failed']}",

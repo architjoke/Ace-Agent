@@ -14,7 +14,6 @@ from src.core.config import (
     BROWSER_PROFILE,
     CONFIG_YAML,
     LESSONS_LEARNED,
-    MASTER_YAML,
     MEMORY_DB,
     OUTPUT_DIR,
     PROJECT_ROOT,

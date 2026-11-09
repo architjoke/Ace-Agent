@@ -14,8 +14,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-from src.core.config import DATA_DIR, LESSONS_LEARNED
-from src.core.reflect import _ensure_lessons_file, lessons_path
+from src.core.config import DATA_DIR
+from src.core.reflect import _ensure_lessons_file
+from src.core.security import validate_safe_path
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +147,7 @@ def memorize_preference(
     if len(text) > 500:
         text = text[:500].rstrip() + "…"
 
-    path = _ensure_lessons_file()
+    path = validate_safe_path(_ensure_lessons_file())
     existing = load_preference_rules(path)
     now = _now_iso()
     # Re-affirm duplicate (same category+text+level)
@@ -174,6 +175,7 @@ def memorize_preference(
 
 
 def _rewrite_affirmed(path: Path, rule_id: str, affirmed_iso: str) -> None:
+    path = validate_safe_path(path)
     raw = path.read_text(encoding="utf-8")
     pattern = re.compile(
         rf'(<!--\s*ACE_PREF\s+id="{re.escape(rule_id)}"[^>]*?\s)affirmed="[^"]+"',
@@ -185,7 +187,7 @@ def _rewrite_affirmed(path: Path, rule_id: str, affirmed_iso: str) -> None:
 
 
 def _archive_path() -> Path:
-    return DATA_DIR / "lessons_archived.md"
+    return validate_safe_path(DATA_DIR / "lessons_archived.md")
 
 
 def prune_decayed_preferences(ttl_days: int = SOFT_TTL_DAYS) -> str:

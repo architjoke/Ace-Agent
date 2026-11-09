@@ -219,25 +219,55 @@ def page_blocked(page) -> bool:
     return looks_blocked(f"{title}\n{body}")
 
 
+def _semantic_fill(page, job_url: str, pdf: Path, answers: dict) -> bool:
+    from src.playbooks._common import goto_dom, success_text
+
+    goto_dom(page, job_url)
+    if page_blocked(page):
+        raise RuntimeError("blocked: captcha/cloudflare on semantic apply")
+    elements = extract_interactive(page)
+    if len(elements) < 2:
+        logger.info("semantic DOM: too few elements (%s) — skip", len(elements))
+        return False
+    actions = plan_semantic_actions(elements, answers=answers, resume_path=str(pdf))
+    if not actions:
+        logger.info("semantic DOM: empty plan — skip")
+        return False
+    execute_semantic_actions(page, actions, str(pdf))
+    elements2 = extract_interactive(page)
+    if elements2:
+        actions2 = plan_semantic_actions(
+            elements2, answers=answers, resume_path=str(pdf)
+        )
+        if actions2:
+            execute_semantic_actions(page, actions2, str(pdf))
+    page.wait_for_timeout(800)
+    if page_blocked(page):
+        raise RuntimeError("blocked: captcha after semantic actions")
+    try:
+        body = page.inner_text("body") or ""
+    except Exception:
+        body = ""
+    if success_text(body):
+        logger.info("semantic DOM apply succeeded for %s", job_url[:160])
+        return True
+    logger.info("semantic DOM apply did not confirm success — fall through")
+    return False
+
+
 def try_semantic_apply(
     job_url: str,
     pdf_path: Path | str,
     master_yaml_path: Path | str,
     *,
     user_data_dir: Path | str | None = None,
+    page=None,
 ) -> bool:
-    """Groq-first DOM apply. True on thank-you/success; False to fall through."""
+    """Groq-first DOM apply. Pass ``page`` to reuse warm Chromium (no launch)."""
     if not env_truthy("ACE_SEMANTIC_DOM", "1"):
         return False
 
-    from playwright.sync_api import sync_playwright
-
-    from src.playbooks._common import (
-        close_context_safe,
-        goto_dom,
-        launch_persistent_context,
-        success_text,
-    )
+    from src.playbooks._common import close_context_safe, launch_persistent_context
 
     pdf = Path(pdf_path).expanduser().resolve()
     master = Path(master_yaml_path).expanduser().resolve()
@@ -245,51 +275,30 @@ def try_semantic_apply(
         return False
 
     answers = _answers_dict(master)
+
+    if page is not None:
+        try:
+            return _semantic_fill(page, job_url, pdf, answers)
+        except Exception:
+            logger.warning(
+                "semantic DOM (warm) aborted for %s", job_url[:160], exc_info=True
+            )
+            return False
+
+    from playwright.sync_api import sync_playwright
+
     manager = ProxySessionManager()
 
     def _once() -> bool:
         context = None
         try:
             with sync_playwright() as p:
-                context, page = launch_persistent_context(
+                context, pg = launch_persistent_context(
                     p,
                     user_data_dir=user_data_dir,
                     proxy=manager.playwright_proxy(),
                 )
-                goto_dom(page, job_url)
-                if page_blocked(page):
-                    raise RuntimeError("blocked: captcha/cloudflare on semantic apply")
-                elements = extract_interactive(page)
-                if len(elements) < 2:
-                    logger.info("semantic DOM: too few elements (%s) — skip", len(elements))
-                    return False
-                actions = plan_semantic_actions(
-                    elements, answers=answers, resume_path=str(pdf)
-                )
-                if not actions:
-                    logger.info("semantic DOM: empty plan — skip")
-                    return False
-                execute_semantic_actions(page, actions, str(pdf))
-                # Second pass for multi-step forms (Next → more fields)
-                elements2 = extract_interactive(page)
-                if elements2:
-                    actions2 = plan_semantic_actions(
-                        elements2, answers=answers, resume_path=str(pdf)
-                    )
-                    if actions2:
-                        execute_semantic_actions(page, actions2, str(pdf))
-                page.wait_for_timeout(800)
-                if page_blocked(page):
-                    raise RuntimeError("blocked: captcha after semantic actions")
-                try:
-                    body = page.inner_text("body") or ""
-                except Exception:
-                    body = ""
-                if success_text(body):
-                    logger.info("semantic DOM apply succeeded for %s", job_url[:160])
-                    return True
-                logger.info("semantic DOM apply did not confirm success — fall through")
-                return False
+                return _semantic_fill(pg, job_url, pdf, answers)
         finally:
             close_context_safe(context, user_data_dir=user_data_dir)
 

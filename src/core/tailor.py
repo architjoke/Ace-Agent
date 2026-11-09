@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Literal, TypedDict
 
@@ -25,12 +28,117 @@ from src.core.llm_router import (
     text_provider_name,
 )
 from src.core.config import OUTPUT_DIR as _DEFAULT_OUTPUT
-from src.core.config import PROJECT_ROOT, THEMES_DIR, resolve_master_yaml
+from src.core.config import PROJECT_ROOT, THEMES_DIR, ensure_runtime_dirs, resolve_master_yaml
 from src.core.llm_text import message_text
 from src.core.prompts import DRAFT_RESUME
 from src.core.reflect import load_lessons
 
 logger = logging.getLogger(__name__)
+
+_ARCHETYPE_LOCK = threading.Lock()
+_ARCHETYPE_CACHE_FILE = _DEFAULT_OUTPUT / "archetype_pdf_cache.json"
+_ALIAS_SUBS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\b(?:sde|swe|software\s*dev(?:eloper|elopment)?|software\s*engineer)s?\b", re.I), "software_engineer"),
+    (re.compile(r"\b(?:back[\s-]?end|be)\b", re.I), "backend"),
+    (re.compile(r"\b(?:front[\s-]?end|fe)\b", re.I), "frontend"),
+    (re.compile(r"\bfull[\s-]?stack\b", re.I), "fullstack"),
+    (re.compile(r"\b(?:machine\s+learning|ml)\b", re.I), "ml"),
+    (re.compile(r"\bdata\s+scientists?\b", re.I), "data_scientist"),
+    (re.compile(r"\b(?:devops|sre)\b", re.I), "devops"),
+]
+
+
+def normalize_role_title(title: str) -> str:
+    """Normalize job title → archetype slug (title hash, not full JD)."""
+    s = (title or "").lower().replace("&", " ").replace("/", " ").replace("|", " ")
+    for pat, repl in _ALIAS_SUBS:
+        s = pat.sub(repl, s)
+    s = re.sub(r"[^a-z0-9_\s]+", " ", s)
+    s = re.sub(r"\s+", "_", s.strip()).strip("_")
+    return (s or "general")[:64]
+
+
+def _archetype_key(track: str, title: str) -> str:
+    return f"{(track or 'GENERAL').strip().upper()}|{normalize_role_title(title)}"
+
+
+def _cache_ttl_sec() -> float:
+    try:
+        return max(1.0, float(os.environ.get("ACE_ARCHETYPE_CACHE_HOURS") or "48")) * 3600.0
+    except ValueError:
+        return 48.0 * 3600.0
+
+
+def _load_archetype_cache() -> dict:
+    if not _ARCHETYPE_CACHE_FILE.is_file():
+        return {}
+    try:
+        return json.loads(_ARCHETYPE_CACHE_FILE.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
+def _save_archetype_cache(data: dict) -> None:
+    ensure_runtime_dirs()
+    tmp = _ARCHETYPE_CACHE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(_ARCHETYPE_CACHE_FILE)
+
+
+def lookup_archetype_pdf(track: str, title: str) -> tuple[str, str] | None:
+    """Return (pdf, yaml) if a same-archetype PDF was built within TTL.
+
+    Same-title archetypes share PDFs across companies for 48h — intentional.
+    """
+    if not (title or "").strip():
+        return None
+    key = _archetype_key(track, title)
+    with _ARCHETYPE_LOCK:
+        row = _load_archetype_cache().get(key)
+    if not isinstance(row, dict):
+        return None
+    try:
+        if time.time() - float(row.get("ts") or 0) > _cache_ttl_sec():
+            return None
+    except (TypeError, ValueError):
+        return None
+    pdf = str(row.get("pdf") or "").strip()
+    if not pdf:
+        return None
+    try:
+        from src.core.security import validate_safe_path
+
+        pdf_path = validate_safe_path(pdf)
+    except Exception:
+        return None
+    if not pdf_path.is_file():
+        return None
+    return str(pdf_path.resolve()), str(row.get("yaml") or "")
+
+
+def store_archetype_pdf(track: str, title: str, pdf: str, yaml_text: str = "") -> None:
+    if not (title or "").strip() or not pdf:
+        return
+    try:
+        from src.core.security import validate_safe_path
+
+        pdf_path = validate_safe_path(pdf)
+    except Exception:
+        return
+    if not pdf_path.is_file():
+        return
+    key = _archetype_key(track, title)
+    with _ARCHETYPE_LOCK:
+        data = _load_archetype_cache()
+        data[key] = {
+            "pdf": str(pdf_path.resolve()),
+            "yaml": yaml_text or "",
+            "ts": time.time(),
+        }
+        try:
+            _save_archetype_cache(data)
+        except Exception:
+            logger.debug("archetype cache write failed", exc_info=True)
 
 # Fallback only — real gate is per-company / per-JD via resolve_ats_pass_score()
 ATS_PASS_SCORE_DEFAULT = 85
@@ -1252,14 +1360,18 @@ def _build_draft_prompt(state: State, *, compact: bool) -> str:
         else f"## Resume Style Guide\n---\n{_load_style_guide()}\n---\n"
     )
 
+    from src.core.prompts import UNTRUSTED_INPUT_GUARDRAIL
+    from src.core.security import wrap_untrusted
+
     return DRAFT_RESUME.format(
+        guardrail=UNTRUSTED_INPUT_GUARDRAIL,
         pass_score=int(state.get("ats_pass_score") or ATS_PASS_SCORE_DEFAULT),
         company=state.get("company") or "Unknown",
         track=track,
         track_brief=track_brief(track),
         style_extra=style_extra,
         lessons_block=lessons_block,
-        jd=jd,
+        jd=wrap_untrusted("job_description", jd),
         master=master,
         required=required,
         unsupported=unsupported,
@@ -1751,11 +1863,21 @@ def tailor_with_graph(
     *,
     company: str = "Unknown",
     job_track: str = "",
+    job_title: str = "",
 ) -> tuple[str, str]:
     """Hybrid extract → draft → NLP critique (≥85) → compile.
 
     Returns ``(pdf_path, tailored_yaml_text)``.
     """
+    hit = lookup_archetype_pdf(job_track, job_title)
+    if hit is not None:
+        logger.info(
+            "Archetype PDF cache hit (%s|%s) — skip LLM/RenderCV",
+            (job_track or "GENERAL").upper(),
+            normalize_role_title(job_title),
+        )
+        return hit
+
     result = get_tailor_graph().invoke(
         {
             "jd": jd,
@@ -1789,7 +1911,9 @@ def tailor_with_graph(
             f"compile_error={result.get('compile_error')!r})"
         )
     yaml_text = (result.get("current_tailored_yaml") or "").strip()
-    return str(Path(pdf_path).resolve()), yaml_text
+    resolved = str(Path(pdf_path).resolve())
+    store_archetype_pdf(job_track, job_title, resolved, yaml_text)
+    return resolved, yaml_text
 
 
 def optimize_resume(
@@ -1798,6 +1922,7 @@ def optimize_resume(
     *,
     company: str = "Unknown",
     job_track: str = "",
+    job_title: str = "",
 ) -> tuple[str, str]:
     """Load master YAML then run the hybrid graph. Returns (pdf_path, yaml)."""
     master_yaml = Path(master_yaml_path).read_text(encoding="utf-8")
@@ -1806,4 +1931,5 @@ def optimize_resume(
         master_yaml,
         company=company,
         job_track=job_track,
+        job_title=job_title,
     )

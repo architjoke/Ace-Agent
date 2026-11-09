@@ -48,6 +48,8 @@ def test_browser_profile_cdp_flags():
     assert bp.cdp_url == "http://127.0.0.1:9222"
     assert bp.is_local is True
     assert bp.keep_alive is True
+    assert bp.accept_downloads is False
+    assert list(bp.permissions or []) == []
 
 
 def test_application_counts_includes_human(tmp_path):
@@ -104,16 +106,20 @@ def test_discard_modal_clicks_discard():
     assert clicks == ["discard"]
 
 
-def test_cdp_handoff_soft_fails_without_port(tmp_path):
+def test_cdp_handoff_soft_fails_without_port(tmp_path, monkeypatch):
     from src.core.executor import RequiresHumanInterventionError, _execute_cdp_handoff
     from src.playbooks.session import PlaybookSession
 
     closed = {"n": 0}
     discarded = {"n": 0}
+    detached = {"n": 0}
 
     class _Session(PlaybookSession):
         def discard_modal(self):
             discarded["n"] += 1
+
+        def detach(self):
+            detached["n"] += 1
 
         def close(self):
             closed["n"] += 1
@@ -129,6 +135,7 @@ def test_cdp_handoff_soft_fails_without_port(tmp_path):
     master = tmp_path / "master.yaml"
     master.write_text("cv: {}\napplication_answers: {}\n", encoding="utf-8")
 
+    monkeypatch.setenv("ACE_BROWSER_KEEP_ALIVE", "1")
     with pytest.raises(RequiresHumanInterventionError):
         asyncio.run(
             _execute_cdp_handoff(
@@ -140,7 +147,8 @@ def test_cdp_handoff_soft_fails_without_port(tmp_path):
             )
         )
     assert discarded["n"] == 1
-    assert closed["n"] == 1
+    assert detached["n"] == 1
+    assert closed["n"] == 0
 
 
 def test_apply_job_requires_human(tmp_path, monkeypatch):

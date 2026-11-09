@@ -143,11 +143,18 @@ def run_linkedin(
     user_data_dir: Path | str | None = None,
     headless: bool | None = None,
     yaml_snapshot: str | None = None,
+    context=None,
+    page=None,
+    cdp_assist=None,
+    **kwargs,
 ) -> bool:
     """Easy Apply state machine. Raises TimeoutError / PlaybookHandoff / AlreadyAppliedError."""
     from playwright.sync_api import TimeoutError as PlaywrightTimeout
     from playwright.sync_api import sync_playwright
 
+    from src.playbooks._common import try_cdp_assist
+
+    _ = kwargs
     pdf = Path(pdf_path).expanduser().resolve()
     master = Path(master_yaml_path).expanduser().resolve()
     if not pdf.is_file():
@@ -156,18 +163,20 @@ def run_linkedin(
         raise FileNotFoundError(f"master.yaml not found: {master}")
 
     answers = load_applicant_profile(master, yaml_snapshot=yaml_snapshot)
-    context = None
-    page = None
+    owned = context is None
     handoff = False
-    pw = sync_playwright().start()
+    pw = None
+    if owned:
+        pw = sync_playwright().start()
     started = time.monotonic()
     try:
-        context, page = launch_persistent_context(
-            pw,
-            user_data_dir=user_data_dir,
-            headless=headless,
-            timeout_ms=30_000,
-        )
+        if owned:
+            context, page = launch_persistent_context(
+                pw,
+                user_data_dir=user_data_dir,
+                headless=headless,
+                timeout_ms=30_000,
+            )
         logger.info("LinkedIn playbook navigating %s", job_url)
         goto_dom(page, job_url)
         from src.core.job_closed import page_shows_job_closed
@@ -195,12 +204,25 @@ def run_linkedin(
 
             try:
                 _fill_step(page, answers=answers, pdf=pdf)
-            except PlaybookFallback:
-                raise
+            except PlaybookFallback as fill_exc:
+                if try_cdp_assist(cdp_assist, str(fill_exc)):
+                    try:
+                        _fill_step(page, answers=answers, pdf=pdf)
+                    except PlaybookFallback:
+                        raise
+                else:
+                    raise
             except Exception as exc:
-                raise PlaybookFallback(
-                    f"linkedin playbook: step fill failed ({exc})"
-                ) from exc
+                reason = f"linkedin playbook: step fill failed ({exc})"
+                if try_cdp_assist(cdp_assist, reason):
+                    try:
+                        _fill_step(page, answers=answers, pdf=pdf)
+                    except Exception as retry_exc:
+                        raise PlaybookFallback(
+                            f"linkedin playbook: step fill failed ({retry_exc})"
+                        ) from retry_exc
+                else:
+                    raise PlaybookFallback(reason) from exc
 
             action = _advance(page)
             if action == "submit":
@@ -216,9 +238,11 @@ def run_linkedin(
             if action == "none":
                 miss_advance += 1
                 if miss_advance >= 2:
-                    raise PlaybookFallback(
-                        "linkedin playbook: Next/Review/Submit missing — Gemini"
-                    )
+                    reason = "linkedin playbook: Next/Review/Submit missing — Gemini"
+                    if try_cdp_assist(cdp_assist, reason):
+                        miss_advance = 0
+                        continue
+                    raise PlaybookFallback(reason)
             else:
                 miss_advance = 0
 
@@ -248,8 +272,17 @@ def run_linkedin(
         )
     finally:
         if not handoff:
-            close_context_safe(context, user_data_dir=user_data_dir)
-            try:
-                pw.stop()
-            except Exception:
-                pass
+            if owned:
+                close_context_safe(context, user_data_dir=user_data_dir)
+                if pw is not None:
+                    try:
+                        pw.stop()
+                    except Exception:
+                        pass
+            else:
+                from src.core.browser_warmup import reset_context_state
+
+                try:
+                    reset_context_state(context, page)
+                except Exception:
+                    logger.debug("warm linkedin reset failed", exc_info=True)

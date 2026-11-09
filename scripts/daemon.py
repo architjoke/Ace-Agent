@@ -76,6 +76,9 @@ def _report_job() -> None:
 
 
 def start_daemon() -> None:
+    from src.core.security import install_redacting_logging
+
+    install_redacting_logging(force=True)
     settings = reload_settings()
     schedule.clear()
     schedule.every().day.at(settings.pipeline_time).do(_morning_job)
@@ -90,9 +93,13 @@ def start_daemon() -> None:
         settings.retrain_time,
         settings.report_time,
     )
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+    try:
+        while True:
+            schedule.run_pending()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Daemon interrupted — shutting down cleanly")
+        raise
 
 
 if __name__ == "__main__":

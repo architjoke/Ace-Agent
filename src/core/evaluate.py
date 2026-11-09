@@ -304,9 +304,13 @@ def evaluate_fit(
     else:
         fact_bank = str(master_yaml)
 
+    from src.core.prompts import UNTRUSTED_INPUT_GUARDRAIL
+    from src.core.security import wrap_untrusted
+
     prompt = EVALUATE_FIT.format(
+        guardrail=UNTRUSTED_INPUT_GUARDRAIL,
         doctrine=ATS_MATCHING_DOCTRINE,
-        jd_text=jd_text,
+        jd_text=wrap_untrusted("job_description", jd_text),
         fact_bank=fact_bank,
     )
 
