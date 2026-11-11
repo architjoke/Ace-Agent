@@ -5,11 +5,10 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from src.core.config import OUTPUT_DIR, PROJECT_ROOT, WORKER_PID
+from src.core.config import OUTPUT_DIR, WORKER_PID
 from src.core.memory import application_counts, init_db, list_applications, stats_since
 from src.core.settings import get_settings
 
-REPO_ROOT = PROJECT_ROOT
 PID_FILE = WORKER_PID
 
 try:
@@ -132,6 +131,26 @@ def format_status() -> str:
             f"Last 24h rejections:      {today['rejections_today']}",
         ]
     )
+    try:
+        from src.core.human_assist import failure_shots_dir
+
+        shot_root = failure_shots_dir()
+        n_shots = sum(1 for _ in shot_root.rglob("*.png")) if shot_root.is_dir() else 0
+        if n_shots:
+            lines.append(f"Failure screenshots:       {n_shots} under {shot_root}")
+    except Exception:
+        pass
+    try:
+        from src.core.memory import list_submitted_company_roles
+
+        submitted = list_submitted_company_roles(within_days=30, limit=20)
+    except Exception:
+        submitted = []
+    if submitted:
+        lines.append("")
+        lines.append("Submitted (company · role, last 30d) — skipped on re-hunt:")
+        for row in submitted:
+            lines.append(f"  • {row['company']} · {row['job_title']}")
     if manuals:
         lines.append("")
         lines.append("Manual applies waiting for you:")

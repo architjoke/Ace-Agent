@@ -1,13 +1,50 @@
-"""Per-host rate limiter + claim_next domain interleaving."""
+"""Ban armor pacing + per-host dispatch limits."""
 
 from __future__ import annotations
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+
+def test_pinned_locale_timezone_defaults():
+    from src.core.browser_identity import pinned_locale, pinned_timezone_id
+
+    assert pinned_locale()
+    assert "/" in pinned_timezone_id() or pinned_timezone_id() == "UTC"
+
+
+def test_apply_hours_window(monkeypatch):
+    from src.core import ban_armor as ba
+
+    monkeypatch.setenv("ACE_BROWSER_TIMEZONE", "Asia/Kolkata")
+    monkeypatch.setenv("ACE_APPLY_HOURS", "9-17")
+    tz = ZoneInfo("Asia/Kolkata")
+    noon = datetime(2026, 3, 10, 12, 0, tzinfo=tz)
+    night = datetime(2026, 3, 10, 23, 0, tzinfo=tz)
+    assert ba.in_apply_hours(now=noon) is True
+    assert ba.in_apply_hours(now=night) is False
+    assert ba.seconds_until_apply_hours(now=night) > 0
+
+
+def test_captcha_circuit_trips_and_cools():
+    from src.core.ban_armor import CaptchaCircuitBreaker
+
+    clock = {"t": 1000.0}
+    br = CaptchaCircuitBreaker(
+        threshold=3, window_sec=600, cooldown_sec=120, clock=lambda: clock["t"]
+    )
+    assert br.ready_in("linkedin.com") == 0.0
+    assert br.record_block("linkedin.com") is False
+    assert br.record_block("linkedin.com") is False
+    assert br.record_block("linkedin.com") is True
+    assert br.ready_in("linkedin.com") == 120.0
+    clock["t"] += 121
+    assert br.ready_in("linkedin.com") == 0.0
+    assert br.is_cf_block_message("cloudflare/turnstile wall")
+    assert not br.is_cf_block_message("timeout waiting for selector")
+
 import sys
 from pathlib import Path
-
-REPO = Path(__file__).resolve().parent.parent
-if str(REPO) not in sys.path:
-    sys.path.insert(0, str(REPO))
 
 
 def test_host_bucket_keys():
@@ -103,6 +140,40 @@ def test_claim_wait_sentinel_when_all_cooling(tmp_path):
     assert int(n) == 0
 
 
+def test_host_limits_env_override(monkeypatch):
+    from src.core import host_limiter as hl
+
+    monkeypatch.setenv("ACE_HOST_LIMITS", "linkedin.com=200:10")
+    hl.reload_host_limits_for_tests()
+    assert hl.HOST_LIMITS["linkedin.com"] == (200.0, 10.0)
+    monkeypatch.delenv("ACE_HOST_LIMITS", raising=False)
+    hl.reload_host_limits_for_tests()
+
+
+def test_requeue_claimed(tmp_path):
+    from src.core.memory import _connect
+    from src.core.queue import claim_next, enqueue_apply, init_queue, requeue_claimed
+
+    db = tmp_path / "q.db"
+    init_queue(db)
+    enqueue_apply(
+        company="Acme",
+        job_url="https://www.linkedin.com/jobs/view/9",
+        track="SDE",
+        jd_text="x",
+        pdf_path=str(tmp_path / "a.pdf"),
+        db_path=db,
+    )
+    item = claim_next("w1", db_path=db)
+    assert item and "id" in item
+    assert requeue_claimed(int(item["id"]), db_path=db) is True
+    with _connect(db) as conn:
+        row = conn.execute(
+            "SELECT status FROM apply_queue WHERE id=?", (int(item["id"]),)
+        ).fetchone()
+    assert row["status"] == "READY"
+
+
 def test_apply_queue_schema_unchanged(tmp_path):
     """Guard: no new columns from this performance pass."""
     from src.core.memory import _connect
@@ -123,6 +194,7 @@ def test_apply_queue_schema_unchanged(tmp_path):
         "jd_text",
         "pdf_path",
         "yaml_snapshot",
+        "job_title",
         "status",
         "worker_id",
         "error_log",

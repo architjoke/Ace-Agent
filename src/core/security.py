@@ -227,6 +227,13 @@ def wrap_untrusted(kind: str, body: str | None, *, max_chars: int = 12_000) -> s
     return f"<{tag}>\n{safe}\n</{tag}>"
 
 
+def wrap_data_block(tag: str, body: str | None, *, max_chars: int = 6_000) -> str:
+    """Wrap DATA (e.g. retrieved_memory) — never treat as system policy."""
+    safe_tag = re.sub(r"[^a-z0-9_]", "_", (tag or "data").strip().lower()) or "data"
+    safe = sanitize_untrusted_input(body, max_chars=max_chars)
+    return f"<{safe_tag}>\n{safe}\n</{safe_tag}>"
+
+
 # ── Phase 3: path jail ──────────────────────────────────────────────
 
 def validate_safe_path(

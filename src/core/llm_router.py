@@ -1,12 +1,13 @@
 """Specialized multi-model text router — Gemini is browser vision only.
 
   triage (fit)     → Cohere → NVIDIA → Ollama
-  draft / fallback → OpenAI → NVIDIA → Ollama
+  draft / fallback → OpenAI → Cohere → NVIDIA → Ollama
   semantic (DOM)   → Groq → NVIDIA
   reflect / inbox  → Ollama → NVIDIA → Cohere
-  default (copilot)→ OpenAI → Groq → NVIDIA → Ollama
+  default / copilot → Groq → Cohere → NVIDIA → Ollama → OpenAI
 
 Gemini text only if ACE_ALLOW_GEMINI_TEXT=1. Groq stays off fit/draft to save RPM for DOM.
+Cohere is the cloud escape hatch when OpenAI is out of credits / rate-limited.
 """
 
 from __future__ import annotations
@@ -26,7 +27,8 @@ CONFIG_PATH = CONFIG_YAML
 
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 DEFAULT_GROQ_FALLBACK_MODEL = "openai/gpt-oss-20b"
-DEFAULT_NVIDIA_MODEL = "mistralai/mistral-small-3.1-24b-instruct-2503"
+# Catalog free endpoint for mistral-small-3.1 is deprecated (Extra data / parse flakes).
+DEFAULT_NVIDIA_MODEL = "meta/llama-3.1-8b-instruct"
 DEFAULT_COHERE_MODEL = "command-r-08-2024"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_OLLAMA_MODEL = "llama3.1"
@@ -34,7 +36,14 @@ DEFAULT_GEMINI_TEXT_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_GEMINI_BROWSER_MODEL = "gemini-3.5-flash-lite"
 
 TextRole = Literal[
-    "triage", "draft", "reflect", "inbox", "fallback", "default", "semantic"
+    "triage",
+    "draft",
+    "reflect",
+    "inbox",
+    "fallback",
+    "default",
+    "semantic",
+    "copilot",
 ]
 ProviderName = Literal["groq", "nvidia", "ollama", "gemini", "cohere", "openai"]
 
@@ -44,12 +53,14 @@ _VALID_PROVIDERS = frozenset(
 
 _ROLE_PREFERENCE: dict[str, tuple[str, ...]] = {
     "triage": ("cohere", "nvidia", "ollama"),
-    "draft": ("openai", "nvidia", "ollama"),
-    "fallback": ("openai", "nvidia", "ollama"),
+    "draft": ("openai", "cohere", "nvidia", "ollama"),
+    "fallback": ("openai", "cohere", "nvidia", "ollama"),
     "semantic": ("groq", "nvidia"),
     "reflect": ("ollama", "nvidia", "cohere"),
     "inbox": ("ollama", "nvidia", "cohere"),
-    "default": ("openai", "groq", "nvidia", "ollama"),
+    # Copilot chat: prefer live free/paid keys; OpenAI last (often credit-empty).
+    "default": ("groq", "cohere", "nvidia", "ollama", "openai"),
+    "copilot": ("groq", "cohere", "nvidia", "ollama", "openai"),
 }
 
 _ROLE_ENV: dict[str, str] = {
@@ -60,6 +71,7 @@ _ROLE_ENV: dict[str, str] = {
     "fallback": "ACE_FALLBACK_PROVIDER",
     "semantic": "ACE_SEMANTIC_PROVIDER",
     "default": "ACE_TEXT_PROVIDER",
+    "copilot": "ACE_COPILOT_PROVIDER",
 }
 
 _YAML_ROLE_KEYS = {
@@ -69,6 +81,7 @@ _YAML_ROLE_KEYS = {
     "inbox": "inbox",
     "fallback": "fallback",
     "semantic": "semantic",
+    "copilot": "copilot",
 }
 
 _FAILOVER_NEEDLES = (
@@ -78,8 +91,20 @@ _FAILOVER_NEEDLES = (
     "tokens per minute", "tpm", "payload too large", "end of life", "no longer available",
     "httpx", "httpcore", "readerror", "connecterror", "remoteprotocolerror",
     "insufficient_quota", "credit",
+    "extra data", "jsondecode", "json decode", "expecting value", "deprecated",
 )
 _FAILOVER_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504})
+
+# Soft cooldown so burned TPD / empty OpenAI credits don't burn seconds every draft.
+_PROVIDER_COOLDOWN_UNTIL: dict[str, float] = {}
+_HARD_BURN_NEEDLES = (
+    "tokens per day",
+    "tpd",
+    "no credits remaining",
+    "insufficient_quota",
+    "billing",
+    "you exceeded your current quota",
+)
 
 
 def _load_dotenv() -> None:
@@ -278,9 +303,11 @@ def _build_ollama(*, temperature: float, model: str | None = None) -> Any:
 
     resolved = model or _env("OLLAMA_MODEL") or DEFAULT_OLLAMA_MODEL
     base_url = _env("OLLAMA_BASE_URL") or "http://127.0.0.1:11434"
-    logger.info("Text LLM → Ollama model=%s", resolved)
+    # Keep short — hung local inference was starving the apply queue (bake13).
+    timeout = float(_env("ACE_OLLAMA_TIMEOUT") or "60")
+    logger.info("Text LLM → Ollama model=%s timeout=%.0fs", resolved, timeout)
     return ChatOllama(
-        model=resolved, base_url=base_url, temperature=temperature, timeout=300
+        model=resolved, base_url=base_url, temperature=temperature, timeout=timeout
     )
 
 
@@ -341,6 +368,40 @@ def _is_failover_error(exc: BaseException) -> bool:
     return False
 
 
+def _cooldown_remaining(provider: str) -> float:
+    import time
+
+    until = float(_PROVIDER_COOLDOWN_UNTIL.get(provider) or 0)
+    return max(0.0, until - time.time())
+
+
+def _mark_provider_cooldown(provider: str, exc: BaseException) -> None:
+    """Park hard-burned providers briefly so draft doesn't retry them every call."""
+    import re
+    import time
+
+    msg = str(exc).lower()
+    if not any(n in msg for n in _HARD_BURN_NEEDLES):
+        return
+    # Prefer upstream "retry in XmYs" when present; else 10 minutes.
+    secs = 600.0
+    m = re.search(r"try again in\s+(\d+)m([\d.]+)s", msg)
+    if m:
+        secs = int(m.group(1)) * 60 + float(m.group(2))
+    else:
+        m2 = re.search(r"try again in\s+([\d.]+)\s*s", msg)
+        if m2:
+            secs = float(m2.group(1))
+    secs = min(max(secs, 30.0), 3600.0)
+    _PROVIDER_COOLDOWN_UNTIL[provider] = time.time() + secs
+    logger.warning(
+        "Provider %s cooling down for %.0fs after burn (%s)",
+        provider,
+        secs,
+        type(exc).__name__,
+    )
+
+
 def invoke_with_failover(
     role: TextRole | str,
     prompt: Any,
@@ -367,6 +428,20 @@ def invoke_with_failover(
 
     errors: list[str] = []
     for idx, provider in enumerate(chain):
+        cool = _cooldown_remaining(provider)
+        if cool > 0:
+            errors.append(f"{provider}: cooling {cool:.0f}s")
+            if idx >= len(chain) - 1:
+                raise RuntimeError(
+                    f"All providers failed for role={role}. " + " | ".join(errors)
+                )
+            logger.info(
+                "Skipping cooled provider %s (%.0fs left) → %s",
+                provider,
+                cool,
+                chain[idx + 1],
+            )
+            continue
         try:
             logger.info(
                 "invoke_with_failover role=%s provider=%s attempt=%s",
@@ -394,6 +469,7 @@ def invoke_with_failover(
                 except Exception as retry_exc:
                     exc = retry_exc
 
+            _mark_provider_cooldown(provider, exc)
             errors.append(f"{provider}: {exc}")
             if idx >= len(chain) - 1:
                 raise RuntimeError(
@@ -417,3 +493,34 @@ def gemini_browser_model_name() -> str:
     """Model id for browser-use ChatGoogle (vision/DOM)."""
     _load_dotenv()
     return _env("GEMINI_BROWSER_MODEL", "GEMINI_MODEL") or DEFAULT_GEMINI_BROWSER_MODEL
+
+
+def message_text(content: Any) -> str:
+    """Flatten LangChain / Gemini content-block lists into a single string."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text = block.get("text") or block.get("content")
+                btype = str(block.get("type") or "").lower()
+                if text and btype in {"", "text", "output_text", "answer"}:
+                    parts.append(str(text))
+                elif text and btype not in {"reasoning", "thinking"}:
+                    parts.append(str(text))
+                elif text and not parts:
+                    parts.append(str(text))
+            else:
+                text = getattr(block, "text", None)
+                if text:
+                    parts.append(str(text))
+        return "\n".join(parts)
+    text = getattr(content, "text", None)
+    if text:
+        return str(text)
+    return str(content)

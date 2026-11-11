@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
+import sqlite3
+import threading
+import time
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -20,17 +24,31 @@ logger = logging.getLogger(__name__)
 
 FIT_PASS_SCORE = 80
 
+# JD→fit memoization — skips slow Ollama fallback when cloud triage rate-limits.
+_TRIAGE_CACHE_TTL_S = 7 * 24 * 3600
+_TRIAGE_CACHE_LOCK = threading.Lock()
+_TRIAGE_CACHE_PATH = Path(__file__).resolve().parents[2] / "data" / "fit_triage_cache.sqlite"
+
 # Always-on free exclusions (0 tokens) — unioned with config.yaml exclude_terms.
+# Citizenship/visa terms are soft-gated (see preferences) — not hard-dropped here.
 _BUILTIN_EXCLUSIONS = {
     "unpaid",
     "volunteer",
     "pay to apply",
     "security clearance",
-    "us citizen",
-    "u.s. citizen",
-    "must be a citizen",
-    "green card",
 }
+
+# Even if still listed in config.yaml, these must soft-gate (never hard-drop).
+_CITIZENSHIP_SOFT_EXCLUDE_TERMS = frozenset(
+    {
+        "us citizen",
+        "u.s. citizen",
+        "must be a citizen",
+        "green card",
+        "work authorization",
+        "citizenship",
+    }
+)
 
 # Extra hard patterns beyond exclude_terms (deterministic, pre-LLM).
 _SENIOR_PATTERNS = (
@@ -51,10 +69,9 @@ _SENIOR_PATTERNS = (
 class FitAssessment(BaseModel):
     """Structured LLM judgment of candidate↔JD fit + compensation extract."""
 
+    # No ge/le — Cohere structured-output rejects integer minimum/maximum constraints.
     fit_score: int = Field(
         ...,
-        ge=0,
-        le=100,
         description=(
             "Holistic fit from 0-100. Must be 0 if any hard policy rule is broken."
         ),
@@ -83,7 +100,7 @@ class FitAssessment(BaseModel):
     )
     recommended_track: str = Field(
         default="",
-        description="Best track for this JD among SDE, AI, ML (or empty).",
+        description="Best track for this JD among SDE, PRODUCT, AI (or empty).",
     )
     company_provided_salary: bool = Field(
         default=False,
@@ -121,6 +138,7 @@ class FitResult(TypedDict):
     salary_format: str
     includes_equity_or_bonus: bool
     jd_salary_format: str
+    citizenship_review: bool
 
 
 def _reject(rule: str, reason: str) -> FitResult:
@@ -190,6 +208,13 @@ def _hard_config_reject(jd_text: str) -> FitResult | None:
     for term in sorted(set(config_terms) | _BUILTIN_EXCLUSIONS):
         if not term or term not in jd:
             continue
+        # Citizenship/visa config terms soft-gate — keep queue saturated.
+        if term in _CITIZENSHIP_SOFT_EXCLUDE_TERMS or re.search(
+            r"\b(citizen|citizenship|green\s*card|work\s*authorization)\b",
+            term,
+            flags=re.I,
+        ):
+            continue
         # Don't drop true intern roles solely on a bare "senior" substring
         # inside "senior design project" noise — still drop role-title senior.
         if term == "senior" and "intern" in jd and not re.search(
@@ -211,6 +236,37 @@ def _hard_config_reject(jd_text: str) -> FitResult | None:
             "RULE BROKEN: unpaid_or_pay_to_apply. Deterministic compensation shield.",
         )
 
+    # Java/Spring-primary roles without our stack (Python/JS/TS/Node/AI) — hard drop.
+    our_stack = bool(
+        re.search(
+            r"\b(python|javascript|typescript|node\.?js|react|next\.?js|"
+            r"pytorch|tensorflow|fastapi|flask)\b",
+            jd,
+            flags=re.I,
+        )
+    )
+    java_primary = bool(
+        re.search(
+            r"\b(java\s+developer|java\s+intern|java\s+engineer|core\s+java|"
+            r"spring\s+boot(\s+developer|\s+intern)?|j2ee|hibernate)\b",
+            jd,
+            flags=re.I,
+        )
+    )
+    java_titleish = bool(
+        re.search(
+            r"\bjava\s+(developer|programmer|engineer|intern)\b",
+            jd,
+            flags=re.I,
+        )
+    )
+    if (java_primary or java_titleish) and not our_stack:
+        return _reject(
+            "stack_mismatch_java",
+            "RULE BROKEN: stack_mismatch_java. "
+            "JD is Java/Spring-primary; fact bank is Python/JS/TS/Node + AI.",
+        )
+
     for pattern in _SENIOR_PATTERNS:
         if not re.search(pattern, jd, flags=re.IGNORECASE):
             continue
@@ -225,11 +281,11 @@ def _hard_config_reject(jd_text: str) -> FitResult | None:
             f"RULE BROKEN: senior_experience_required. Matched pattern={pattern!r}.",
         )
 
-    # Dynamic Preference Engine — HARD dealbreakers only (SOFT applied post-LLM).
+    # Dynamic Preference Engine — HARD dealbreakers only (SOFT / citizenship post-LLM).
     try:
         from src.core.preferences import apply_preference_gate
 
-        hard_reason, _, _ = apply_preference_gate(jd_text)
+        hard_reason, _, _, _ = apply_preference_gate(jd_text)
         if hard_reason:
             return _reject("preference_hard", hard_reason)
     except Exception:
@@ -240,7 +296,7 @@ def _hard_config_reject(jd_text: str) -> FitResult | None:
 
 def _salvage_fit_from_text(raw: Any) -> dict[str, Any]:
     """Parse markdown-fenced or messy JSON into a FitAssessment-shaped dict."""
-    from src.core.llm_text import message_text
+    from src.core.llm_router import message_text
 
     text = message_text(getattr(raw, "content", raw) if raw is not None else "")
     text = (text or "").strip()
@@ -283,6 +339,79 @@ def _salvage_fit_from_text(raw: Any) -> dict[str, Any]:
         }
 
 
+def _triage_cache_key(jd_text: str, fact_bank: str, min_score: int) -> str:
+    h = hashlib.sha256()
+    h.update((jd_text or "").strip().encode("utf-8", errors="replace"))
+    h.update(b"|")
+    h.update(hashlib.sha256((fact_bank or "").encode("utf-8", errors="replace")).digest())
+    h.update(b"|")
+    h.update(str(int(min_score)).encode("ascii"))
+    return h.hexdigest()
+
+
+def _triage_cache_conn() -> sqlite3.Connection:
+    _TRIAGE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(_TRIAGE_CACHE_PATH), timeout=30)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fit_triage (
+            cache_key TEXT PRIMARY KEY,
+            payload TEXT NOT NULL,
+            created_at REAL NOT NULL
+        )
+        """
+    )
+    return conn
+
+
+def _lookup_triage_cache(cache_key: str) -> FitResult | None:
+    try:
+        with _TRIAGE_CACHE_LOCK:
+            conn = _triage_cache_conn()
+            try:
+                row = conn.execute(
+                    "SELECT payload, created_at FROM fit_triage WHERE cache_key=?",
+                    (cache_key,),
+                ).fetchone()
+                if not row:
+                    return None
+                payload, created_at = row
+                if (time.time() - float(created_at or 0)) > _TRIAGE_CACHE_TTL_S:
+                    conn.execute(
+                        "DELETE FROM fit_triage WHERE cache_key=?", (cache_key,)
+                    )
+                    conn.commit()
+                    return None
+                data = json.loads(payload)
+                if not isinstance(data, dict) or "fit_score" not in data:
+                    return None
+                return data  # type: ignore[return-value]
+            finally:
+                conn.close()
+    except Exception:
+        logger.debug("fit triage cache lookup failed", exc_info=True)
+        return None
+
+
+def _store_triage_cache(cache_key: str, result: FitResult) -> None:
+    try:
+        with _TRIAGE_CACHE_LOCK:
+            conn = _triage_cache_conn()
+            try:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO fit_triage(cache_key, payload, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (cache_key, json.dumps(result), time.time()),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception:
+        logger.debug("fit triage cache store failed", exc_info=True)
+
+
 def evaluate_fit(
     jd_text: str,
     master_yaml: str | Path,
@@ -292,6 +421,7 @@ def evaluate_fit(
     """Score one JD against the master fact bank via text LLM (Groq/Ollama).
 
     Deterministic Python shield runs FIRST (0 tokens). Then LLM skill fit.
+    Identical JD+fact-bank hashes reuse a local SQLite memo (skips Ollama starve).
     """
     shielded = _hard_config_reject(jd_text)
     if shielded is not None:
@@ -303,6 +433,23 @@ def evaluate_fit(
         fact_bank = Path(master_yaml).read_text(encoding="utf-8")
     else:
         fact_bank = str(master_yaml)
+
+    cache_key = _triage_cache_key(jd_text, fact_bank, min_score)
+    cached = _lookup_triage_cache(cache_key)
+    if cached is not None:
+        # Recompute pass against caller's min_score (TTL may span threshold tweaks).
+        cached = dict(cached)
+        cached["passed"] = bool(
+            int(cached.get("fit_score") or 0) >= min_score
+            and not cached.get("rule_broken")
+        )
+        logger.info(
+            "Fit triage cache hit score=%s passed=%s — %s",
+            cached.get("fit_score"),
+            cached.get("passed"),
+            str(cached.get("reason") or "")[:160],
+        )
+        return cached  # type: ignore[return-value]
 
     from src.core.prompts import UNTRUSTED_INPUT_GUARDRAIL
     from src.core.security import wrap_untrusted
@@ -356,18 +503,20 @@ def evaluate_fit(
         if not reason.upper().startswith("RULE BROKEN"):
             reason = f"RULE BROKEN: {rule_broken}. {reason}".strip()
 
-    if track not in {"SDE", "AI", "ML"}:
+    if track not in {"SDE", "PRODUCT", "AI"}:
         track = ""
 
     score = max(0, min(100, score))
 
-    # Serendipity triage: SOFT preferences penalize but do not hard-reject.
-    # A very strong match can still clear the bar after the penalty.
+    # Serendipity triage: SOFT preferences (incl. citizenship soft-gate) penalize only.
+    citizenship_review = False
     if not rule_broken:
         try:
             from src.core.preferences import apply_preference_gate
 
-            _, soft_penalty, soft_hits = apply_preference_gate(jd_text)
+            _, soft_penalty, soft_hits, citizenship_review = apply_preference_gate(
+                jd_text
+            )
             if soft_penalty > 0:
                 before = score
                 score = max(0, score - soft_penalty)
@@ -377,11 +526,12 @@ def evaluate_fit(
                 )
                 reason = (reason + note).strip()
                 logger.info(
-                    "SOFT preference penalty -%s (%s→%s) hits=%s",
+                    "SOFT preference penalty -%s (%s→%s) hits=%s citizenship_review=%s",
                     soft_penalty,
                     before,
                     score,
                     soft_hits[:3],
+                    citizenship_review,
                 )
         except Exception:
             logger.exception("SOFT preference gate crashed — continuing")
@@ -399,7 +549,7 @@ def evaluate_fit(
         matched[:8],
         reason[:240],
     )
-    return {
+    result: FitResult = {
         "fit_score": score,
         "reason": reason,
         "passed": passed,
@@ -417,4 +567,7 @@ def evaluate_fit(
             or compensation.get("salary_format")
             or "ANNUAL"
         ),
+        "citizenship_review": bool(citizenship_review),
     }
+    _store_triage_cache(cache_key, result)
+    return result

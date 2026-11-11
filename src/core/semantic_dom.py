@@ -99,7 +99,7 @@ def plan_semantic_actions(
     if not elements:
         return []
     from src.core.llm_router import DEFAULT_GROQ_FALLBACK_MODEL, invoke_with_failover
-    from src.core.llm_text import message_text
+    from src.core.llm_router import message_text
 
     slim = [
         {
@@ -118,7 +118,8 @@ def plan_semantic_actions(
         '{"action":"click","id":N}, '
         '{"action":"upload","id":N}\n'
         "Fill ALL visible identity fields from ANSWERS in ONE list. "
-        "Use upload once for the resume file input. "
+        "Use upload once for the resume file input — NEVER click a saved/library "
+        "resume card; always Upload/Replace from disk. "
         "Click Apply/Submit/Continue/Next only after fields are filled. "
         "Skip disabled elements. Do not invent facts.\n\n"
         f"RESUME_PATH: {resume_path}\n"
@@ -188,6 +189,11 @@ def execute_semantic_actions(page, actions: list[dict[str, Any]], resume_path: s
                 ran = True
                 page.wait_for_timeout(300)
             elif action == "upload" and pdf.is_file():
+                from src.playbooks._common import force_upload_resume
+
+                if force_upload_resume(page, pdf):
+                    ran = True
+                    continue
                 # Prefer a nearby file input if the id is a button
                 tag = ""
                 try:
@@ -220,11 +226,14 @@ def page_blocked(page) -> bool:
 
 
 def _semantic_fill(page, job_url: str, pdf: Path, answers: dict) -> bool:
-    from src.playbooks._common import goto_dom, success_text
+    from src.playbooks._common import force_upload_resume, goto_dom, success_text
 
     goto_dom(page, job_url)
     if page_blocked(page):
         raise RuntimeError("blocked: captcha/cloudflare on semantic apply")
+    # Prefer fresh disk upload before planning clicks that might hit library cards.
+    if pdf.is_file():
+        force_upload_resume(page, pdf)
     elements = extract_interactive(page)
     if len(elements) < 2:
         logger.info("semantic DOM: too few elements (%s) — skip", len(elements))

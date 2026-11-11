@@ -1,4 +1,8 @@
 python-jobspy
+# Jobdrop expands WWR/Wellfound/HiringCafe; prefer curl_cffi that JobSpy needs.
+# Jobdrop pins <0.8 at publish time but imports cleanly on 0.16+.
+jobdrop>=2.10.0
+curl_cffi>=0.16.2
 google-genai>=2.34.0,<3.0.0
 langchain-google-genai
 langchain-groq

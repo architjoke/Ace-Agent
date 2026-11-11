@@ -49,13 +49,57 @@ TRACK_QUERIES: dict[str, str] = {
 
 DEFAULT_LOCATION = "India"
 DEFAULT_COUNTRY_INDEED = "India"
-DEFAULT_SITES = ["linkedin", "indeed"]
+DEFAULT_SITES = ["linkedin", "naukri"]
 
 # Aggregator listing pages that usually cannot host a real application form.
+# Glassdoor stays discovery-blocked (Cloudflare); external job_url_direct still OK.
 _AGGREGATOR_HOSTS = (
     "glassdoor.",
     "glassdoor.co",
     "indeed.glassdoor",
+)
+
+# Scam / never-apply boards (hard drop even if JobSpy returns them).
+_BLOCKED_BOARD_HOSTS = (
+    "internshala.com",
+    "internshala.",
+)
+
+# Crowded Soft Apply surfaces — skip unless ACE_ALLOW_INDEED=1.
+_INDEED_SOFT_HOSTS = (
+    "indeed.com",
+    "indeed.co",
+    "smartapply.indeed",
+)
+
+# Redirect boards — listing may not host the form; prefer job_url_direct / bridge.
+_REDIRECT_BOARD_HOSTS = (
+    "weworkremotely.com",
+    "himalayas.app",
+    "hiring.cafe",
+    "hiringcafe.com",
+)
+
+# Prefer company ATS / career boards over aggregator Easy Apply.
+# Redirect boards (Hiring Cafe, WWR, …) stay out of this list so job_url_direct
+# Greenhouse/Lever/Ashby always outranks the aggregator listing itself.
+_CAREER_ATS_HOST_HINTS = (
+    "greenhouse.io",
+    "boards.greenhouse",
+    "lever.co",
+    "jobs.lever",
+    "ashbyhq.com",
+    "myworkdayjobs.com",
+    "workday.com",
+    "jobs.ashby",
+    "smartrecruiters.com",
+    "jobvite.com",
+    "icims.com",
+    "bamboohr.com",
+    # Bridged via career_site playbook (Eightfold / Zoho / careers.*).
+    "eightfold.ai",
+    "zohorecruit.",
+    "zoho.com",
 )
 
 
@@ -66,9 +110,67 @@ def _host(url: str) -> str:
         return ""
 
 
+def is_blocked_board(url: str) -> bool:
+    """True for scam/never-apply hosts (Internshala, …)."""
+    h = _host(url)
+    blob = f"{h} {(url or '').lower()}"
+    return any(marker in blob for marker in _BLOCKED_BOARD_HOSTS)
+
+
+def is_indeed_soft_url(url: str) -> bool:
+    """Indeed Soft / SmartApply listing — crowded + captcha-prone."""
+    h = _host(url)
+    return any(marker in h for marker in _INDEED_SOFT_HOSTS)
+
+
+def indeed_applies_allowed() -> bool:
+    """Opt-in Indeed Soft Apply (default off — prefer career-site directs)."""
+    import os
+
+    from src.core.utils import env_truthy
+
+    return env_truthy("ACE_ALLOW_INDEED", "0")
+
+
 def is_aggregator_listing(url: str) -> bool:
+    """Glassdoor-class walls — skip browser unless a direct ATS URL exists."""
     h = _host(url)
     return any(marker in h for marker in _AGGREGATOR_HOSTS)
+
+
+def is_redirect_board(url: str) -> bool:
+    """Boards that usually click-through to Greenhouse/Lever/mailto (bridge playbook)."""
+    h = _host(url)
+    return any(marker in h for marker in _REDIRECT_BOARD_HOSTS)
+
+
+def is_career_ats_url(url: str) -> bool:
+    """Company career / ATS hosts that usually autofill from an uploaded resume."""
+    h = _host(url)
+    if any(marker in h for marker in _CAREER_ATS_HOST_HINTS):
+        return True
+    # Custom career microsites (often Zoho/Eightfold wrappers).
+    return h.startswith("careers.") and "linkedin.com" not in h
+
+
+def apply_url_priority(url: str) -> int:
+    """Lower = better. Career ATS first; Indeed Soft last; blocked = worst."""
+    u = (url or "").strip()
+    if not u or is_blocked_board(u):
+        return 100
+    if is_career_ats_url(u):
+        return 0
+    if is_indeed_soft_url(u):
+        return 80
+    # Hiring Cafe / WWR / Himalayas — bridge to ATS; worse than direct career hosts.
+    if is_redirect_board(u):
+        return 30
+    h = _host(u)
+    if "linkedin.com" in h:
+        return 40
+    if "naukri.com" in h:
+        return 35
+    return 20
 
 
 def is_applyable_url(url: str) -> bool:
@@ -76,25 +178,31 @@ def is_applyable_url(url: str) -> bool:
     u = (url or "").strip()
     if not re.match(r"https?://", u, re.I):
         return False
+    if is_blocked_board(u):
+        return False
     if is_aggregator_listing(u):
+        return False
+    if is_indeed_soft_url(u) and not indeed_applies_allowed():
         return False
     return True
 
 
 def pick_apply_url(row: dict | pd.Series) -> str:
-    """Prefer company/ATS direct apply URL; else LinkedIn/Indeed listing."""
+    """Prefer company/ATS direct apply URL; else LinkedIn listing (Indeed last)."""
     direct = str(row.get("job_url_direct") or "").strip()
     listing = str(row.get("job_url") or "").strip()
-    if is_applyable_url(direct):
-        return direct
-    if is_applyable_url(listing):
-        return listing
+    candidates = [u for u in (direct, listing) if u]
+    # Prefer career ATS / direct over crowded Soft Apply listings.
+    candidates.sort(key=apply_url_priority)
+    for url in candidates:
+        if is_applyable_url(url):
+            return url
     # Last resort: listing even if aggregator (caller may Manual_Action)
     return listing or direct
 
 
 def _normalize_frame(jobs: pd.DataFrame) -> pd.DataFrame:
-    """Attach apply_url; drop glassdoor-only rows with no usable direct link."""
+    """Attach apply_url; drop blocked / glassdoor-only / Indeed-soft (unless allowed)."""
     if jobs.empty:
         return jobs
     apply_urls: list[str] = []
@@ -104,15 +212,23 @@ def _normalize_frame(jobs: pd.DataFrame) -> pd.DataFrame:
         apply_urls.append(apply)
         listing = str(row.get("job_url") or "")
         direct = str(row.get("job_url_direct") or "")
+        if is_blocked_board(apply) or is_blocked_board(listing) or is_blocked_board(direct):
+            keep.append(False)
+            continue
         # Drop pure Glassdoor walls with no company apply link.
         if is_aggregator_listing(listing) and not is_applyable_url(direct):
             keep.append(False)
+        elif is_indeed_soft_url(apply) and not indeed_applies_allowed():
+            keep.append(False)
         else:
-            keep.append(bool(apply))
+            keep.append(bool(apply) and not is_blocked_board(apply))
     out = jobs.loc[keep].copy()
     out["apply_url"] = [u for u, k in zip(apply_urls, keep) if k]
     # Prefer browsing the apply_url for the rest of the pipeline.
     out["job_url"] = out["apply_url"]
+    if not out.empty:
+        out["_prio"] = out["job_url"].map(apply_url_priority)
+        out = out.sort_values("_prio", kind="stable").drop(columns=["_prio"])
     return out.reset_index(drop=True)
 
 
@@ -122,7 +238,21 @@ def _sites_from_settings() -> list[str]:
 
         sites = [str(s).strip().lower() for s in (get_settings().sites or []) if s]
         # Never scrape Glassdoor for autonomous apply — Cloudflare walls.
-        sites = [s for s in sites if s and s != "glassdoor"]
+        # Prefer Naukri via JobSpy; WWR/Wellfound/HiringCafe via jobdrop (extra).
+        sites = [
+            s
+            for s in sites
+            if s
+            and s
+            not in {
+                "glassdoor",
+                "weworkremotely",
+                "wellfound",
+                "hiring_cafe",
+                "himalayas",
+                "yc_waas",
+            }
+        ]
         return sites or list(DEFAULT_SITES)
     except Exception:
         return list(DEFAULT_SITES)
@@ -215,6 +345,38 @@ def fetch_jobs_by_tracks(
                 logger.info(
                     "Track %s returned %s applyable jobs", track_name, len(frame)
                 )
+
+    # Jobdrop (WWR / optional Wellfound/HiringCafe) + custom Himalayas / YC.
+    # Hard-bounded so Camoufox downloads / hung scrapers never block apply.
+    try:
+        import os
+        from concurrent.futures import TimeoutError as FuturesTimeout
+
+        from src.core.discovery_extra import fetch_extra_jobs_by_track
+
+        timeout_s = float(os.environ.get("ACE_EXTRA_DISCOVERY_TIMEOUT_S", "90") or 90)
+        with ThreadPoolExecutor(max_workers=1) as extra_pool:
+            fut = extra_pool.submit(
+                fetch_extra_jobs_by_track,
+                queries,
+                location=location,
+                max_results_per_track=max(4, max_results_per_track // 2),
+                country_indeed=country_indeed,
+            )
+            try:
+                extra = fut.result(timeout=max(20.0, timeout_s))
+            except FuturesTimeout:
+                logger.warning(
+                    "Extra discovery timed out after %.0fs — continuing with JobSpy only",
+                    timeout_s,
+                )
+                extra = None
+        if extra is not None and not extra.empty:
+            extra = _normalize_frame(extra)
+            frames.append(extra)
+            logger.info("Extra discovery sources returned %s jobs", len(extra))
+    except Exception:
+        logger.exception("Extra discovery sources failed — continuing with JobSpy")
 
     if not frames:
         combined = pd.DataFrame()

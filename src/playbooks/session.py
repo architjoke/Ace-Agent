@@ -32,6 +32,49 @@ def read_cdp_url(user_data_dir: Path | str | None, *, wait_s: float = 2.0) -> st
     return None
 
 
+def clear_stale_devtools_port(user_data_dir: Path | str | None) -> None:
+    """Remove leftover DevToolsActivePort so Ace never advertises a dead CDP URL."""
+    if not user_data_dir:
+        return
+    port_file = Path(user_data_dir).expanduser().resolve() / "DevToolsActivePort"
+    try:
+        port_file.unlink(missing_ok=True)
+    except OSError:
+        logger.debug("clear_stale_devtools_port failed for %s", port_file, exc_info=True)
+
+
+def cdp_endpoint_alive(cdp_url: str | None, *, timeout_s: float = 0.8) -> bool:
+    """True when ``GET {cdp_url}/json/version`` succeeds (browser listening)."""
+    if not cdp_url:
+        return False
+    import urllib.error
+    import urllib.request
+
+    url = f"{str(cdp_url).rstrip('/')}/json/version"
+    try:
+        with urllib.request.urlopen(url, timeout=max(0.2, float(timeout_s))) as resp:
+            return 200 <= int(getattr(resp, "status", 200)) < 300
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return False
+
+
+def read_live_cdp_url(
+    user_data_dir: Path | str | None,
+    *,
+    wait_s: float = 2.0,
+    probe_timeout_s: float = 0.8,
+) -> str | None:
+    """Like ``read_cdp_url`` but only returns a port that answers /json/version."""
+    cdp_url = read_cdp_url(user_data_dir, wait_s=wait_s)
+    if not cdp_url:
+        return None
+    if cdp_endpoint_alive(cdp_url, timeout_s=probe_timeout_s):
+        return cdp_url
+    logger.warning("Stale CDP port %s — clearing DevToolsActivePort", cdp_url)
+    clear_stale_devtools_port(user_data_dir)
+    return None
+
+
 @dataclass
 class PlaybookSession:
     context: Any

@@ -87,5 +87,18 @@ def pinned_device_scale_factor() -> float:
         return 1.0
 
 
+def pinned_locale() -> str:
+    """BCP-47 locale aligned with sticky proxy geo (ACE_BROWSER_LOCALE).
+
+    Default en-IN for India candidates. Mismatch vs residential IP is a CF signal.
+    """
+    return (os.environ.get("ACE_BROWSER_LOCALE") or "en-IN").strip() or "en-IN"
+
+
+def pinned_timezone_id() -> str:
+    """IANA timezone for Chromium (ACE_BROWSER_TIMEZONE). Default Asia/Kolkata."""
+    return (os.environ.get("ACE_BROWSER_TIMEZONE") or "Asia/Kolkata").strip() or "Asia/Kolkata"
+
+
 def webdriver_stealth_script() -> str:
     return _WEBDRIVER_STEALTH_JS

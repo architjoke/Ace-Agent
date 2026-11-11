@@ -98,6 +98,29 @@ def urls_equivalent(current: str, target: str) -> bool:
     return all(cq.get(k) == v for k, v in tq.items())
 
 
+def _is_playwright_thread_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "different thread" in msg or "cannot switch to a different" in msg
+
+
+def _is_portal_navigation_error(exc: BaseException) -> bool:
+    """DNS / connection failures on company portals (not greenlet / soft timeout)."""
+    msg = str(exc).lower()
+    markers = (
+        "err_name_not_resolved",
+        "err_connection_refused",
+        "err_connection_timed_out",
+        "err_address_unreachable",
+        "err_internet_disconnected",
+        "err_connection_reset",
+        "err_timed_out",
+        "net::err_",
+        "name_not_resolved",
+        "dns_probe_finished",
+    )
+    return any(m in msg for m in markers)
+
+
 def goto_dom(
     page,
     url: str,
@@ -117,6 +140,17 @@ def goto_dom(
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
     except Exception as first_exc:
+        # Greenlet/thread mismatch: reload would also fail — surface cleanly.
+        if _is_playwright_thread_error(first_exc):
+            raise TimeoutError(
+                f"DOM navigation failed for {url[:160]}: {first_exc}"
+            ) from first_exc
+        if _is_portal_navigation_error(first_exc):
+            from src.core.executor import ExternalPortalLoadError
+
+            raise ExternalPortalLoadError(
+                f"FAILED_PORTAL_DNS: navigation failed for {url[:160]}: {first_exc}"
+            ) from first_exc
         logger.warning(
             "goto_dom timeout/fail on %s (%s) — reloading once",
             (url or "")[:160],
@@ -125,6 +159,12 @@ def goto_dom(
         try:
             page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
         except Exception as reload_exc:
+            if _is_portal_navigation_error(reload_exc):
+                from src.core.executor import ExternalPortalLoadError
+
+                raise ExternalPortalLoadError(
+                    f"FAILED_PORTAL_DNS: reload failed for {url[:160]}: {reload_exc}"
+                ) from reload_exc
             raise TimeoutError(
                 f"DOM navigation failed for {url[:160]}: {first_exc}; reload={reload_exc}"
             ) from reload_exc
@@ -238,6 +278,8 @@ def launch_persistent_context(
 
     from src.core.browser_identity import (
         pinned_device_scale_factor,
+        pinned_locale,
+        pinned_timezone_id,
         pinned_user_agent,
         pinned_viewport,
         webdriver_stealth_script,
@@ -253,6 +295,9 @@ def launch_persistent_context(
         "user_agent": pinned_user_agent(user_data_dir=profile),
         "viewport": vp,
         "device_scale_factor": pinned_device_scale_factor(),
+        # Align Chromium locale/TZ with sticky residential geo (ban armor).
+        "locale": pinned_locale(),
+        "timezone_id": pinned_timezone_id(),
         # Zero-Trust: no downloads; no geo/camera/mic grants.
         "accept_downloads": False,
         "permissions": [],
@@ -309,6 +354,267 @@ def upload_resume_file(page, pdf_path: Path) -> bool:
     return False
 
 
+_UPLOAD_BTN = re.compile(
+    r"(upload(\s+(a\s+)?(new\s+|other\s+|different\s+)?(resume|cv|file))?|"
+    r"replace(\s+(resume|cv|file))?|"
+    r"change(\s+(resume|cv|file))?|choose\s+file|browse|"
+    r"attach(\s+(resume|cv|file))?|use\s+a\s+different\s+(resume|cv|file))",
+    re.I,
+)
+_SAVED_RESUME_CARD = re.compile(
+    r"(select\s+(this\s+)?resume|use\s+(this\s+)?resume|choose\s+from\s+library|"
+    r"previously\s+uploaded|saved\s+resume)",
+    re.I,
+)
+_RESUME_EDIT_BTN = re.compile(r"^(Edit|Replace|Change)$", re.I)
+_RESUME_SECTION = re.compile(r"(resume|cv|curriculum)", re.I)
+
+
+def _click_resume_edit_affordance(page) -> bool:
+    """Indeed Soft review: click Edit beside the attached CV to open re-upload."""
+    # Aria / testid first (Indeed Soft Apply)
+    for sel in (
+        "button[aria-label*='Edit' i][aria-label*='resume' i]",
+        "button[aria-label*='Edit' i][aria-label*='CV' i]",
+        "[data-testid*='resume' i] button:has-text('Edit')",
+        "[data-testid*='Resume' i] button:has-text('Edit')",
+        "button:near(:text('Resume'), 80):has-text('Edit')",
+        "button:near(:text('CV'), 80):has-text('Edit')",
+    ):
+        try:
+            loc = page.locator(sel).first
+            if loc.count() == 0 or not loc.is_visible(timeout=700):
+                continue
+            loc.click(timeout=4000)
+            try:
+                page.wait_for_timeout(450)
+            except Exception:
+                pass
+            return True
+        except Exception:
+            continue
+    # Role-name Edit near resume copy
+    try:
+        edits = page.get_by_role("button", name=_RESUME_EDIT_BTN)
+        n = min(edits.count(), 8)
+    except Exception:
+        n = 0
+    for i in range(n):
+        btn = edits.nth(i)
+        try:
+            if not btn.is_visible(timeout=500):
+                continue
+            # Prefer edits whose nearby text mentions resume/CV
+            try:
+                nearby = (btn.evaluate(
+                    """el => (el.closest('section,form,div')||el.parentElement||el)
+                        .innerText||''"""
+                ) or "")
+            except Exception:
+                nearby = ""
+            if nearby and not _RESUME_SECTION.search(nearby):
+                # Still try if only a couple Edit buttons exist
+                if n > 3:
+                    continue
+            btn.click(timeout=4000)
+            try:
+                page.wait_for_timeout(450)
+            except Exception:
+                pass
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _click_upload_affordance(page) -> bool:
+    """Click Upload/Replace/Change — never saved-resume library cards.
+
+    On Indeed Soft review, prefer Edit-beside-CV first so 'upload other resume'
+    becomes available.
+    """
+    _click_resume_edit_affordance(page)
+    # Prefer explicit buttons/links with upload/replace wording
+    for role in ("button", "link"):
+        try:
+            loc = page.get_by_role(role, name=_UPLOAD_BTN)
+            n = min(loc.count(), 6)
+        except Exception:
+            n = 0
+        for i in range(n):
+            btn = loc.nth(i)
+            try:
+                label = (btn.inner_text(timeout=400) or "").strip()
+            except Exception:
+                label = ""
+            if _SAVED_RESUME_CARD.search(label):
+                continue
+            try:
+                if not btn.is_visible(timeout=800):
+                    continue
+                btn.click(timeout=4000)
+                try:
+                    page.wait_for_timeout(350)
+                except Exception:
+                    pass
+                return True
+            except Exception:
+                continue
+    # Text fallback
+    try:
+        loc = page.get_by_text(_UPLOAD_BTN)
+        n = min(loc.count(), 4)
+    except Exception:
+        n = 0
+    for i in range(n):
+        el = loc.nth(i)
+        try:
+            label = (el.inner_text(timeout=300) or "").strip()
+            if _SAVED_RESUME_CARD.search(label):
+                continue
+            if el.is_visible(timeout=600):
+                el.click(timeout=4000)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _resume_stem_visible(page, pdf_path: Path) -> bool:
+    stem = pdf_path.stem.lower()
+    name = pdf_path.name.lower()
+    try:
+        body = (page.inner_text("body", timeout=1500) or "").lower()
+    except Exception:
+        body = ""
+    if stem and stem in body:
+        return True
+    if name and name in body:
+        return True
+    return False
+
+
+_RESUME_ATTACHED_UI = re.compile(
+    r"(upload\s+complete|resume\s+attached|cv\s+attached|file\s+uploaded|"
+    r"successfully\s+uploaded|resume\s+uploaded)",
+    re.I,
+)
+
+
+def _dispatch_file_input_react_events(page) -> None:
+    """Force React/controlled inputs to register set_input_files via change/input."""
+    try:
+        page.evaluate(
+            """() => {
+                const inputs = Array.from(
+                    document.querySelectorAll('input[type="file"]')
+                );
+                for (const el of inputs) {
+                    try {
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    } catch (e) {}
+                }
+                return inputs.length;
+            }"""
+        )
+    except Exception:
+        logger.debug("file input React event dispatch failed", exc_info=True)
+
+
+def _file_input_has_files(page) -> bool:
+    try:
+        return bool(
+            page.evaluate(
+                """() => Array.from(document.querySelectorAll('input[type="file"]'))
+                    .some(el => el.files && el.files.length > 0)"""
+            )
+        )
+    except Exception:
+        return False
+
+
+def _resume_ui_attached(page, pdf_path: Path) -> bool:
+    """True when UI shows attached resume (stem, Indeed card, or generic copy)."""
+    if _resume_stem_visible(page, pdf_path):
+        return True
+    try:
+        card = page.locator(
+            '[data-testid="attached-resume-card"], '
+            '[data-testid*="resume" i][data-testid*="attach" i], '
+            '[data-test*="attached-resume" i]'
+        ).first
+        if card.count() and card.is_visible(timeout=600):
+            return True
+    except Exception:
+        pass
+    try:
+        loc = page.get_by_text(_RESUME_ATTACHED_UI).first
+        if loc.count() and loc.is_visible(timeout=600):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _confirm_resume_upload(page, pdf_path: Path, *, wait_ms: int = 2500) -> bool:
+    """Event-driven confirm: UI markers, else input.files.length > 0."""
+    deadline_markers = (
+        '[data-testid="attached-resume-card"]',
+        "text=/upload complete/i",
+        "text=/resume attached/i",
+        "text=/cv attached/i",
+    )
+    try:
+        # Prefer waiting for a visible attach affordance rather than sleep.
+        combined = None
+        for sel in deadline_markers:
+            loc = page.locator(sel).first
+            combined = loc if combined is None else combined.or_(loc)
+        if combined is not None:
+            try:
+                combined.wait_for(state="visible", timeout=wait_ms)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if _resume_ui_attached(page, pdf_path):
+        return True
+    if _file_input_has_files(page):
+        logger.debug("force_upload_resume confirmed via input.files.length")
+        return True
+    return False
+
+
+def force_upload_resume(page, pdf_path: Path | str) -> bool:
+    """Force a fresh disk PDF upload — never reuse a saved/library resume.
+
+    After ``set_input_files``, dispatches input/change so React registers the
+    file, then verifies via UI text / Indeed attach card / ``el.files.length``.
+    """
+    pdf = Path(pdf_path).expanduser().resolve()
+    if not pdf.is_file():
+        return False
+    _click_upload_affordance(page)
+    if upload_resume_file(page, pdf):
+        _dispatch_file_input_react_events(page)
+        if _confirm_resume_upload(page, pdf):
+            logger.debug("force_upload_resume confirmed stem=%s", pdf.stem)
+            return True
+        logger.debug(
+            "force_upload_resume set files but UI/files not confirmed yet (%s)",
+            pdf.stem,
+        )
+    # Second affordance click then retry (modal may open after first click)
+    _click_upload_affordance(page)
+    if upload_resume_file(page, pdf):
+        _dispatch_file_input_react_events(page)
+        if _confirm_resume_upload(page, pdf):
+            logger.info("force_upload_resume succeeded on retry for %s", pdf.name)
+            return True
+    return False
+
+
 def success_text(body: str) -> bool:
     blob = (body or "").lower()
     markers = (
@@ -321,3 +627,225 @@ def success_text(body: str) -> bool:
         "you applied",
     )
     return any(m in blob for m in markers)
+
+
+# --- Enterprise harden helpers (new boards) ---------------------------------
+
+
+_CF_IFRAME = (
+    "iframe[src*='challenges.cloudflare.com'], "
+    "iframe[src*='turnstile'], "
+    "iframe[title*='Cloudflare' i], "
+    "div.cf-turnstile, "
+    "[data-sitekey]"
+)
+
+
+def cloudflare_turnstile_present(page) -> bool:
+    """True when a Cloudflare / Turnstile challenge is visible or in DOM."""
+    try:
+        loc = page.locator(_CF_IFRAME).first
+        if loc.count() and loc.is_visible(timeout=400):
+            return True
+    except Exception:
+        pass
+    try:
+        body = (page.inner_text("body", timeout=800) or "").lower()
+    except Exception:
+        body = ""
+    blob = f"{(page.url or '').lower()} {body}"
+    needles = (
+        "cf-turnstile",
+        "cf-browser-verification",
+        "challenges.cloudflare.com",
+        "one more step before you proceed",
+        "verify you are human",
+        "attention required",
+        "checking your browser",
+    )
+    return any(n in blob for n in needles)
+
+
+def raise_if_cloudflare(page, site: str) -> None:
+    """Hard-exit CF walls — never hand to Gemini vision (unsolvable quota burn).
+
+    Circuit recording happens in browser_worker_loop on ApplicationBlockedError
+    so we do not double-count the same wall.
+    """
+    if not cloudflare_turnstile_present(page):
+        return
+    from src.core.executor import ApplicationBlockedError
+
+    raise ApplicationBlockedError(
+        f"{site}: cloudflare/turnstile wall — requires human (no vision)"
+    )
+
+
+def human_type(locator, text: str, *, delay_ms: int = 10) -> bool:
+    """Type like a human (delay between keys). Prefer press_sequentially, else type."""
+    value = str(text or "")
+    if not value:
+        return False
+    try:
+        locator.click(timeout=2000)
+    except Exception:
+        pass
+    try:
+        locator.fill("", timeout=1500)
+    except Exception:
+        pass
+    try:
+        if hasattr(locator, "press_sequentially"):
+            locator.press_sequentially(value, delay=max(1, int(delay_ms)))
+            return True
+    except Exception:
+        logger.debug("press_sequentially failed — falling back to type", exc_info=True)
+    try:
+        locator.type(value, delay=max(1, int(delay_ms)), timeout=30_000)
+        return True
+    except Exception:
+        try:
+            locator.fill(value, timeout=5000)
+            return True
+        except Exception:
+            return False
+
+
+def resolve_pitch_short(
+    *,
+    yaml_snapshot: str | None,
+    master_path: Path | str | None = None,
+    company: str = "",
+    job_title: str = "",
+    jd_text: str = "",
+) -> str:
+    """Prefer embedded pitch_short → application_answers → template (no mid-apply LLM)."""
+    from src.core.pitch import extract_pitch, _fallback_pitch
+
+    existing = extract_pitch(yaml_snapshot)
+    if existing and len(existing) >= 40:
+        return existing
+    answers: dict[str, Any] = {}
+    if master_path:
+        try:
+            answers = load_applicant_profile(master_path, yaml_snapshot=yaml_snapshot)
+        except Exception:
+            answers = {}
+    for key in ("why_this_role", "additional_information", "pitch_short", "cover_letter"):
+        val = str(answers.get(key) or "").strip()
+        if len(val) >= 40:
+            co = (company or "").strip()
+            if co and co.lower() not in val.lower():
+                return f"{val} Excited about {co}."
+            return val
+    return _fallback_pitch(company or "the team", job_title or "")
+
+
+def wait_for_any(page, selectors: list[str], *, timeout_ms: int = 5000):
+    """Event-driven wait for the first matching visible locator (or None)."""
+    if not selectors:
+        return None
+    combined = None
+    for sel in selectors:
+        loc = page.locator(sel).first
+        combined = loc if combined is None else combined.or_(loc)
+    if combined is None:
+        return None
+    try:
+        combined.wait_for(state="visible", timeout=timeout_ms)
+        return combined
+    except Exception:
+        return None
+
+
+def close_extra_pages(context, keep) -> None:
+    """Close every page except ``keep`` to prevent tab/memory leaks."""
+    if context is None or keep is None:
+        return
+    try:
+        pages = list(context.pages)
+    except Exception:
+        return
+    for p in pages:
+        if p is keep:
+            continue
+        try:
+            if not p.is_closed():
+                p.close()
+        except Exception:
+            logger.debug("close_extra_pages failed", exc_info=True)
+
+
+def capture_popup_url_then_close(
+    context,
+    primary_page,
+    click_fn,
+    *,
+    popup_timeout_ms: int = 6000,
+    nav_timeout_ms: int = 12_000,
+) -> str:
+    """Click CTA; if a new tab opens, read its URL, close it, return URL.
+
+    Same-tab navigations return the primary page URL. Never leaves popup tabs open.
+    Sync Playwright only (warm worker thread) — no asyncio.run.
+
+    Important: do not click twice. ``expect_page`` still runs the click when no
+    popup appears; a second click was wiping the offsite URL race (bake15b).
+    """
+    before = ""
+    try:
+        before = (primary_page.url or "").strip()
+    except Exception:
+        before = ""
+
+    popup = None
+    try:
+        with context.expect_page(timeout=popup_timeout_ms) as wait_popup:
+            click_fn()
+        popup = wait_popup.value
+    except Exception:
+        # Click already happened inside expect_page (or click itself failed).
+        try:
+            primary_page.wait_for_function(
+                """(prev) => {
+                    const u = location.href || '';
+                    if (!u || u === 'about:blank') return false;
+                    if (prev && u !== prev && !u.includes('linkedin.com')) return true;
+                    if (prev && u !== prev) return true;
+                    return false;
+                }""",
+                arg=before,
+                timeout=min(nav_timeout_ms, 8000),
+            )
+        except Exception:
+            try:
+                primary_page.wait_for_load_state(
+                    "domcontentloaded", timeout=min(nav_timeout_ms, 5000)
+                )
+            except Exception:
+                pass
+        return (primary_page.url or "").strip()
+
+    try:
+        popup.wait_for_load_state("domcontentloaded", timeout=nav_timeout_ms)
+    except Exception:
+        pass
+    # Offsite tabs often land about:blank then redirect — wait briefly.
+    try:
+        popup.wait_for_function(
+            """() => {
+                const u = location.href || '';
+                return !!u && u !== 'about:blank' && !u.startsWith('chrome-error:');
+            }""",
+            timeout=5000,
+        )
+    except Exception:
+        pass
+    final_url = (popup.url or "").strip()
+    try:
+        if not popup.is_closed():
+            popup.close()
+    except Exception:
+        logger.debug("popup close failed", exc_info=True)
+    close_extra_pages(context, keep=primary_page)
+    return final_url

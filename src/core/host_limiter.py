@@ -2,22 +2,83 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import random
 import threading
 import time
 from collections.abc import Callable
 from urllib.parse import urlparse
 
+logger = logging.getLogger(__name__)
+
 # host_suffix -> (base_seconds, jitter_seconds)
-HOST_LIMITS: dict[str, tuple[float, float]] = {
+# Sensitive boards (CF / account flags) get LinkedIn-class spacing.
+_DEFAULT_HOST_LIMITS: dict[str, tuple[float, float]] = {
     "linkedin.com": (90.0, 15.0),
+    # Indeed Soft Apply is crowded — heavy spacing if ACE_ALLOW_INDEED=1.
+    "indeed.com": (150.0, 30.0),
+    "smartapply.indeed.com": (150.0, 30.0),
     "myworkdayjobs.com": (45.0, 10.0),
     "lever.co": (25.0, 5.0),
     "greenhouse.io": (25.0, 5.0),
+    "wellfound.com": (95.0, 20.0),
+    "angel.co": (95.0, 20.0),
+    "glassdoor.com": (120.0, 25.0),
+    "glassdoor.co.in": (120.0, 25.0),
+    "naukri.com": (50.0, 12.0),
+    "workatastartup.com": (75.0, 15.0),
+    "weworkremotely.com": (20.0, 5.0),
+    "himalayas.app": (20.0, 5.0),
+    "hiring.cafe": (25.0, 5.0),
 }
 DEFAULT_LIMIT: tuple[float, float] = (15.0, 3.0)
 
+
+def _parse_host_limits_env(raw: str) -> dict[str, tuple[float, float]]:
+    """Parse ACE_HOST_LIMITS=linkedin.com=120:20,naukri.com=60:15."""
+    out: dict[str, tuple[float, float]] = {}
+    for part in (raw or "").replace("\n", ",").split(","):
+        chunk = part.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        host, rest = chunk.split("=", 1)
+        host = host.strip().lower().lstrip(".")
+        rest = rest.strip()
+        if not host or ":" not in rest:
+            continue
+        base_s, jit_s = rest.split(":", 1)
+        try:
+            base = float(base_s.strip())
+            jitter = float(jit_s.strip())
+        except ValueError:
+            continue
+        if base < 1.0:
+            continue
+        out[host] = (base, max(0.0, jitter))
+    return out
+
+
+def _build_host_limits() -> dict[str, tuple[float, float]]:
+    limits = dict(_DEFAULT_HOST_LIMITS)
+    env = (os.environ.get("ACE_HOST_LIMITS") or "").strip()
+    if env:
+        overrides = _parse_host_limits_env(env)
+        if overrides:
+            limits.update(overrides)
+            logger.info("ACE_HOST_LIMITS overrides applied: %s", sorted(overrides))
+    return limits
+
+
+HOST_LIMITS: dict[str, tuple[float, float]] = _build_host_limits()
 _HOST_KEYS_SORTED = tuple(sorted(HOST_LIMITS.keys(), key=len, reverse=True))
+
+
+def reload_host_limits_for_tests() -> None:
+    """Re-read ACE_HOST_LIMITS into module globals (tests only)."""
+    global HOST_LIMITS, _HOST_KEYS_SORTED
+    HOST_LIMITS = _build_host_limits()
+    _HOST_KEYS_SORTED = tuple(sorted(HOST_LIMITS.keys(), key=len, reverse=True))
 
 
 def host_bucket_key(job_url: str) -> str:

@@ -16,6 +16,13 @@ QUEUE_STATUSES = frozenset({"READY", "CLAIMED", "DONE", "CANCELLED"})
 _RECLAIM_RE = re.compile(r"(?:^|;)\s*reclaim=(\d+)\s*(?:;|$)", re.I)
 
 
+def _ensure_queue_columns(conn) -> None:
+    rows = conn.execute("PRAGMA table_info(apply_queue)").fetchall()
+    cols = {str(r["name"] if hasattr(r, "keys") else r[1]) for r in rows}
+    if "job_title" not in cols:
+        conn.execute("ALTER TABLE apply_queue ADD COLUMN job_title TEXT")
+
+
 def init_queue(db_path: Path | None = None) -> Path:
     path = init_db(db_path)
     with _connect(db_path) as conn:
@@ -33,10 +40,12 @@ def init_queue(db_path: Path | None = None) -> Path:
                 worker_id TEXT,
                 error_log TEXT,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                job_title TEXT
             )
             """
         )
+        _ensure_queue_columns(conn)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_apply_queue_status "
             "ON apply_queue(status, id)"
@@ -57,26 +66,30 @@ def enqueue_apply(
     jd_text: str,
     pdf_path: str,
     yaml_snapshot: str = "",
+    job_title: str = "",
     db_path: Path | None = None,
 ) -> int:
     """Insert or refresh a READY apply item. Returns row id."""
     init_queue(db_path)
     url = (job_url or "").strip()
     ts = _now()
+    title = (job_title or "").strip()
     with _connect(db_path) as conn:
+        _ensure_queue_columns(conn)
         conn.execute(
             """
             INSERT INTO apply_queue (
                 company, job_url, track, jd_text, pdf_path, yaml_snapshot,
-                status, worker_id, error_log, created_at, updated_at
+                status, worker_id, error_log, created_at, updated_at, job_title
             )
-            VALUES (?, ?, ?, ?, ?, ?, 'READY', NULL, '', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 'READY', NULL, '', ?, ?, ?)
             ON CONFLICT(job_url) DO UPDATE SET
                 company=excluded.company,
                 track=excluded.track,
                 jd_text=excluded.jd_text,
                 pdf_path=excluded.pdf_path,
                 yaml_snapshot=excluded.yaml_snapshot,
+                job_title=COALESCE(NULLIF(excluded.job_title, ''), apply_queue.job_title),
                 status='READY',
                 worker_id=NULL,
                 error_log='',
@@ -92,6 +105,7 @@ def enqueue_apply(
                 yaml_snapshot or "",
                 ts,
                 ts,
+                title,
             ),
         )
         row = conn.execute(
@@ -189,6 +203,27 @@ def mark_done(
             (error_log or "", _now(), int(queue_id)),
         )
         conn.commit()
+
+
+def requeue_claimed(
+    queue_id: int,
+    *,
+    error_log: str = "circuit_cooldown",
+    db_path: Path | None = None,
+) -> bool:
+    """Return a CLAIMED row to READY (ban-armor circuit / pacing pause)."""
+    init_queue(db_path)
+    with _connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            UPDATE apply_queue
+            SET status='READY', worker_id=NULL, error_log=?, updated_at=?
+            WHERE id=? AND status='CLAIMED'
+            """,
+            (error_log or "circuit_cooldown", _now(), int(queue_id)),
+        )
+        conn.commit()
+        return cur.rowcount > 0
 
 
 def _parse_reclaim_count(error_log: str | None) -> int:
@@ -359,3 +394,34 @@ def queue_counts(db_path: Path | None = None) -> dict[str, int]:
 def ready_count(db_path: Path | None = None) -> int:
     counts = queue_counts(db_path)
     return int(counts.get("READY", 0)) + int(counts.get("CLAIMED", 0))
+
+
+def company_active_apply_count(
+    company: str,
+    *,
+    db_path: Path | None = None,
+) -> int:
+    """Count READY/CLAIMED rows for this company (shared build-dir peers)."""
+    needle = (company or "").strip().lower()
+    if not needle:
+        return 0
+    init_queue(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT company FROM apply_queue
+            WHERE status IN ('READY', 'CLAIMED')
+            ORDER BY id DESC
+            LIMIT 400
+            """
+        ).fetchall()
+    return sum(
+        1
+        for row in rows
+        if str(row["company"] or "").strip().lower() == needle
+    )
+
+
+def company_has_peer_apply(company: str, *, db_path: Path | None = None) -> bool:
+    """True if ≥2 active queue rows share the company (caller is usually one of them)."""
+    return company_active_apply_count(company, db_path=db_path) > 1

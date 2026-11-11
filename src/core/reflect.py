@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from src.core.llm_router import invoke_with_failover
-from src.core.llm_text import message_text
+from src.core.llm_router import message_text
 from src.core.memory import recent_failures, recent_rejections
 from src.core.security import validate_safe_path
 from src.core.settings import get_settings

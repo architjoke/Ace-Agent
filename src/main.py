@@ -55,6 +55,7 @@ async def process_job(job, master_yaml: Path, master_text: str, min_fit: int) ->
         master_yaml=master_yaml,
         cleanup_linkedin_resume=("linkedin.com" in tailored["job_url"].lower()),
         job_url_direct=str(tailored.get("job_url_direct") or ""),
+        job_title=str(tailored.get("title") or ""),
     )
 
 

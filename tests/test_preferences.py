@@ -10,41 +10,42 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 
-def test_hard_soft_and_prune(tmp_path, monkeypatch):
+def test_hard_soft_and_prune(monkeypatch):
     from src.core import preferences as pref
-    from src.core import reflect
 
-    lessons = tmp_path / "lessons_learned.md"
-    lessons.write_text("# Lessons\n\n", encoding="utf-8")
-    monkeypatch.setattr(pref, "LESSONS_LEARNED", lessons)
-    monkeypatch.setattr(reflect, "lessons_path", lambda: lessons)
-    monkeypatch.setattr(pref, "_archive_path", lambda: tmp_path / "archived.md")
+    rules = [
+        pref.PreferenceRule(
+            id="h1",
+            category="JOB_FILTERING",
+            rule_text='Exclude jobs mentioning "whatsapp community"',
+            enforcement_level="HARD",
+            created="2026-01-01T00:00:00+00:00",
+            affirmed="2026-01-01T00:00:00+00:00",
+        ),
+        pref.PreferenceRule(
+            id="s1",
+            category="CULTURE",
+            rule_text="Prefer remote-friendly roles",
+            enforcement_level="SOFT",
+            created="2026-01-01T00:00:00+00:00",
+            affirmed="2026-01-01T00:00:00+00:00",
+        ),
+    ]
+    monkeypatch.setattr(pref, "load_preference_rules", lambda path=None: rules)
 
-    hard = pref.memorize_preference(
-        "JOB_FILTERING",
-        'Exclude jobs mentioning "whatsapp community"',
-        "HARD",
-    )
-    soft = pref.memorize_preference(
-        "CULTURE",
-        "Prefer remote-friendly roles",
-        "SOFT",
-    )
-    assert hard.enforcement_level == "HARD"
-    assert soft.enforcement_level == "SOFT"
-
-    reason, penalty, hits = pref.apply_preference_gate(
+    reason, penalty, hits, cit = pref.apply_preference_gate(
         "Join our WhatsApp community for updates. Python intern."
     )
     assert reason and "preference_hard" in reason
     assert penalty == 0
+    assert cit is False
 
-    reason2, penalty2, hits2 = pref.apply_preference_gate(
+    reason2, penalty2, hits2, cit2 = pref.apply_preference_gate(
         "Remote-friendly Python internship in India."
     )
     assert reason2 is None
-    # soft may or may not hit depending on heuristic; remote-friendly should hit
     assert penalty2 >= 0
+    assert cit2 is False
 
 
 def test_cleanup_jail():
@@ -77,7 +78,7 @@ if __name__ == "__main__":
         'Exclude jobs mentioning "whatsapp community"',
         "HARD",
     )
-    r, p, h = apply_preference_gate("Please join our WhatsApp community first")
-    print("hard_gate", bool(r), p)
+    r, p, h, c = apply_preference_gate("Please join our WhatsApp community first")
+    print("hard_gate", bool(r), p, c)
     print("prune", prune_decayed_preferences())
     print("ok")

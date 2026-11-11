@@ -19,14 +19,50 @@ from src.playbooks.session import (  # noqa: E402
     PlaybookSession as PlaybookSession,
 )
 
+# Native / board kinds that have dedicated runners (plus classic ATS).
+_BOARD_KINDS = frozenset(
+    {
+        "linkedin",
+        "indeed",
+        "greenhouse",
+        "lever",
+        "ashby",
+        "workday",
+        "naukri",
+        "wellfound",
+        "yc_waas",
+        "glassdoor",
+        "aggregator",
+        "google_forms",
+        "career_site",
+        "mailto",
+    }
+)
+
 
 def classify_ats(job_url: str) -> str:
-    """Return ats kind: linkedin | greenhouse | lever | ashby | workday | other."""
-    host = (urlparse(job_url or "").hostname or "").lower()
-    path = (urlparse(job_url or "").path or "").lower()
+    """Return ats/board kind for router dispatch."""
+    raw = (job_url or "").strip()
+    if raw.lower().startswith("mailto:"):
+        return "mailto"
+    host = (urlparse(raw).hostname or "").lower()
+    path = (urlparse(raw).path or "").lower()
     blob = f"{host}{path}"
+    if "docs.google.com" in host and "/forms" in path:
+        return "google_forms"
+    if host.endswith("forms.gle") or host == "forms.gle":
+        return "google_forms"
+    if "eightfold.ai" in host:
+        return "career_site"
+    if "zohorecruit." in host or ("zoho.com" in host and "recruit" in blob):
+        return "career_site"
+    if host.startswith("careers.") and "linkedin.com" not in host:
+        # Custom career microsites (often Zoho/Eightfold/Workday wrappers).
+        return "career_site"
     if "linkedin.com" in host:
         return "linkedin"
+    if "indeed.com" in host or "smartapply.indeed.com" in host:
+        return "indeed"
     if "boards.greenhouse.io" in host or host.endswith("greenhouse.io"):
         return "greenhouse"
     if "greenhouse.io" in blob and "/jobs/" in path:
@@ -39,6 +75,28 @@ def classify_ats(job_url: str) -> str:
         return "workday"
     if host.startswith("wd") and "myworkdayjobs.com" in host:
         return "workday"
+    if "naukri.com" in host:
+        return "naukri"
+    if "wellfound.com" in host or host.endswith("angel.co"):
+        return "wellfound"
+    if "workatastartup.com" in host or (
+        "ycombinator.com" in host and "workatastartup" in blob
+    ):
+        return "yc_waas"
+    if "glassdoor." in host or host.endswith("glassdoor.com") or host.endswith(
+        "glassdoor.co.in"
+    ):
+        return "glassdoor"
+    if any(
+        marker in host
+        for marker in (
+            "weworkremotely.com",
+            "himalayas.app",
+            "hiring.cafe",
+            "hiringcafe.com",
+        )
+    ):
+        return "aggregator"
     return "other"
 
 
@@ -91,7 +149,7 @@ def resolve_ats_kind(
     user_data_dir: Path | str | None = None,
     page=None,
 ) -> str:
-    """Classify ATS. Pass ``page`` to reuse warm Chromium (no launch/close)."""
+    """Classify ATS/board. Pass ``page`` to reuse warm Chromium (no launch/close)."""
     url = (job_url or "").strip()
     kind = classify_ats(url)
     if kind != "other":

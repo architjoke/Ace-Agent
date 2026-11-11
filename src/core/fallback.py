@@ -43,10 +43,9 @@ class ManualPackageContent(BaseModel):
             "engineering tone. No markdown fences."
         ),
     )
+    # No min_length/max_length — Cohere structured-output rejects array minItems/maxItems.
     top_keywords: list[str] = Field(
         ...,
-        min_length=5,
-        max_length=5,
         description="Exactly five high-signal keywords/phrases extracted from the JD.",
     )
     apply_instructions: str = Field(

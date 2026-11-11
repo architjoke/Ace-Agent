@@ -18,6 +18,7 @@ VALID_STATUSES = frozenset(
         "FAILED_TIMEOUT_OR_STUCK",
         "FAILED_INTERRUPTED",
         "REQUIRES_HUMAN_INTERVENTION",
+        "REQUIRES_HUMAN_CITIZENSHIP_REVIEW",
         "JOB_CLOSED",
     }
 )
@@ -59,6 +60,7 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
         "outcome_updated_at": "TEXT",
         "action_url": "TEXT",
         "action_deadline": "TEXT",
+        "job_title": "TEXT",
     }
     for name, decl in migrations.items():
         if name not in cols:
@@ -128,43 +130,241 @@ def has_successful_apply(job_url: str, db_path: Path | None = None) -> bool:
     return row is not None
 
 
+def _norm_company(name: str) -> str:
+    text = (name or "").lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(
+        r"\b(inc|llc|ltd|pvt|private|limited|corp|corporation|technologies|tech|labs|recruiting|careers|team|hr)\b",
+        " ",
+        text,
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _norm_role(title: str) -> str:
+    """Normalize job role for company+role matching."""
+    from src.core.tailor import normalize_role_title
+
+    return normalize_role_title(title or "")
+
+
+def _row_age_days(ts_raw: str, *, now: datetime | None = None) -> float | None:
+    raw = (ts_raw or "").strip()
+    if not raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        ref = now or datetime.now(timezone.utc)
+        return (ref - ts).total_seconds() / 86400.0
+    except ValueError:
+        return None
+
+
 def has_successful_company_apply(
     company: str,
     *,
     within_days: int = 30,
     db_path: Path | None = None,
 ) -> bool:
-    """True if a SUCCESS apply exists for this company within within_days."""
+    """Legacy: SUCCESS/ALREADY_APPLIED for this company within within_days (any role).
+
+    Prefer ``has_recent_company_role_apply`` when a job title is known.
+    """
+    return has_recent_company_role_apply(
+        company, "", within_days=within_days, db_path=db_path
+    )
+
+
+def has_recent_company_role_apply(
+    company: str,
+    job_title: str,
+    *,
+    within_days: int = 30,
+    db_path: Path | None = None,
+) -> bool:
+    """True if SUCCESS/ALREADY_APPLIED for same company(+role) within within_days.
+
+    With ``job_title``: match normalized company + role. Empty title: company-wide.
+    After TTL, same company+role is allowed again for a new URL (exact URL still
+    blocked forever by ``has_applied``).
+    """
     needle = _norm_company(company)
     if not needle:
         return False
+    role_needle = _norm_role(job_title) if (job_title or "").strip() else ""
     days = max(1, int(within_days))
     with _connect(db_path) as conn:
+        _ensure_columns(conn)
         rows = conn.execute(
             """
-            SELECT company, timestamp FROM applications
-            WHERE status = 'SUCCESS'
+            SELECT company, job_title, status, timestamp FROM applications
+            WHERE status IN ('SUCCESS', 'ALREADY_APPLIED')
             ORDER BY id DESC
-            LIMIT 500
+            LIMIT 800
             """
         ).fetchall()
     now = datetime.now(timezone.utc)
     for row in rows:
         if _norm_company(str(row["company"] or "")) != needle:
             continue
-        ts_raw = str(row["timestamp"] or "").strip()
-        if not ts_raw:
-            return True
-        try:
-            ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            age_days = (now - ts).total_seconds() / 86400.0
-            if age_days <= days:
+        age = _row_age_days(str(row["timestamp"] or ""), now=now)
+        in_window = True if age is None else age <= days
+        if not in_window:
+            continue
+        stored_title = str(row["job_title"] or "").strip()
+        if role_needle:
+            if stored_title:
+                if _norm_role(stored_title) == role_needle:
+                    return True
+                continue
+            # Legacy SUCCESS without title still blocks that company while in window
+            if str(row["status"] or "").upper() == "SUCCESS":
                 return True
-        except ValueError:
-            return True
+            continue
+        return True
     return False
+
+
+def list_submitted_company_roles(
+    *,
+    within_days: int | None = 30,
+    limit: int = 100,
+    db_path: Path | None = None,
+) -> list[dict]:
+    """Distinct submitted company · role rows (SUCCESS), newest first."""
+    init_db(db_path)
+    days = None if within_days is None else max(1, int(within_days))
+    with _connect(db_path) as conn:
+        _ensure_columns(conn)
+        rows = conn.execute(
+            """
+            SELECT company, job_title, timestamp, job_url, status
+            FROM applications
+            WHERE status = 'SUCCESS'
+            ORDER BY id DESC
+            LIMIT 800
+            """
+        ).fetchall()
+    now = datetime.now(timezone.utc)
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
+    for row in rows:
+        company = str(row["company"] or "").strip() or "Unknown"
+        title = str(row["job_title"] or "").strip()
+        if days is not None:
+            age = _row_age_days(str(row["timestamp"] or ""), now=now)
+            if age is not None and age > days:
+                continue
+        key = (_norm_company(company), _norm_role(title) if title else "")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "company": company,
+                "job_title": title or "(role unknown)",
+                "timestamp": str(row["timestamp"] or ""),
+                "job_url": str(row["job_url"] or ""),
+            }
+        )
+        if len(out) >= max(1, min(int(limit), 500)):
+            break
+    return out
+
+
+def mark_company_role_submitted(
+    company: str,
+    job_title: str = "",
+    *,
+    job_url: str = "",
+    track: str = "",
+    db_path: Path | None = None,
+) -> dict:
+    """Record user-confirmed submit for company(+role). Returns summary dict."""
+    init_db(db_path)
+    company_s = (company or "").strip() or "Unknown"
+    title_s = (job_title or "").strip()
+    needle = _norm_company(company_s)
+    role_needle = _norm_role(title_s) if title_s else ""
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    updated_ids: list[int] = []
+    with _connect(db_path) as conn:
+        _ensure_columns(conn)
+        rows = conn.execute(
+            """
+            SELECT id, company, job_title, job_url, status FROM applications
+            ORDER BY id DESC
+            LIMIT 800
+            """
+        ).fetchall()
+        # Empty role (Manual_Action bulk mark): only flip open packages, never
+        # every historical row for the company.
+        _OPEN_FOR_MARK = frozenset(
+            {
+                "MANUAL_ACTION",
+                "REQUIRES_HUMAN_INTERVENTION",
+                "REQUIRES_HUMAN_CITIZENSHIP_REVIEW",
+            }
+        )
+        for row in rows:
+            if _norm_company(str(row["company"] or "")) != needle:
+                continue
+            stored = str(row["job_title"] or "").strip()
+            if role_needle and stored and _norm_role(stored) != role_needle:
+                continue
+            status = str(row["status"] or "").strip().upper()
+            if not role_needle and status not in _OPEN_FOR_MARK:
+                continue
+            from src.core.db_jail import jailed_update_application_status
+
+            jailed_update_application_status(
+                conn,
+                int(row["id"]),
+                status="SUCCESS",
+                error_log="USER_MARKED_SUBMITTED",
+                job_title=title_s or stored,
+            )
+            updated_ids.append(int(row["id"]))
+            if role_needle:
+                break
+
+        if not updated_ids:
+            url = (job_url or "").strip()
+            if not url:
+                slug_c = re.sub(r"[^a-z0-9]+", "-", needle).strip("-") or "company"
+                slug_r = role_needle or "role"
+                url = f"ace://submitted/{slug_c}/{slug_r}"
+            conn.execute(
+                """
+                INSERT INTO applications (
+                    company, job_url, track, status, error_log, timestamp,
+                    outcome_status, jd_text, tailored_yaml_snapshot, job_title
+                )
+                VALUES (?, ?, ?, 'SUCCESS', 'USER_MARKED_SUBMITTED', ?, 'PENDING', '', '', ?)
+                ON CONFLICT(job_url) DO UPDATE SET
+                    company=excluded.company,
+                    track=excluded.track,
+                    status='SUCCESS',
+                    error_log='USER_MARKED_SUBMITTED',
+                    timestamp=excluded.timestamp,
+                    job_title=COALESCE(NULLIF(excluded.job_title, ''), applications.job_title)
+                """,
+                (company_s, url, (track or "").strip(), ts, title_s),
+            )
+            row = conn.execute(
+                "SELECT id FROM applications WHERE job_url = ?", (url,)
+            ).fetchone()
+            if row:
+                updated_ids.append(int(row["id"]))
+        conn.commit()
+    return {
+        "company": company_s,
+        "job_title": title_s or "(role unknown)",
+        "updated": len(updated_ids),
+        "ids": updated_ids,
+    }
 
 
 def log_application(
@@ -177,6 +377,7 @@ def log_application(
     jd_text: str = "",
     tailored_yaml_snapshot: str = "",
     outcome_status: str = "PENDING",
+    job_title: str = "",
     db_path: Path | None = None,
 ) -> None:
     """Record one application execution. Upserts on job_url."""
@@ -194,6 +395,7 @@ def log_application(
     if not url:
         raise ValueError("job_url is required")
 
+    title = (job_title or "").strip()
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with _connect(db_path) as conn:
         _ensure_columns(conn)
@@ -201,9 +403,9 @@ def log_application(
             """
             INSERT INTO applications (
                 company, job_url, track, status, error_log, timestamp,
-                outcome_status, jd_text, tailored_yaml_snapshot
+                outcome_status, jd_text, tailored_yaml_snapshot, job_title
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(job_url) DO UPDATE SET
                 company=excluded.company,
                 track=excluded.track,
@@ -214,7 +416,8 @@ def log_application(
                 tailored_yaml_snapshot=COALESCE(
                     NULLIF(excluded.tailored_yaml_snapshot, ''),
                     applications.tailored_yaml_snapshot
-                )
+                ),
+                job_title=COALESCE(NULLIF(excluded.job_title, ''), applications.job_title)
             """,
             (
                 (company or "Unknown").strip() or "Unknown",
@@ -226,20 +429,10 @@ def log_application(
                 outcome,
                 jd_text or "",
                 tailored_yaml_snapshot or "",
+                title,
             ),
         )
         conn.commit()
-
-
-def _norm_company(name: str) -> str:
-    text = (name or "").lower()
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    text = re.sub(
-        r"\b(inc|llc|ltd|pvt|private|limited|corp|corporation|technologies|tech|labs|recruiting|careers|team|hr)\b",
-        " ",
-        text,
-    )
-    return re.sub(r"\s+", " ", text).strip()
 
 
 def update_application_outcome(
@@ -390,6 +583,7 @@ def application_counts(db_path: Path | None = None) -> dict[str, int]:
     stuck = by_status.get("FAILED_TIMEOUT_OR_STUCK", 0)
     interrupted = by_status.get("FAILED_INTERRUPTED", 0)
     human = by_status.get("REQUIRES_HUMAN_INTERVENTION", 0)
+    citizen = by_status.get("REQUIRES_HUMAN_CITIZENSHIP_REVIEW", 0)
     closed = by_status.get("JOB_CLOSED", 0)
     return {
         "staged_ready": staged,
@@ -399,6 +593,7 @@ def application_counts(db_path: Path | None = None) -> dict[str, int]:
         "failed_timeout_or_stuck": stuck,
         "failed_interrupted": interrupted,
         "requires_human_intervention": human,
+        "requires_human_citizenship_review": citizen,
         "job_closed": closed,
         "attempted": staged
         + manual
@@ -407,6 +602,7 @@ def application_counts(db_path: Path | None = None) -> dict[str, int]:
         + stuck
         + interrupted
         + human
+        + citizen
         + closed,
         "unique_companies": int(companies or 0),
         "pending_outcomes": int(pending_outcomes or 0),
@@ -433,7 +629,7 @@ def list_applications(
         rows = conn.execute(
             f"""
             SELECT id, company, job_url, track, status, error_log, timestamp,
-                   outcome_status, outcome_reason
+                   outcome_status, outcome_reason, job_title
             FROM applications
             {clause}
             ORDER BY id DESC

@@ -29,7 +29,7 @@ from src.core.llm_router import (
 )
 from src.core.config import OUTPUT_DIR as _DEFAULT_OUTPUT
 from src.core.config import PROJECT_ROOT, THEMES_DIR, ensure_runtime_dirs, resolve_master_yaml
-from src.core.llm_text import message_text
+from src.core.llm_router import message_text
 from src.core.prompts import DRAFT_RESUME
 from src.core.reflect import load_lessons
 
@@ -1273,6 +1273,14 @@ def _safe_dir_name(name: str) -> str:
     return cleaned or "Unknown"
 
 
+_PDF_PATH_RE = re.compile(r"([^\s\"']+\.pdf)", re.I)
+_RENDERCV_BANNER_RE = re.compile(
+    r"(new version|update available|pip install --upgrade\s+rendercv|"
+    r"a new version of rendercv)",
+    re.I,
+)
+
+
 def _find_pdf(tailored_yaml: str, search_dirs: list[Path] | None = None) -> Path:
     loaded = yaml.safe_load(tailored_yaml) or {}
     cv_name = str((loaded.get("cv") or {}).get("name") or "CV")
@@ -1287,6 +1295,63 @@ def _find_pdf(tailored_yaml: str, search_dirs: list[Path] | None = None) -> Path
         if pdfs:
             return pdfs[-1]
     return expected
+
+
+def _parse_rendercv_pdf_paths(*blobs: str) -> list[Path]:
+    """Extract existing PDF paths from RenderCV stdout/stderr via strict regex."""
+    found: list[Path] = []
+    seen: set[str] = set()
+    for blob in blobs:
+        if not blob:
+            continue
+        for match in _PDF_PATH_RE.finditer(blob):
+            raw = match.group(1).strip().strip("\"'")
+            if not raw or _RENDERCV_BANNER_RE.search(raw):
+                continue
+            path = Path(raw)
+            if not path.is_absolute():
+                path = (REPO_ROOT / path).resolve()
+            else:
+                path = path.resolve()
+            key = str(path).lower()
+            if key in seen:
+                continue
+            if path.is_file() and path.suffix.lower() == ".pdf":
+                seen.add(key)
+                found.append(path)
+    return found
+
+
+def _scrub_rendercv_output(text: str) -> str:
+    """Drop update-banner lines that corrupt error / path parsers."""
+    if not text:
+        return ""
+    lines = [
+        line
+        for line in text.splitlines()
+        if line.strip() and not _RENDERCV_BANNER_RE.search(line)
+    ]
+    return "\n".join(lines).strip()
+
+
+def _default_base_resume_pdf() -> Path | None:
+    """Static fresher PDFs under resumes/ when RenderCV compile fails."""
+    resumes = REPO_ROOT / "resumes"
+    preferred = (
+        "Archit_Gupta_SDE_-_Resume_2.pdf",
+        "Archit_Gupta_AI_Engineer_-_Resume_2.pdf",
+        "Archit_Gupta_ML-_Resume_2.pdf",
+        "Archit_Gupta_-_Resume__1_.pdf",
+    )
+    for name in preferred:
+        path = resumes / name
+        if path.is_file():
+            return path.resolve()
+    if resumes.is_dir():
+        pdfs = sorted(resumes.glob("*.pdf"), key=lambda p: p.stat().st_mtime)
+        if pdfs:
+            return pdfs[-1].resolve()
+    return None
 
 
 def extract_node(state: State) -> dict:
@@ -1513,12 +1578,18 @@ def _ensure_ace_theme_beside_yaml(yaml_path: Path) -> None:
     )
 
 
-def _run_rendercv(yaml_path: Path, company_dir: Path) -> tuple[int, str]:
+def _run_rendercv(yaml_path: Path, company_dir: Path) -> tuple[int, str, str, str]:
+    """Run RenderCV. Returns (code, scrubbed_err, stdout, stderr)."""
     yaml_path = Path(yaml_path).expanduser().resolve()
     company_dir = Path(company_dir).expanduser().resolve()
     _ensure_ace_theme_beside_yaml(yaml_path)
     relative_yaml = yaml_path.relative_to(REPO_ROOT).as_posix()
     relative_out = company_dir.relative_to(REPO_ROOT).as_posix()
+    env = os.environ.copy()
+    # Best-effort suppressors — RenderCV has no dedicated CLI flag.
+    env.setdefault("RENDERCV_SKIP_UPDATE_CHECK", "1")
+    env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+    env.setdefault("NO_UPDATE_NOTIFIER", "1")
     try:
         completed = subprocess.run(
             [
@@ -1534,12 +1605,15 @@ def _run_rendercv(yaml_path: Path, company_dir: Path) -> tuple[int, str]:
             encoding="utf-8",
             errors="replace",
             cwd=str(REPO_ROOT),
+            env=env,
         )
     except OSError as exc:
         logger.exception("Failed to launch RenderCV")
-        return 1, f"Failed to launch RenderCV: {exc}"
-    err = (completed.stderr or completed.stdout or "").strip()
-    return completed.returncode, err
+        return 1, f"Failed to launch RenderCV: {exc}", "", ""
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
+    err = _scrub_rendercv_output(stderr or stdout)
+    return completed.returncode, err, stdout, stderr
 
 
 def _output_root() -> Path:
@@ -1549,6 +1623,22 @@ def _output_root() -> Path:
         return Path(get_settings().output_dir)
     except Exception:
         return OUTPUT_DIR
+
+
+def _resolve_rendercv_pdf(
+    tailored: str,
+    company_dir: Path,
+    stdout: str = "",
+    stderr: str = "",
+) -> Path:
+    """Prefer regex-parsed stdout paths that exist; else filesystem probe."""
+    parsed = _parse_rendercv_pdf_paths(stdout, stderr)
+    if parsed:
+        return parsed[-1]
+    return _find_pdf(
+        tailored,
+        search_dirs=[company_dir, REPO_ROOT / "rendercv_output"],
+    )
 
 
 def compile_node(state: State) -> dict:
@@ -1569,7 +1659,7 @@ def compile_node(state: State) -> dict:
     company_dir.mkdir(parents=True, exist_ok=True)
     yaml_path.write_text(tailored, encoding="utf-8")
 
-    code, err = _run_rendercv(yaml_path, company_dir)
+    code, err, stdout, stderr = _run_rendercv(yaml_path, company_dir)
     if code != 0:
         logger.warning("RenderCV failed — routing back to draft:\n%s", err[-2000:])
         return {
@@ -1584,10 +1674,7 @@ def compile_node(state: State) -> dict:
             ).strip(),
         }
 
-    pdf_path = _find_pdf(
-        tailored,
-        search_dirs=[company_dir, REPO_ROOT / "rendercv_output"],
-    )
+    pdf_path = _resolve_rendercv_pdf(tailored, company_dir, stdout, stderr)
     if not pdf_path.is_file():
         return {
             "compile_error": f"RenderCV exited 0 but PDF missing under {company_dir}",
@@ -1624,7 +1711,7 @@ def compile_node(state: State) -> dict:
             pass
         tailored = _apply_design(tailored, preset)
         yaml_path.write_text(tailored, encoding="utf-8")
-        code, err = _run_rendercv(yaml_path, company_dir)
+        code, err, stdout, stderr = _run_rendercv(yaml_path, company_dir)
         if code != 0:
             return {
                 "compile_error": (
@@ -1640,10 +1727,7 @@ def compile_node(state: State) -> dict:
                     "shorten each bullet to ≤120 chars; CGPA-only education."
                 ).strip(),
             }
-        pdf_path = _find_pdf(
-            tailored,
-            search_dirs=[company_dir, REPO_ROOT / "rendercv_output"],
-        )
+        pdf_path = _resolve_rendercv_pdf(tailored, company_dir, stdout, stderr)
         pages = _pdf_page_count(pdf_path) if pdf_path.is_file() else -1
 
     if pages > 1 and revisions < MAX_DRAFT_REVISIONS:
@@ -1677,16 +1761,13 @@ def compile_node(state: State) -> dict:
                 tailored, preset=shrink_preset, jd=jd, level=level
             )
             yaml_path.write_text(hard, encoding="utf-8")
-            code, err = _run_rendercv(yaml_path, company_dir)
+            code, err, stdout, stderr = _run_rendercv(yaml_path, company_dir)
             if code != 0:
                 logger.warning(
                     "Hard-shrink level=%s RenderCV failed: %s", level, err[-500:]
                 )
                 continue
-            pdf_path = _find_pdf(
-                hard,
-                search_dirs=[company_dir, REPO_ROOT / "rendercv_output"],
-            )
+            pdf_path = _resolve_rendercv_pdf(hard, company_dir, stdout, stderr)
             tailored = hard
             preset = shrink_preset
             pages = _pdf_page_count(pdf_path) if pdf_path.is_file() else pages
@@ -1902,7 +1983,20 @@ def tailor_with_graph(
         {"recursion_limit": 40},
     )
     pdf_path = (result.get("pdf_path") or "").strip()
+    yaml_text = (result.get("current_tailored_yaml") or "").strip()
     if not pdf_path or not Path(pdf_path).is_file():
+        # Version-banner / compile failure: ship static base resume rather than abort.
+        fallback = _default_base_resume_pdf()
+        if fallback is not None:
+            logger.warning(
+                "Tailor graph missing PDF (compile_error=%r) — using base resume %s",
+                (result.get("compile_error") or "")[:240],
+                fallback.name,
+            )
+            resolved = str(fallback)
+            if yaml_text:
+                store_archetype_pdf(job_track, job_title, resolved, yaml_text)
+            return resolved, yaml_text or ""
         raise FileNotFoundError(
             "Tailor graph finished without a PDF "
             f"(last ATS score={result.get('ats_score')}/"
@@ -1910,7 +2004,6 @@ def tailor_with_graph(
             f"missing={result.get('missing_keywords')}, "
             f"compile_error={result.get('compile_error')!r})"
         )
-    yaml_text = (result.get("current_tailored_yaml") or "").strip()
     resolved = str(Path(pdf_path).resolve())
     store_archetype_pdf(job_track, job_title, resolved, yaml_text)
     return resolved, yaml_text

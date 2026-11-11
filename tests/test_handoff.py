@@ -158,7 +158,9 @@ def test_apply_job_requires_human(tmp_path, monkeypatch):
     db = tmp_path / "mem.db"
     monkeypatch.setattr(pipeline, "has_successful_apply", lambda url: False)
     monkeypatch.setattr(
-        pipeline, "has_successful_company_apply", lambda company: False
+        pipeline,
+        "has_recent_company_role_apply",
+        lambda company, title="", **kw: False,
     )
     monkeypatch.setattr(pipeline, "is_aggregator_listing", lambda url: False)
 

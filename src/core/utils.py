@@ -162,4 +162,5 @@ def fit_reject(rule_broken: str, reason: str) -> dict[str, Any]:
         "salary_format": "ANNUAL",
         "includes_equity_or_bonus": False,
         "jd_salary_format": "ANNUAL",
+        "citizenship_review": False,
     }

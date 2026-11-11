@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 
 ENFORCEMENT_LEVELS = frozenset({"HARD", "SOFT"})
 SOFT_PENALTY_POINTS = 15
+# Citizenship soft-gate must not starve the 72–86 fit band (min_fit=72).
+# Full SOFT_PENALTY_POINTS still applies to ordinary SOFT prefs.
+CITIZENSHIP_SOFT_PENALTY_POINTS = 8
 SOFT_TTL_DAYS = 30
 
 _MARKER_RE = re.compile(
@@ -297,21 +300,102 @@ def rule_matches_jd(rule_text: str, jd_text: str) -> bool:
     return False
 
 
-def apply_preference_gate(jd_text: str) -> tuple[str | None, int, list[str]]:
+# Citizenship/visa HARD prefs → soft-gate (keep queue saturated). Clearance stays HARD.
+_CITIZENSHIP_SOFT_RE = re.compile(
+    r"\b(citizen|citizenship|green\s*card|work\s*authorization|visa|us\s*citizen|"
+    r"u\.s\.\s*citizen|must\s+be\s+a\s+citizen)\b",
+    re.I,
+)
+_CLEARANCE_HARD_RE = re.compile(
+    r"\b(security\s+clearances?|ts/?sci|top\s+secret|secret\s+clearances?)\b",
+    re.I,
+)
+_EEO_BOILERPLATE_RE = re.compile(
+    r"(equal\s+opportunity|eeo|affirmative\s+action|regardless\s+of|"
+    r"without\s+regard\s+to|protected\s+(?:status|characteristic)|"
+    r"discrimination|diversity\s+and\s+inclusion)",
+    re.I,
+)
+
+
+def is_eeo_boilerplate_hit(jd_text: str, matched_span: str | None = None) -> bool:
+    """True when citizenship language is only inside EEO / equal-opportunity prose."""
+    jd = jd_text or ""
+    if not _EEO_BOILERPLATE_RE.search(jd):
+        return False
+    # Window around each citizenship mention — if nearby EEO words, treat as boilerplate.
+    for m in _CITIZENSHIP_SOFT_RE.finditer(jd):
+        start = max(0, m.start() - 120)
+        end = min(len(jd), m.end() + 120)
+        window = jd[start:end]
+        if _EEO_BOILERPLATE_RE.search(window):
+            return True
+    return False
+
+
+def citizenship_rule_should_soft(rule_text: str, category: str = "") -> bool:
+    """HARD citizenship/visa prefs soft-gate; clearance-only rules stay HARD.
+
+    Compound rules ("clearances or US Citizenship") are soft-candidates so the
+    gate can split on JD evidence — clearance mention → HARD, citizenship-only → soft.
+    """
+    blob = f"{category} {rule_text}"
+    has_clearance = bool(_CLEARANCE_HARD_RE.search(blob))
+    has_citizen = bool(_CITIZENSHIP_SOFT_RE.search(blob))
+    if has_clearance and not has_citizen:
+        return False
+    return has_citizen
+
+
+def apply_preference_gate(
+    jd_text: str,
+) -> tuple[str | None, int, list[str], bool]:
     """Evaluate HARD/SOFT preferences against a JD.
 
-    Returns ``(hard_reject_reason_or_None, soft_penalty_points, soft_hit_labels)``.
+    Returns
+    ``(hard_reject_reason_or_None, soft_penalty_points, soft_hit_labels, citizenship_review)``.
+    Citizenship/visa HARD rules soft-gate (penalty + review flag) unless clearance.
+    EEO boilerplate citizenship mentions are ignored.
     """
     soft_penalty = 0
     soft_hits: list[str] = []
+    citizenship_review = False
+    eeo_skip = is_eeo_boilerplate_hit(jd_text)
+    jd = jd_text or ""
+    jd_has_clearance = bool(_CLEARANCE_HARD_RE.search(jd))
+    jd_has_citizen = bool(_CITIZENSHIP_SOFT_RE.search(jd))
+
     for rule in load_preference_rules():
-        if not rule_matches_jd(rule.rule_text, jd_text):
+        if not rule_matches_jd(rule.rule_text, jd):
             continue
+        blob = f"{rule.category} {rule.rule_text}"
+        rule_has_clearance = bool(_CLEARANCE_HARD_RE.search(blob))
+        rule_has_citizen = bool(_CITIZENSHIP_SOFT_RE.search(blob))
+
+        if rule.level == "HARD" and (rule_has_clearance or rule_has_citizen):
+            # Require phrase evidence in the JD — blocks token FPs ("security"+"require").
+            if rule_has_clearance and jd_has_clearance:
+                reason = (
+                    f"RULE BROKEN: preference_hard[{rule.category}]. {rule.rule_text}"
+                )
+                return reason, 0, [], False
+            if rule_has_citizen and jd_has_citizen:
+                if eeo_skip and not jd_has_clearance:
+                    continue
+                citizenship_review = True
+                soft_penalty += CITIZENSHIP_SOFT_PENALTY_POINTS
+                soft_hits.append(
+                    f"citizenship_soft[{rule.category}]: {rule.rule_text[:120]}"
+                )
+                continue
+            # Matched via loose tokens only — ignore (do not starve queue / HARD-drop).
+            continue
+
         if rule.level == "HARD":
             reason = (
                 f"RULE BROKEN: preference_hard[{rule.category}]. {rule.rule_text}"
             )
-            return reason, 0, []
+            return reason, 0, [], False
         soft_penalty += SOFT_PENALTY_POINTS
         soft_hits.append(f"{rule.category}: {rule.rule_text[:120]}")
-    return None, soft_penalty, soft_hits
+    return None, soft_penalty, soft_hits, citizenship_review

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +23,7 @@ from src.core.executor import (
     ApplicationBlockedError,
     ApplicationTimeoutError,
     APPLY_RESUME_FILENAME,
+    ExternalPortalLoadError,
     JobClosedError,
     RequiresHumanInterventionError,
     SUBMITTED_TOKEN,
@@ -34,15 +34,15 @@ from src.core.executor import (
 from src.core.fallback import generate_manual_package
 from src.core.memory import (
     has_applied,
+    has_recent_company_role_apply,
     has_successful_apply,
-    has_successful_company_apply,
     init_db,
     log_application,
 )
 from src.core.queue import enqueue_apply, init_queue, queue_counts
 from src.core.settings import reload_settings
 from src.core.config import PROJECT_ROOT
-from src.core.tailor import _safe_dir_name, optimize_resume
+from src.core.tailor import optimize_resume
 
 logger = logging.getLogger("ace_agent")
 
@@ -50,30 +50,12 @@ REPO_ROOT = PROJECT_ROOT
 
 
 def _cleanup_tailored_artifacts(company: str, pdf_path: Path | str | None = None) -> None:
-    """After verified submit: archive under output/Submitted/, remove work folder."""
-    from src.core.settings import get_settings as _gs
+    """After verified submit: archive PDF under Submitted/, release build folder."""
+    from src.core.output_artifacts import release_company_build
 
-    out = Path(_gs().output_dir)
-    name = _safe_dir_name(company)
-    company_dir = out / name
-    submitted_dir = out / "Submitted" / name
-    try:
-        submitted_dir.mkdir(parents=True, exist_ok=True)
-        src_pdf = Path(pdf_path) if pdf_path else None
-        if src_pdf and src_pdf.is_file():
-            dest = submitted_dir / src_pdf.name
-            shutil.copy2(src_pdf, dest)
-            logger.info("Archived submitted resume → %s", dest)
-        elif company_dir.is_dir():
-            for pdf in company_dir.glob("*.pdf"):
-                shutil.copy2(pdf, submitted_dir / pdf.name)
-                logger.info("Archived submitted resume → %s", submitted_dir / pdf.name)
-                break
-        if company_dir.is_dir():
-            shutil.rmtree(company_dir)
-            logger.info("Removed work folder after submit → %s", company_dir)
-    except OSError:
-        logger.exception("Could not archive/cleanup tailored package for %s", company)
+    release_company_build(
+        company, pdf_path=pdf_path, archive=True, reason="auto_success"
+    )
 
 
 def triage_job(
@@ -102,8 +84,42 @@ def triage_job(
         logger.warning("Skipping %s — missing job_url or description", company)
         return None
 
+    from src.core.discovery import (
+        indeed_applies_allowed,
+        is_blocked_board,
+        is_indeed_soft_url,
+    )
+
+    if is_blocked_board(job_url) or is_blocked_board(str(job.get("job_url") or "")):
+        logger.info("Skipping %s — blocked board (Internshala/scam) %s", company, job_url[:120])
+        return None
+
+    # LinkedIn wrappers that advertise Internshala in the JD — drop before tailor.
+    desc_l = description.lower()
+    if "internshala.com" in desc_l or "internshala." in desc_l:
+        logger.info(
+            "Skipping %s — JD funnels to Internshala (blocked board)",
+            company,
+        )
+        return None
+
+    if is_indeed_soft_url(job_url) and not indeed_applies_allowed():
+        logger.info(
+            "Skipping %s — Indeed Soft Apply off (prefer career ATS); set ACE_ALLOW_INDEED=1 to enable",
+            company,
+        )
+        return None
+
     if has_applied(job_url):
         logger.info("Skipping %s — already in memory (%s)", company, job_url[:120])
+        return None
+
+    if has_recent_company_role_apply(company, title):
+        logger.info(
+            "Skipping %s — recent submitted company+role (%s)",
+            company,
+            (title or "(any role)")[:120],
+        )
         return None
 
     try:
@@ -117,6 +133,7 @@ def triage_job(
             "FAILED",
             error_log=f"fit_triage_crash: {type(exc).__name__}: {exc}",
             jd_text=description,
+            job_title=title,
         )
         return None
 
@@ -133,6 +150,9 @@ def triage_job(
 
     logger.info("Fit passed (%s): %s", fit["fit_score"], fit["reason"][:240])
     job_track = track or fit.get("recommended_track") or ""
+    citizenship_review = bool(fit.get("citizenship_review"))
+    if citizenship_review:
+        logger.info("citizenship_review=1 for %s — soft-gated into queue", company)
     return {
         "company": company,
         "title": title,
@@ -147,6 +167,7 @@ def triage_job(
         "salary_format": str(fit.get("salary_format") or "ANNUAL"),
         "includes_equity_or_bonus": bool(fit.get("includes_equity_or_bonus")),
         "jd_salary_format": str(fit.get("jd_salary_format") or "ANNUAL"),
+        "citizenship_review": citizenship_review,
     }
 
 
@@ -173,6 +194,17 @@ def tailor_job(
         yaml_snapshot = embed_compensation(
             yaml_snapshot, compensation_from_fit(triage)
         )
+        try:
+            from src.core.pitch import embed_pitch, generate_pitch
+
+            pitch = generate_pitch(
+                company=company,
+                job_title=str(triage.get("title") or ""),
+                jd_text=description,
+            )
+            yaml_snapshot = embed_pitch(yaml_snapshot, pitch)
+        except Exception:
+            logger.debug("Pitch embed skipped for %s", company, exc_info=True)
         logger.info("Tailored PDF ready (%s): %s", job_track or "GENERAL", pdf_path)
         apply_pdf = unique_apply_pdf(pdf_path, company)
         return {
@@ -190,6 +222,7 @@ def tailor_job(
             error_log=f"tailor_failed: {type(exc).__name__}: {exc}",
             jd_text=description,
             tailored_yaml_snapshot=yaml_snapshot,
+            job_title=str(triage.get("title") or ""),
         )
         return None
 
@@ -206,17 +239,19 @@ async def apply_job(
     user_data_dir: Path | str | None = None,
     cleanup_linkedin_resume: bool = False,
     job_url_direct: str = "",
+    job_title: str = "",
 ) -> str:
     """Browser-only apply. Returns success|fallback|failed|already_applied|timeout|requires_human|job_closed."""
     skip_browser = is_aggregator_listing(job_url) and not is_applyable_url(
         job_url_direct or ""
     )
+    title = (job_title or "").strip()
 
     # Phase 1A: DB fast-fail before Chromium.
     if has_successful_apply(job_url):
         reason = "db_success_url"
-    elif has_successful_company_apply(company):
-        reason = "db_success_company_30d"
+    elif has_recent_company_role_apply(company, title):
+        reason = "db_success_company_role_30d"
     else:
         reason = ""
     if reason:
@@ -229,6 +264,7 @@ async def apply_job(
             error_log=reason,
             jd_text=jd_text,
             tailored_yaml_snapshot=yaml_snapshot,
+            job_title=title,
         )
         return "already_applied"
 
@@ -245,6 +281,8 @@ async def apply_job(
             user_data_dir=user_data_dir,
             yaml_snapshot=yaml_snapshot,
             jd_text=jd_text,
+            company=company,
+            job_title=title,
         )
         if ok:
             logger.info(
@@ -260,6 +298,7 @@ async def apply_job(
                 error_log=SUBMITTED_TOKEN,
                 jd_text=jd_text,
                 tailored_yaml_snapshot=yaml_snapshot,
+                job_title=title,
             )
             _cleanup_tailored_artifacts(company, pdf_path)
             return "success"
@@ -274,6 +313,7 @@ async def apply_job(
             error_log=str(exc),
             jd_text=jd_text,
             tailored_yaml_snapshot=yaml_snapshot,
+            job_title=title,
         )
         return "already_applied"
     except JobClosedError as exc:
@@ -286,6 +326,7 @@ async def apply_job(
             error_log=str(exc),
             jd_text=jd_text,
             tailored_yaml_snapshot=yaml_snapshot,
+            job_title=title,
         )
         return "job_closed"
     except RequiresHumanInterventionError as exc:
@@ -294,16 +335,39 @@ async def apply_job(
             company,
             exc,
         )
+        human_status = (
+            "REQUIRES_HUMAN_CITIZENSHIP_REVIEW"
+            if "ace:citizenship_review=1" in (yaml_snapshot or "")
+            else "REQUIRES_HUMAN_INTERVENTION"
+        )
         log_application(
             company,
             job_url,
             track,
-            "REQUIRES_HUMAN_INTERVENTION",
+            human_status,
             error_log=f"{type(exc).__name__}: {exc}",
             jd_text=jd_text,
             tailored_yaml_snapshot=yaml_snapshot,
+            job_title=title,
         )
         return "requires_human"
+    except ExternalPortalLoadError as exc:
+        logger.warning(
+            "[portal] %s external portal/DNS failed — skip without CDP (%s)",
+            company,
+            exc,
+        )
+        log_application(
+            company,
+            job_url,
+            track,
+            "FAILED_TIMEOUT_OR_STUCK",
+            error_log=f"FAILED_EXTERNAL_LOAD: {exc}",
+            jd_text=jd_text,
+            tailored_yaml_snapshot=yaml_snapshot,
+            job_title=title,
+        )
+        return "timeout"
     except ApplicationTimeoutError as exc:
         logger.warning(
             "[timeout] %s stuck/timeout — skipping Manual_Action (%s)",
@@ -318,6 +382,7 @@ async def apply_job(
             error_log=f"{type(exc).__name__}: {exc}",
             jd_text=jd_text,
             tailored_yaml_snapshot=yaml_snapshot,
+            job_title=title,
         )
         return "timeout"
     except (ApplicationBlockedError, Exception) as exc:
@@ -327,6 +392,20 @@ async def apply_job(
             type(exc).__name__,
             exc,
         )
+        # apply_job swallows; record CF/captcha here so the pool circuit can trip.
+        try:
+            from src.core.ban_armor import get_captcha_breaker
+            from src.core.host_limiter import host_bucket_key
+
+            err_l = f"{type(exc).__name__} {exc}".lower()
+            breaker = get_captcha_breaker()
+            if breaker.is_cf_block_message(err_l):
+                breaker.record_block(
+                    host_bucket_key(job_url),
+                    reason=str(exc)[:160],
+                )
+        except Exception:
+            logger.debug("captcha circuit record failed", exc_info=True)
         try:
             package_dir = generate_manual_package(
                 company=company,
@@ -344,6 +423,7 @@ async def apply_job(
                 error_log=f"{type(exc).__name__}: {exc}",
                 jd_text=jd_text,
                 tailored_yaml_snapshot=yaml_snapshot,
+                job_title=title,
             )
             return "fallback"
         except Exception as fallback_exc:
@@ -362,6 +442,7 @@ async def apply_job(
                 ),
                 jd_text=jd_text,
                 tailored_yaml_snapshot=yaml_snapshot,
+                job_title=title,
             )
             return "failed"
 
@@ -392,13 +473,17 @@ async def _produce_one(
         if tailored is None:
             counts["failed"] = counts.get("failed", 0) + 1
             return
+        snap = tailored.get("yaml_snapshot") or ""
+        if tailored.get("citizenship_review") and "ace:citizenship_review=1" not in snap:
+            snap = f"# ace:citizenship_review=1\n{snap}"
         enqueue_apply(
             company=tailored["company"],
             job_url=tailored["job_url"],
             track=tailored["track"],
             jd_text=tailored["description"],
             pdf_path=tailored["pdf_path"],
-            yaml_snapshot=tailored.get("yaml_snapshot") or "",
+            yaml_snapshot=snap,
+            job_title=str(tailored.get("title") or ""),
         )
         counts["queued"] = counts.get("queued", 0) + 1
         logger.info(
@@ -471,7 +556,8 @@ async def run_parallel(
     min_fit = settings.minimum_fit_score
     target = int(target_companies) if target_companies and target_companies > 0 else 0
     produce_n = _env_int("ACE_PRODUCER_CONCURRENCY", 15)
-    warm_n = _env_int("ACE_QUEUE_WARM_THRESHOLD", 5)
+    # Default 2: start applies while more drafts finish (avoids Ollama starve gate).
+    warm_n = _env_int("ACE_QUEUE_WARM_THRESHOLD", 2)
     browser_workers = max(1, int(settings.browser_workers))
     groq_slots = max(1, int(settings.groq_concurrency))
 

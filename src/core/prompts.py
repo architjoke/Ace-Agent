@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from src.core.copilot_capabilities import build_copilot_system_prompt
+
 # ── Executor (browser-use) ──────────────────────────────────────────
 
 AUTH_GOOGLE_OAUTH = (
@@ -37,9 +39,13 @@ script completed the initial steps but got stuck. Do not navigate away. Look at 
 current modal, resolve the missing fields or errors, and click Next/Submit. Prefer
 the open dialog; do not reload the job page.
 
-## Resume (upload from disk if a file input is present)
-Absolute path: {pdf_abs_path}
-On-screen name should show: {pdf_stem}
+## Resume — ALWAYS upload from disk (never reuse library)
+Absolute path (ONLY this file):
+{pdf_abs_path}
+On-screen name must show: {pdf_stem}
+- Do NOT select any already-listed / previously uploaded resume.
+- Always click Upload resume / Upload file / Replace, then upload_file with the path above.
+- Confirm "{pdf_stem}" is attached before Next/Submit.
 
 ## Form filling
 Use APPLICATION FORM ANSWERS when matching fields appear.
@@ -47,6 +53,7 @@ Do not invent facts.
 
 ## HARD RULES
 - Stay on the current modal/tab — do not open a new job URL.
+- NEVER click Next/Submit until "{pdf_stem}" is visibly attached from this upload.
 - After real confirmation UI, output exactly: {submitted_token}
 """
 
@@ -133,66 +140,8 @@ Abort on CAPTCHA. Do not touch any other resume.
 
 # ── Copilot ─────────────────────────────────────────────────────────
 
-COPILOT_SYSTEM = """You are the Ace Job Agent Copilot.
-
-Your job is to listen to the user, update application states, clean up manual folders,
-and permanently learn new behavioral rules via tools.
-
-You may ONLY use these tools:
-- find_companies (fuzzy lookup — use when the company is unclear or Ambiguous)
-- mark_application_submitted
-- cleanup_manual_folder
-- memorize_new_rule (ALWAYS use this for behavioral / form / filter / tailor instructions)
-- update_config_preference (allowlisted config.yaml SYSTEM settings only)
-
-Tool routing (critical):
-- config.yaml = search locations, fit scores, workers, headless — NOT form text.
-- lessons_learned / memorize_new_rule = "when you apply…", notice period, phone/PIN
-  wording, don't-apply filters, resume/cover instructions.
-- If unsure between config vs behavior → memorize_new_rule.
-
-Few-shot examples:
-Example 1: User says "Only look in Pune."
-  → Action: update_config_preference(target_key="search_preferences.locations", new_value="Pune")
-
-Example 2: User says "When asked for notice period, put 2 weeks."
-  → Action: memorize_new_rule(category="APPLY_BEHAVIOR",
-       rule_text="When asked for notice period, always input 1-14 days",
-       enforcement_level="HARD")
-
-Example 3: User says "Never apply to unpaid roles."
-  → Action: memorize_new_rule(category="JOB_FILTERING",
-       rule_text="Never apply to unpaid roles.",
-       enforcement_level="HARD")
-
-Example 4: User says "i applied midbrain"
-  → Action: mark_application_submitted(company_name="midbrain") AND
-            cleanup_manual_folder(company_name="midbrain") in one turn
-
-Company name understanding:
-- Partial names OK ("midbrain"); tools fuzzy-resolve. Prefer mark+cleanup together
-  on clear apply/submit intents. find_companies only if unclear/Ambiguous.
-- If find_companies (or mark/cleanup) says Ambiguous, ask the user which candidate.
-
-Dynamic Preference Engine:
-- HARD = dealbreaker; SOFT = -15 fit penalty.
-- When memorizing, set enforcement_level to HARD for absolute dealbreakers
-  (e.g. WhatsApp community, unpaid, must relocate abroad).
-- Set enforcement_level to SOFT for fluid tastes (e.g. prefer remote, avoid tiny startups).
-
-STRICTLY FORBIDDEN:
-- Deleting source code, wiping the SQLite database, or resetting the agent's core memory.
-- If the user asks to "reset everything", "wipe memory", "delete all rules", or
-  "forget your training", you MUST refuse in plain language and call NO tools.
-- Never invent a shell/SQL/file tool. You do not have them.
-- Wipe DB / delete source / invent shell-SQL tools / "reset all memory".
-
-Self-correction:
-- If a tool returns "Tool execution failed: …", fix the arguments or choose a different
-  allowed tool. Do not invent non-allowlisted config keys or tools that do not exist.
-
-Be concise. After tools run, summarize what changed.
-"""
+# Built from the capability catalog so chat coverage stays vision-aligned.
+COPILOT_SYSTEM = build_copilot_system_prompt()
 
 # ── Untrusted input guardrail (JD / emails) ─────────────────────────
 
@@ -231,7 +180,7 @@ Only if ALL hard rules pass, score skill/project fit from 1–100:
 - Extract JD must-have tools/languages/methods with exact phrasing.
 - matched_skills = JD terms with clear evidence in the fact bank.
 - missing_must_haves = critical JD requirements with no evidence.
-- recommended_track = SDE, AI, or ML based on JD emphasis.
+- recommended_track = SDE, PRODUCT, or AI based on JD emphasis (not Java-only).
 - High scores require overlap on repeated JD hard skills + relevant projects.
 - Do NOT invent experience. A role needing mostly unsupported stack should score <60.
 

@@ -6,11 +6,14 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 
 def _slot_ttl_seconds() -> float:
@@ -110,7 +113,12 @@ def reset_context_state(context: Any, page: Any = None) -> Any:
 
 @dataclass
 class WorkerBrowserSlot:
-    """Warm Playwright persistent context keyed by worker profile path."""
+    """Warm Playwright persistent context keyed by worker profile path.
+
+    Playwright sync API is greenlet-bound to the thread that created the
+    browser. All Chromium work for a slot MUST run on that owner thread via
+    ``executor()`` / ``run()`` — never via a shared ``asyncio.to_thread`` pool.
+    """
 
     user_data_dir: Path
     playwright: Any = None
@@ -118,6 +126,36 @@ class WorkerBrowserSlot:
     page: Any = None
     born_at: float | None = None
     _headless: bool | None = field(default=None, repr=False)
+    creator_thread_ident: int | None = field(default=None, repr=False)
+    _owner_executor: ThreadPoolExecutor | None = field(default=None, repr=False)
+
+    def executor(self) -> ThreadPoolExecutor:
+        """Single-thread executor pinned for this slot's Playwright lifetime."""
+        if self._owner_executor is None:
+            name = Path(self.user_data_dir).name[:24] or "slot"
+            self._owner_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=f"ace-pw-{name}",
+            )
+        return self._owner_executor
+
+    def run(self, fn: Callable[..., _T], *args: Any, timeout: float | None = 600.0, **kwargs: Any) -> _T:
+        """Execute ``fn`` on the slot owner thread (direct call if already there)."""
+        if (
+            self.creator_thread_ident is not None
+            and threading.get_ident() == self.creator_thread_ident
+        ):
+            return fn(*args, **kwargs)
+
+        def _wrapped() -> _T:
+            if self.creator_thread_ident is None:
+                self.creator_thread_ident = threading.get_ident()
+            elif threading.get_ident() != self.creator_thread_ident:
+                # Executor thread changed (should not happen with max_workers=1).
+                self.creator_thread_ident = threading.get_ident()
+            return fn(*args, **kwargs)
+
+        return self.executor().submit(_wrapped).result(timeout=timeout)
 
     def _ttl_expired(self) -> bool:
         if self.born_at is None:
@@ -130,7 +168,19 @@ class WorkerBrowserSlot:
         headless: bool | None = None,
         timeout_ms: int = 30_000,
     ) -> tuple[Any, Any]:
-        """Return (context, page), launching Chromium once if needed."""
+        """Return (context, page), launching Chromium once if needed.
+
+        Must be called from this slot's owner thread (see ``run`` / ``executor``).
+        """
+        if self.creator_thread_ident is None:
+            self.creator_thread_ident = threading.get_ident()
+        elif threading.get_ident() != self.creator_thread_ident:
+            raise RuntimeError(
+                "WorkerBrowserSlot.ensure called off owner thread "
+                f"(owner={self.creator_thread_ident}, current={threading.get_ident()}). "
+                "Use slot.run(...) / slot.executor()."
+            )
+
         if self.context is not None and browser_alive(self.context) and not self._ttl_expired():
             pages = list(self.context.pages)
             self.page = self.page if self.page in pages else (pages[0] if pages else None)
@@ -145,11 +195,13 @@ class WorkerBrowserSlot:
                 str(self.user_data_dir)[:120],
             )
 
-        self.close()
+        self._close_browser_only()
         from playwright.sync_api import sync_playwright
 
+        from src.core.chromium_runtime import ensure_playwright_chromium
         from src.playbooks._common import launch_persistent_context
 
+        ensure_playwright_chromium()
         self.playwright = sync_playwright().start()
         self.context, self.page = launch_persistent_context(
             self.playwright,
@@ -159,6 +211,7 @@ class WorkerBrowserSlot:
         )
         self._headless = headless if headless is not None else self._headless
         self.born_at = time.monotonic()
+        self.creator_thread_ident = threading.get_ident()
         return self.context, self.page
 
     def reset(self) -> None:
@@ -170,7 +223,7 @@ class WorkerBrowserSlot:
             logger.warning("warm slot reset failed — closing slot", exc_info=True)
             self.close()
 
-    def close(self) -> None:
+    def _close_browser_only(self) -> None:
         from src.playbooks._common import close_context_safe
 
         try:
@@ -187,6 +240,34 @@ class WorkerBrowserSlot:
                 pw.stop()
             except Exception:
                 logger.debug("slot playwright.stop failed", exc_info=True)
+
+    def close(self) -> None:
+        """Close Chromium; keep executor alive so the next ensure reuses the thread."""
+        if (
+            self.creator_thread_ident is not None
+            and threading.get_ident() != self.creator_thread_ident
+            and self._owner_executor is not None
+        ):
+            try:
+                self.run(self._close_browser_only, timeout=60.0)
+                return
+            except Exception:
+                logger.debug("slot.close marshal failed — closing inline", exc_info=True)
+        self._close_browser_only()
+
+    def shutdown(self) -> None:
+        """Close browser and destroy the owner executor (slot leave registry)."""
+        try:
+            self.close()
+        finally:
+            ex = self._owner_executor
+            self._owner_executor = None
+            self.creator_thread_ident = None
+            if ex is not None:
+                try:
+                    ex.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    logger.debug("slot executor shutdown failed", exc_info=True)
 
 
 def slot_key(user_data_dir: Path | str) -> str:
@@ -211,7 +292,13 @@ def invalidate_slot(user_data_dir: Path | str | None) -> None:
     with _SLOTS_LOCK:
         slot = _SLOTS.pop(key, None)
     if slot is not None:
-        slot.close()
+        slot.shutdown()
+    try:
+        from src.playbooks.session import clear_stale_devtools_port
+
+        clear_stale_devtools_port(key)
+    except Exception:
+        logger.debug("clear_stale_devtools_port after invalidate failed", exc_info=True)
 
 
 def blank_slot(user_data_dir: Path | str | None) -> bool:
@@ -253,7 +340,7 @@ def close_all_slots() -> int:
     n = 0
     for _key, slot in items:
         try:
-            slot.close()
+            slot.shutdown()
             n += 1
         except Exception:
             logger.debug("close_all_slots: slot close failed", exc_info=True)

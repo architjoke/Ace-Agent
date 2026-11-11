@@ -22,15 +22,21 @@ search_preferences:
     - India
   country_indeed: India
   max_results_per_track: 25
-  # JobSpy site keys
+  # JobSpy site keys (Glassdoor still off — CF). Extra boards via jobdrop + custom:
+  # weworkremotely / wellfound / hiring_cafe (jobdrop), himalayas + yc_waas (custom).
+  # Indeed Soft Apply is crowded/captcha-heavy — prefer LinkedIn → company career directs
+  # + Hiring Cafe / Himalayas / YC (set ACE_JOBDROP_ALLOW_CAMOUFOX=1 for Hiring Cafe).
   sites:
     - linkedin
-    - indeed
-    # glassdoor: Cloudflare bot walls block browser-use — skip for autonomous apply
+    - naukri
+    # indeed: off by default (ACE_ALLOW_INDEED=1 to re-enable)
+    # glassdoor: Cloudflare — discovery blocked; playbook exists for rare warm hits
+  # Primary hunt: SDE + Product Engineering + AI Engineer (Archit stack: Python/JS/TS/Node + AI).
+  # Dropped broad ML/CV hunt and Java-primary search noise.
   tracks:
-    SDE: "Software Development Engineer OR Software Engineer Intern OR Backend Developer Intern OR Full Stack Developer Intern"
-    AI: "AI Engineer Intern OR AI Software Engineer OR Applied AI Engineer OR Generative AI Engineer Intern"
-    ML: "Machine Learning Engineer Intern OR ML Engineer Intern OR Deep Learning Engineer Intern OR Computer Vision Engineer Intern"
+    SDE: "Software Engineer Intern OR Software Development Engineer Intern OR Full Stack Developer Intern OR Backend Developer Intern OR Node.js Developer Intern OR TypeScript Developer Intern"
+    PRODUCT: "Product Engineer Intern OR Software Product Engineer Intern OR Associate Product Engineer OR Product Development Engineer Intern"
+    AI: "AI Engineer Intern OR Applied AI Engineer Intern OR Generative AI Engineer Intern OR AI Software Engineer Intern OR LLM Engineer Intern"
 
 filters:
   minimum_fit_score: 72
@@ -41,14 +47,22 @@ filters:
     - "pay to apply"
     - "5+ years"
     - "security clearance"
-    - "us citizen"
-    - "u.s. citizen"
-    - "green card"
+    # citizenship / green card soft-gated in preferences+evaluate (queue stays warm)
     - senior
     - "whatsapp group"
     - "whatsapp community"
     - "join whatsapp"
     - "wa.me/"
+    # Scam / low-signal boards
+    - internshala
+    - "internshala.com"
+    # Stack mismatch — fact bank is Python/JS/TS/Node/AI, not Java/Spring-primary
+    - "java developer"
+    - "java intern"
+    - "core java"
+    - "spring boot developer"
+    - "j2ee"
+    - "android developer"
 
 # ATS gate is per company + JD (not one global bar).
 # Tailor loops until keyword coverage ≥ pass_score for THAT posting.

@@ -57,6 +57,10 @@ def _fill_label(page, label_pat: re.Pattern, value: str) -> bool:
 
 def _upload_resume_aria(page, pdf_path: Path) -> bool:
     """Upload via Resume/CV label region; file input is the only type=file exception."""
+    from src.playbooks._common import force_upload_resume
+
+    if force_upload_resume(page, pdf_path):
+        return True
     label_pat = re.compile(r"Resume|CV|Upload\s*(Resume|CV)?", re.I)
     try:
         labeled = page.get_by_label(label_pat)

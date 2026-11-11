@@ -74,7 +74,15 @@ def probe_on_page(page, job_url: str, *, timeout_ms: int = 15_000) -> JobProbeRe
             logger.info("DOM fast-fail: already applied at %s", url[:160])
             return "already_applied"
         return "ok"
-    except Exception:
+    except Exception as exc:
+        # Dead company portals / DNS must not look like a healthy probe.
+        try:
+            from src.core.executor import ExternalPortalLoadError, is_portal_load_failure
+
+            if isinstance(exc, ExternalPortalLoadError) or is_portal_load_failure(exc):
+                raise
+        except ImportError:
+            pass
         logger.warning("Job-page DOM probe failed for %s — continuing apply", url[:160])
         return "ok"
 

@@ -44,7 +44,7 @@ def test_triage_cohere_primary(monkeypatch):
     assert "openai" not in chain
 
 
-def test_draft_openai_primary_no_cohere_or_groq(monkeypatch):
+def test_draft_openai_then_cohere_no_groq(monkeypatch):
     lr = _patch_router(
         monkeypatch,
         keys={
@@ -56,7 +56,8 @@ def test_draft_openai_primary_no_cohere_or_groq(monkeypatch):
     )
     chain = lr.providers_for_role("draft")
     assert chain[0] == "openai"
-    assert "cohere" not in chain
+    assert "cohere" in chain
+    assert chain.index("cohere") < chain.index("nvidia")
     assert "groq" not in chain
 
 
@@ -68,12 +69,13 @@ def test_semantic_groq_then_nvidia(monkeypatch):
     assert lr.providers_for_role("semantic") == ["groq", "nvidia"]
 
 
-def test_default_openai_head(monkeypatch):
+def test_default_groq_head(monkeypatch):
     lr = _patch_router(
         monkeypatch,
         keys={"GROQ_API_KEY": "g", "OPENAI_API_KEY": "o", "NVIDIA_API_KEY": "n"},
     )
-    assert lr.providers_for_role("default")[0] == "openai"
+    # Chat/default prefers live Groq before often-empty OpenAI credits.
+    assert lr.providers_for_role("default")[0] == "groq"
 
 
 def test_reflect_skips_groq(monkeypatch):

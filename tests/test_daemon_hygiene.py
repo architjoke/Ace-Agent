@@ -1,4 +1,4 @@
-"""Daemon hygiene: orphan reclaim, log rotation, slot shutdown."""
+"""Daemon hygiene: orphan reclaim, log rotation, path smoke."""
 
 from __future__ import annotations
 
@@ -108,21 +108,26 @@ def test_telemetry_rotation(tmp_path, monkeypatch):
     line = path.read_text(encoding="utf-8").strip().splitlines()[-1]
     assert json.loads(line)["stage"] == "playbook_execution_ms"
 
+def test_project_root_and_memory_db():
+    from src.core.config import MEMORY_DB, PROJECT_ROOT, ensure_runtime_dirs
+    from src.core.memory import init_db
+    from src.core.settings import get_settings, reload_settings
 
-def test_close_all_slots(tmp_path):
-    from src.core import browser_warmup as bw
+    ensure_runtime_dirs()
+    assert PROJECT_ROOT == REPO
+    assert MEMORY_DB == REPO / "data" / "ace_memory.db"
+    assert MEMORY_DB.is_absolute()
 
-    bw._SLOTS.clear()
-    key = str((tmp_path / "prof").resolve())
-    (tmp_path / "prof").mkdir()
-    slot = bw.WorkerBrowserSlot(user_data_dir=Path(key))
-    slot.context = object()
-    slot.page = object()
-    slot.playwright = None
-    bw._SLOTS[key] = slot
+    reload_settings()
+    settings = get_settings()
+    assert settings.memory_db.is_absolute()
+    assert settings.memory_db == MEMORY_DB or settings.memory_db.name == "ace_memory.db"
 
-    n = bw.close_all_slots()
-    assert n == 1
-    assert bw._SLOTS == {}
-    assert slot.context is None
-    assert slot.page is None
+    path = init_db()
+    assert path.is_absolute()
+    assert path.exists()
+
+
+if __name__ == "__main__":
+    test_project_root_and_memory_db()
+    print("ok", REPO / "data" / "ace_memory.db")

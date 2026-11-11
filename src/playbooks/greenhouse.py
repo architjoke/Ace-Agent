@@ -68,6 +68,10 @@ def _fill_first(page, selectors: list[str], value: str) -> bool:
 
 
 def _upload_resume(page, pdf_path: Path) -> bool:
+    from src.playbooks._common import force_upload_resume
+
+    if force_upload_resume(page, pdf_path):
+        return True
     inputs = page.locator('input[type="file"]')
     try:
         n = inputs.count()
@@ -75,7 +79,6 @@ def _upload_resume(page, pdf_path: Path) -> bool:
         n = 0
     if n == 0:
         return False
-    # Prefer the first visible file input (Greenhouse resume)
     for i in range(n):
         inp = inputs.nth(i)
         try:

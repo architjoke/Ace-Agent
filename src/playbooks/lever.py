@@ -13,6 +13,7 @@ from src.playbooks._common import (
     launch_persistent_context,
     load_applicant_profile,
     success_text,
+    force_upload_resume,
     upload_resume_file,
 )
 
@@ -223,10 +224,12 @@ def run_lever(
         _click_apply(page)
 
         filled = _fill_ashby(page, fields) if ashby else _fill_lever(page, fields)
-        uploaded = upload_resume_file(page, pdf)
+        uploaded = force_upload_resume(page, pdf) or upload_resume_file(page, pdf)
         if not uploaded:
             reason = f"{kind} playbook: resume file input not found"
-            if try_cdp_assist(cdp_assist, reason) and upload_resume_file(page, pdf):
+            if try_cdp_assist(cdp_assist, reason) and (
+                force_upload_resume(page, pdf) or upload_resume_file(page, pdf)
+            ):
                 pass
             else:
                 raise PlaybookFallback(reason)

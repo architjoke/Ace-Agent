@@ -40,7 +40,7 @@ class Settings:
     locations: list[str] = field(default_factory=lambda: ["India"])
     country_indeed: str = "India"
     max_results_per_track: int = 8
-    sites: list[str] = field(default_factory=lambda: ["linkedin", "indeed", "glassdoor"])
+    sites: list[str] = field(default_factory=lambda: ["linkedin", "naukri"])
     tracks: dict[str, str] = field(default_factory=dict)
     minimum_fit_score: int = 80
     require_paid: bool = True
@@ -132,9 +132,9 @@ def load_settings(config_path: Path | None = None) -> Settings:
                 raw,
                 "search_preferences",
                 "sites",
-                default=["linkedin", "indeed", "glassdoor"],
+                default=["linkedin", "indeed", "naukri"],
             )
-            or ["linkedin", "indeed", "glassdoor"]
+            or ["linkedin", "indeed", "naukri"]
         ),
         tracks={str(k): str(v) for k, v in tracks.items()},
         minimum_fit_score=int(

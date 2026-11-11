@@ -20,6 +20,7 @@ from src.core.queue import (
     mark_done,
     queue_counts,
     reclaim_orphaned_claims,
+    requeue_claimed,
     requeue_stale_claims,
 )
 from src.core.settings import get_settings
@@ -162,29 +163,79 @@ def update_one_worker(worker_id: str, **fields: Any) -> None:
 
 
 class LinkedInRateLimiter:
-    """Soft cap Easy Applies / hour / account across parallel workers."""
+    """Soft cap Easy Applies / hour + optional daily budget across workers.
 
-    def __init__(self, max_per_hour: int = 10) -> None:
+    Daily budget uses wall-clock local day (ACE_BROWSER_TIMEZONE) so overnight
+    workers cannot dump a week's volume in one burst.
+    """
+
+    def __init__(
+        self,
+        max_per_hour: int = 10,
+        max_per_day: int | None = None,
+    ) -> None:
         self.max_per_hour = max(1, int(max_per_hour))
+        if max_per_day is None:
+            raw = (os.environ.get("ACE_LINKEDIN_MAX_PER_DAY") or "40").strip()
+            try:
+                max_per_day = int(raw)
+            except ValueError:
+                max_per_day = 40
+        self.max_per_day = max(1, int(max_per_day))
         self._ts: list[float] = []
+        self._day_key: str = ""
+        self._day_count: int = 0
         self._lock = asyncio.Lock()
+
+    def _local_day_key(self) -> str:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        from src.core.ban_armor import apply_timezone_name
+
+        try:
+            tz = ZoneInfo(apply_timezone_name())
+        except Exception:
+            tz = ZoneInfo("UTC")
+        return datetime.now(tz).strftime("%Y-%m-%d")
+
+    def try_acquire_now(self) -> float:
+        """Reserve a slot without sleeping. Returns 0 if acquired, else wait secs."""
+        # Sync helper — callers that already hold a CLAIMED row should requeue
+        # before sleeping so jobs are not stuck for the daily cool-down.
+        now = time.monotonic()
+        day = self._local_day_key()
+        if day != self._day_key:
+            self._day_key = day
+            self._day_count = 0
+        if self._day_count >= self.max_per_day:
+            return 1800.0
+        self._ts = [t for t in self._ts if now - t < 3600]
+        if len(self._ts) < self.max_per_hour:
+            self._ts.append(now)
+            self._day_count += 1
+            return 0.0
+        return min(120.0, max(5.0, 3600 - (now - self._ts[0]) + 1))
 
     async def acquire(self) -> None:
         """Reserve a slot; sleep *outside* the lock so peers can progress."""
         while True:
-            wait = 0.0
             async with self._lock:
-                now = time.monotonic()
-                self._ts = [t for t in self._ts if now - t < 3600]
-                if len(self._ts) < self.max_per_hour:
-                    self._ts.append(now)
+                wait = self.try_acquire_now()
+                if wait <= 0:
                     return
-                wait = min(120.0, max(5.0, 3600 - (now - self._ts[0]) + 1))
-            logger.info(
-                "LinkedIn soft rate limit (%s/hour) — sleeping %.0fs",
-                self.max_per_hour,
-                wait,
-            )
+                if wait >= 1800.0:
+                    logger.warning(
+                        "LinkedIn daily budget exhausted (%s/day) — cooling %.0fs",
+                        self.max_per_day,
+                        wait,
+                    )
+                else:
+                    logger.info(
+                        "LinkedIn soft rate limit (%s/hour) — sleeping %.0fs",
+                        self.max_per_hour,
+                        wait,
+                    )
             await asyncio.sleep(wait)
 
 
@@ -224,6 +275,16 @@ async def browser_worker_loop(
     )
     os.environ.setdefault("ACE_BROWSER_KEEP_ALIVE", "1")
 
+    try:
+        from src.core.chromium_runtime import ensure_playwright_chromium
+
+        await asyncio.to_thread(ensure_playwright_chromium)
+    except Exception:
+        logger.exception(
+            "[%s] Chromium runtime ensure failed — warm path may MANUAL_ACTION",
+            worker_id,
+        )
+
     profile = worker_profile_dir(worker_id)
     clear_singleton_locks(profile)
     counts = {"success": 0, "fallback": 0, "failed": 0, "skipped": 0}
@@ -238,6 +299,23 @@ async def browser_worker_loop(
     while True:
         if stop_event.is_set():
             break
+
+        # Ban armor: human-like apply hours (default 08–22 local).
+        try:
+            from src.core.ban_armor import in_apply_hours, seconds_until_apply_hours
+
+            if not in_apply_hours():
+                wait_h = min(1800.0, seconds_until_apply_hours())
+                logger.info(
+                    "[%s] outside ACE_APPLY_HOURS — sleeping %.0fs (account protection)",
+                    worker_id,
+                    wait_h,
+                )
+                await asyncio.sleep(wait_h)
+                continue
+        except Exception:
+            logger.debug("[%s] apply-hours check failed", worker_id, exc_info=True)
+
         from src.core.telemetry import time_stage
 
         with time_stage("queue_claim_wait_ms", worker=worker_id):
@@ -265,7 +343,33 @@ async def browser_worker_loop(
         jd_text = str(item.get("jd_text") or "")
         pdf_path = str(item.get("pdf_path") or "")
         yaml_snapshot = str(item.get("yaml_snapshot") or "")
+        job_title = str(item.get("job_title") or "")
         qid = int(item["id"])
+
+        # Ban armor: pause host (or global) after repeated CF/Turnstile walls.
+        try:
+            from src.core.ban_armor import get_captcha_breaker
+            from src.core.host_limiter import host_bucket_key
+
+            breaker = get_captcha_breaker()
+            host_key = host_bucket_key(job_url)
+            cool = max(breaker.ready_in(host_key), breaker.ready_in("global"))
+            if cool > 0:
+                logger.warning(
+                    "[%s] captcha circuit cooling %s — sleep %.0fs (requeue)",
+                    worker_id,
+                    host_key,
+                    cool,
+                )
+                try:
+                    requeue_claimed(qid)
+                except Exception:
+                    mark_done(qid, error_log="failed")
+                await asyncio.sleep(min(120.0, cool))
+                update_one_worker(worker_id, status="idle", company="")
+                continue
+        except Exception:
+            logger.debug("[%s] circuit check failed", worker_id, exc_info=True)
 
         if host_limiter is not None:
             host_limiter.mark_dispatched(job_url)
@@ -282,7 +386,23 @@ async def browser_worker_loop(
         )
 
         if "linkedin.com" in job_url.lower() and linkedin_limiter is not None:
-            await linkedin_limiter.acquire()
+            # Never sleep while holding CLAIMED — requeue first, then cool.
+            async with linkedin_limiter._lock:
+                li_wait = linkedin_limiter.try_acquire_now()
+            if li_wait > 0:
+                logger.info(
+                    "[%s] LinkedIn pacing %.0fs — requeue %s",
+                    worker_id,
+                    li_wait,
+                    company,
+                )
+                try:
+                    requeue_claimed(qid)
+                except Exception:
+                    mark_done(qid, error_log="failed")
+                await asyncio.sleep(min(120.0, float(li_wait)))
+                update_one_worker(worker_id, status="idle", company="")
+                continue
 
         if force_cold_next:
             os.environ["ACE_BROWSER_KEEP_ALIVE"] = "0"
@@ -304,6 +424,7 @@ async def browser_worker_loop(
                 master_yaml=master_yaml,
                 user_data_dir=profile,
                 cleanup_linkedin_resume=False,
+                job_title=job_title,
             )
         except (ApplicationBlockedError, ApplicationTimeoutError, Exception) as exc:
             logger.warning(
@@ -315,6 +436,18 @@ async def browser_worker_loop(
             )
             outcome = "failed"
             err_l = f"{type(exc).__name__} {exc}".lower()
+            try:
+                from src.core.ban_armor import get_captcha_breaker
+                from src.core.host_limiter import host_bucket_key
+
+                breaker = get_captcha_breaker()
+                if breaker.is_cf_block_message(err_l):
+                    breaker.record_block(
+                        host_bucket_key(job_url),
+                        reason=str(exc)[:160],
+                    )
+            except Exception:
+                logger.debug("[%s] circuit record failed", worker_id, exc_info=True)
             if any(n in err_l for n in _BROWSER_CRASH_NEEDLES):
                 force_cold_next = True
                 try:
@@ -373,6 +506,18 @@ async def run_browser_pool(
     except Exception:
         logger.exception("Pool startup orphan reclaim failed")
     requeue_stale_claims()
+    try:
+        from src.core.output_artifacts import prune_stale_company_builds
+
+        stats = prune_stale_company_builds()
+        if stats.get("removed"):
+            logger.info(
+                "Output build GC: removed=%s skipped=%s",
+                stats.get("removed"),
+                stats.get("skipped"),
+            )
+    except Exception:
+        logger.debug("output prune on pool start failed", exc_info=True)
     clone_profiles_from_master(n)
     stop = stop_event or asyncio.Event()
     lim = LinkedInRateLimiter(

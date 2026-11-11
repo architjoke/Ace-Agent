@@ -191,9 +191,34 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("brief", help="Write today's Markdown brief")
     sub.add_parser("inbox", help="Scan recruiter inbox now")
-    sub.add_parser(
+    p_chat = sub.add_parser(
         "chat",
         help="HITL Self-Training Copilot (mark submitted, clean Manual_Action, memorize rules)",
+    )
+    p_chat.add_argument(
+        "--admin",
+        action="store_true",
+        help="Operator chat_role=admin (worker/config/LTM/inbox/brief tools)",
+    )
+    p_cf = sub.add_parser(
+        "camoufox",
+        help="Fetch/verify Camoufox binary (unlocks Hiring Cafe + Wellfound discovery)",
+    )
+    p_cf.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-download even if cache probe is already green",
+    )
+    p_cf.add_argument(
+        "--status",
+        action="store_true",
+        help="Print cache path + Jobdrop sites only (no download)",
+    )
+    p_cf.add_argument(
+        "--from-zip",
+        type=str,
+        default=None,
+        help="Install from a pre-downloaded Camoufox Windows release zip",
     )
 
     # Legacy flags still work when no subcommand
@@ -279,7 +304,7 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "chat":
         from src.core.copilot import start_chat_loop
 
-        return start_chat_loop()
+        return start_chat_loop(chat_role="admin" if getattr(args, "admin", False) else "user")
 
     if cmd == "inbox" or args.scan_inbox:
         from src.core.inbox_scanner import process_inbox
@@ -294,6 +319,19 @@ def main(argv: list[str] | None = None) -> int:
                 f"(db_matches={row.get('db_matches', 0)})"
             )
         return 0
+
+    if cmd == "camoufox":
+        from scripts.fetch_camoufox import main as camoufox_main
+
+        argv_cf: list[str] = []
+        if getattr(args, "force", False):
+            argv_cf.append("--force")
+        if getattr(args, "status", False):
+            argv_cf.append("--status")
+        from_zip = getattr(args, "from_zip", None)
+        if from_zip:
+            argv_cf.extend(["--from-zip", str(from_zip)])
+        return camoufox_main(argv_cf)
 
     if args.dry_run:
         from src.core.settings import get_settings
