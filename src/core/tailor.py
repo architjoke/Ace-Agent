@@ -7,7 +7,6 @@ import logging
 import os
 import re
 import subprocess
-import threading
 import time
 from pathlib import Path
 from typing import Literal, TypedDict
@@ -35,8 +34,6 @@ from src.core.reflect import load_lessons
 
 logger = logging.getLogger(__name__)
 
-_ARCHETYPE_LOCK = threading.Lock()
-_ARCHETYPE_CACHE_FILE = _DEFAULT_OUTPUT / "archetype_pdf_cache.json"
 _ALIAS_SUBS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(?:sde|swe|software\s*dev(?:eloper|elopment)?|software\s*engineer)s?\b", re.I), "software_engineer"),
     (re.compile(r"\b(?:back[\s-]?end|be)\b", re.I), "backend"),
@@ -49,7 +46,7 @@ _ALIAS_SUBS: list[tuple[re.Pattern[str], str]] = [
 
 
 def normalize_role_title(title: str) -> str:
-    """Normalize job title → archetype slug (title hash, not full JD)."""
+    """Normalize job title → slug used inside JD artifact fingerprints."""
     s = (title or "").lower().replace("&", " ").replace("/", " ").replace("|", " ")
     for pat, repl in _ALIAS_SUBS:
         s = pat.sub(repl, s)
@@ -58,87 +55,14 @@ def normalize_role_title(title: str) -> str:
     return (s or "general")[:64]
 
 
-def _archetype_key(track: str, title: str) -> str:
-    return f"{(track or 'GENERAL').strip().upper()}|{normalize_role_title(title)}"
-
-
-def _cache_ttl_sec() -> float:
-    try:
-        return max(1.0, float(os.environ.get("ACE_ARCHETYPE_CACHE_HOURS") or "48")) * 3600.0
-    except ValueError:
-        return 48.0 * 3600.0
-
-
-def _load_archetype_cache() -> dict:
-    if not _ARCHETYPE_CACHE_FILE.is_file():
-        return {}
-    try:
-        return json.loads(_ARCHETYPE_CACHE_FILE.read_text(encoding="utf-8")) or {}
-    except Exception:
-        return {}
-
-
-def _save_archetype_cache(data: dict) -> None:
-    ensure_runtime_dirs()
-    tmp = _ARCHETYPE_CACHE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(_ARCHETYPE_CACHE_FILE)
-
-
 def lookup_archetype_pdf(track: str, title: str) -> tuple[str, str] | None:
-    """Return (pdf, yaml) if a same-archetype PDF was built within TTL.
-
-    Same-title archetypes share PDFs across companies for 48h — intentional.
-    """
-    if not (title or "").strip():
-        return None
-    key = _archetype_key(track, title)
-    with _ARCHETYPE_LOCK:
-        row = _load_archetype_cache().get(key)
-    if not isinstance(row, dict):
-        return None
-    try:
-        if time.time() - float(row.get("ts") or 0) > _cache_ttl_sec():
-            return None
-    except (TypeError, ValueError):
-        return None
-    pdf = str(row.get("pdf") or "").strip()
-    if not pdf:
-        return None
-    try:
-        from src.core.security import validate_safe_path
-
-        pdf_path = validate_safe_path(pdf)
-    except Exception:
-        return None
-    if not pdf_path.is_file():
-        return None
-    return str(pdf_path.resolve()), str(row.get("yaml") or "")
+    """Deprecated title-only lookup — always misses (never bypass keyword fit)."""
+    return None
 
 
 def store_archetype_pdf(track: str, title: str, pdf: str, yaml_text: str = "") -> None:
-    if not (title or "").strip() or not pdf:
-        return
-    try:
-        from src.core.security import validate_safe_path
-
-        pdf_path = validate_safe_path(pdf)
-    except Exception:
-        return
-    if not pdf_path.is_file():
-        return
-    key = _archetype_key(track, title)
-    with _ARCHETYPE_LOCK:
-        data = _load_archetype_cache()
-        data[key] = {
-            "pdf": str(pdf_path.resolve()),
-            "yaml": yaml_text or "",
-            "ts": time.time(),
-        }
-        try:
-            _save_archetype_cache(data)
-        except Exception:
-            logger.debug("archetype cache write failed", exc_info=True)
+    """Deprecated no-op — use JD fingerprint store via tailor_with_graph."""
+    return
 
 # Fallback only — real gate is per-company / per-JD via resolve_ats_pass_score()
 ATS_PASS_SCORE_DEFAULT = 85
@@ -1950,12 +1874,21 @@ def tailor_with_graph(
 
     Returns ``(pdf_path, tailored_yaml_text)``.
     """
-    hit = lookup_archetype_pdf(job_track, job_title)
+    from src.core.resume_artifacts import jd_signature, lookup_artifact, store_artifact
+
+    artifact_key, supportable = jd_signature(
+        jd,
+        master_yaml,
+        track=job_track,
+        title=job_title,
+    )
+    hit = lookup_artifact(artifact_key)
     if hit is not None:
         logger.info(
-            "Archetype PDF cache hit (%s|%s) — skip LLM/RenderCV",
+            "Resume artifact cache hit (%s|%s key=%s…) — skip LLM/RenderCV",
             (job_track or "GENERAL").upper(),
             normalize_role_title(job_title),
+            artifact_key[:12],
         )
         return hit
 
@@ -1995,7 +1928,18 @@ def tailor_with_graph(
             )
             resolved = str(fallback)
             if yaml_text:
-                store_archetype_pdf(job_track, job_title, resolved, yaml_text)
+                try:
+                    store_artifact(
+                        artifact_key,
+                        pdf_path=resolved,
+                        yaml_text=yaml_text,
+                        supportable=supportable,
+                        track=job_track,
+                        title=job_title,
+                        ats_score=result.get("ats_score"),
+                    )
+                except Exception:
+                    logger.debug("resume artifact store failed", exc_info=True)
             return resolved, yaml_text or ""
         raise FileNotFoundError(
             "Tailor graph finished without a PDF "
@@ -2005,7 +1949,18 @@ def tailor_with_graph(
             f"compile_error={result.get('compile_error')!r})"
         )
     resolved = str(Path(pdf_path).resolve())
-    store_archetype_pdf(job_track, job_title, resolved, yaml_text)
+    try:
+        store_artifact(
+            artifact_key,
+            pdf_path=resolved,
+            yaml_text=yaml_text,
+            supportable=supportable,
+            track=job_track,
+            title=job_title,
+            ats_score=result.get("ats_score"),
+        )
+    except Exception:
+        logger.debug("resume artifact store failed", exc_info=True)
     return resolved, yaml_text
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -312,71 +312,86 @@ def fetch_jobs_by_tracks(
     country_indeed: str = DEFAULT_COUNTRY_INDEED,
     tracks: dict[str, str] | None = None,
 ) -> pd.DataFrame:
-    """Run JobSpy per track in parallel, prefer direct apply URLs, write jobs.csv."""
+    """Run JobSpy per track in killable processes; merge partial results."""
+    from src.core.discovery_runners import (
+        extra_timeout_s,
+        overall_timeout_s,
+        records_to_frame,
+        run_parallel_deadlines,
+        track_timeout_s,
+    )
+
     queries = tracks or TRACK_QUERIES
     sites = _sites_from_settings()
     frames: list[pd.DataFrame] = []
+    hunt_started = time.monotonic()
+    wall = overall_timeout_s()
+    per_track = track_timeout_s()
 
-    def _one(track_name: str, query: str) -> pd.DataFrame:
-        return fetch_jobs(
-            keywords=query,
-            location=location,
-            max_results=max_results_per_track,
-            country_indeed=country_indeed,
-            track=track_name,
-            sites=sites,
+    jobs = [
+        (
+            "jobspy_track",
+            {
+                "keywords": query,
+                "location": location,
+                "max_results": max_results_per_track,
+                "country_indeed": country_indeed,
+                "track": track_name,
+                "sites": sites,
+            },
+            per_track,
+            f"jobspy:{track_name}",
         )
-
-    max_workers = max(1, min(4, len(queries)))
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {
-            pool.submit(_one, track_name, query): track_name
-            for track_name, query in queries.items()
-        }
-        for fut in as_completed(futures):
-            track_name = futures[fut]
-            try:
-                frame = fut.result()
-            except Exception:
-                logger.exception("Track %s scrape failed — continuing", track_name)
-                continue
-            if frame is not None and not frame.empty:
-                frames.append(frame)
-                logger.info(
-                    "Track %s returned %s applyable jobs", track_name, len(frame)
+        for track_name, query in queries.items()
+    ]
+    for result in run_parallel_deadlines(jobs, overall_timeout_s=wall):
+        if result.timed_out:
+            logger.warning(
+                "Track %s timed out — continuing with partial discovery",
+                result.label,
+            )
+            continue
+        if not result.ok:
+            if result.error:
+                logger.warning(
+                    "Track %s scrape failed: %s",
+                    result.label,
+                    (result.error or "")[:240],
                 )
+            continue
+        frame = records_to_frame(result.records)
+        if frame is not None and not frame.empty:
+            frames.append(frame)
+            logger.info(
+                "Track %s returned %s applyable jobs",
+                result.label,
+                len(frame),
+            )
 
-    # Jobdrop (WWR / optional Wellfound/HiringCafe) + custom Himalayas / YC.
-    # Hard-bounded so Camoufox downloads / hung scrapers never block apply.
-    try:
-        import os
-        from concurrent.futures import TimeoutError as FuturesTimeout
+    # Jobdrop + Himalayas / YC — process-isolated; never block apply on hang.
+    remaining = wall - (time.monotonic() - hunt_started)
+    if remaining > 5.0:
+        try:
+            from src.core.discovery_extra import fetch_extra_jobs_by_track
 
-        from src.core.discovery_extra import fetch_extra_jobs_by_track
-
-        timeout_s = float(os.environ.get("ACE_EXTRA_DISCOVERY_TIMEOUT_S", "90") or 90)
-        with ThreadPoolExecutor(max_workers=1) as extra_pool:
-            fut = extra_pool.submit(
-                fetch_extra_jobs_by_track,
+            extra_budget = min(extra_timeout_s(), remaining)
+            extra = fetch_extra_jobs_by_track(
                 queries,
                 location=location,
                 max_results_per_track=max(4, max_results_per_track // 2),
                 country_indeed=country_indeed,
+                overall_deadline_s=extra_budget,
             )
-            try:
-                extra = fut.result(timeout=max(20.0, timeout_s))
-            except FuturesTimeout:
-                logger.warning(
-                    "Extra discovery timed out after %.0fs — continuing with JobSpy only",
-                    timeout_s,
-                )
-                extra = None
-        if extra is not None and not extra.empty:
-            extra = _normalize_frame(extra)
-            frames.append(extra)
-            logger.info("Extra discovery sources returned %s jobs", len(extra))
-    except Exception:
-        logger.exception("Extra discovery sources failed — continuing with JobSpy")
+            if extra is not None and not extra.empty:
+                extra = _normalize_frame(extra)
+                frames.append(extra)
+                logger.info("Extra discovery sources returned %s jobs", len(extra))
+        except Exception:
+            logger.exception("Extra discovery sources failed — continuing with JobSpy")
+    else:
+        logger.warning(
+            "Overall discovery budget exhausted — skipping extra sources"
+        )
 
     if not frames:
         combined = pd.DataFrame()

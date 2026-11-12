@@ -302,7 +302,7 @@ def run_greenhouse(
         uploaded = _upload_resume(page, pdf)
         if not uploaded:
             reason = "Greenhouse playbook: resume file input not found"
-            if try_cdp_assist(cdp_assist, reason) and _upload_resume(page, pdf):
+            if try_cdp_assist(cdp_assist, reason, page=page) and _upload_resume(page, pdf):
                 pass
             else:
                 raise PlaybookFallback(reason)
@@ -311,7 +311,7 @@ def run_greenhouse(
 
         if _has_unanswered_custom(page):
             reason = "Greenhouse playbook: unanswered custom/required fields — Gemini"
-            if try_cdp_assist(cdp_assist, reason) and not _has_unanswered_custom(page):
+            if try_cdp_assist(cdp_assist, reason, page=page) and not _has_unanswered_custom(page):
                 pass
             else:
                 raise PlaybookFallback(reason)
@@ -349,7 +349,7 @@ def run_greenhouse(
 
         if not submitted:
             reason = "Greenhouse playbook: submit control not found"
-            if try_cdp_assist(cdp_assist, reason):
+            if try_cdp_assist(cdp_assist, reason, page=page):
                 for name in (
                     "Submit application",
                     "Submit Application",
@@ -370,7 +370,9 @@ def run_greenhouse(
             if not submitted:
                 raise PlaybookFallback(reason)
 
-        page.wait_for_timeout(2000)
+        from src.playbooks._common import settle
+
+        settle(page, timeout_ms=2500)
         body = ""
         try:
             body = (page.inner_text("body") or "").lower()
@@ -389,10 +391,9 @@ def run_greenhouse(
 
         if "error" in body and "required" in body:
             raise PlaybookFallback("Greenhouse playbook: validation errors after submit")
-        logger.info(
-            "Greenhouse playbook submitted without clear thank-you — counting success"
+        raise PlaybookFallback(
+            "Greenhouse playbook: submitted without confirmation — Gemini"
         )
-        return True
 
     except PlaywrightTimeout as exc:
         from src.playbooks.session import raise_handoff

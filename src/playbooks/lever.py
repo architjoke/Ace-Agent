@@ -10,10 +10,11 @@ from urllib.parse import urlparse
 from src.playbooks import PlaybookFallback
 from src.playbooks._common import (
     fill_css,
+    force_upload_resume,
     launch_persistent_context,
     load_applicant_profile,
+    settle,
     success_text,
-    force_upload_resume,
     upload_resume_file,
 )
 
@@ -227,7 +228,7 @@ def run_lever(
         uploaded = force_upload_resume(page, pdf) or upload_resume_file(page, pdf)
         if not uploaded:
             reason = f"{kind} playbook: resume file input not found"
-            if try_cdp_assist(cdp_assist, reason) and (
+            if try_cdp_assist(cdp_assist, reason, page=page) and (
                 force_upload_resume(page, pdf) or upload_resume_file(page, pdf)
             ):
                 pass
@@ -238,19 +239,19 @@ def run_lever(
 
         if _unanswered_custom(page):
             reason = f"{kind} playbook: unanswered custom/required fields — Gemini"
-            if try_cdp_assist(cdp_assist, reason) and not _unanswered_custom(page):
+            if try_cdp_assist(cdp_assist, reason, page=page) and not _unanswered_custom(page):
                 pass
             else:
                 raise PlaybookFallback(reason)
 
         if not _submit(page):
             reason = f"{kind} playbook: submit control not found"
-            if try_cdp_assist(cdp_assist, reason) and _submit(page):
+            if try_cdp_assist(cdp_assist, reason, page=page) and _submit(page):
                 pass
             else:
                 raise PlaybookFallback(reason)
 
-        page.wait_for_timeout(2000)
+        settle(page, timeout_ms=2500)
         try:
             body = page.inner_text("body") or ""
         except Exception:
@@ -260,8 +261,9 @@ def run_lever(
             return True
         if "required" in body.lower() and "error" in body.lower():
             raise PlaybookFallback(f"{kind} playbook: validation errors after submit")
-        logger.info("%s playbook submitted without clear thank-you — counting success", kind)
-        return True
+        raise PlaybookFallback(
+            f"{kind} playbook: submitted without confirmation — Gemini"
+        )
     except PlaywrightTimeout as exc:
         from src.playbooks.session import raise_handoff
 

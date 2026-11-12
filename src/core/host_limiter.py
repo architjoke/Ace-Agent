@@ -103,6 +103,13 @@ def _limits_for(key: str) -> tuple[float, float]:
     return DEFAULT_LIMIT
 
 
+def spacing_interval_for(host_key: str) -> float:
+    """Base±jitter seconds until the next dispatch for this host bucket."""
+    base, jitter = _limits_for(host_key or "default")
+    delay = base + random.uniform(-jitter, jitter)
+    return max(1.0, float(delay))
+
+
 class HostRateLimiter:
     """In-memory per-host token spacing shared across browser workers."""
 
@@ -116,9 +123,7 @@ class HostRateLimiter:
         return host_bucket_key(job_url)
 
     def _effective_interval(self, key: str) -> float:
-        base, jitter = _limits_for(key)
-        delay = base + random.uniform(-jitter, jitter)
-        return max(1.0, float(delay))
+        return spacing_interval_for(key)
 
     def ready_in(self, job_url: str) -> float:
         """Seconds until this host can dispatch again (0 if ready)."""

@@ -105,6 +105,33 @@ _HARD_BURN_NEEDLES = (
     "billing",
     "you exceeded your current quota",
 )
+# Set when every provider in a role chain is hard-burned / cooled — batch should pause.
+_TOKEN_LIMIT_REACHED = False
+_TOKEN_LIMIT_DETAIL = ""
+
+
+def token_limit_reached() -> bool:
+    return bool(_TOKEN_LIMIT_REACHED)
+
+
+def token_limit_detail() -> str:
+    return _TOKEN_LIMIT_DETAIL or "API token/quota limit reached"
+
+
+def mark_token_limit_reached(detail: str = "") -> None:
+    global _TOKEN_LIMIT_REACHED, _TOKEN_LIMIT_DETAIL
+    _TOKEN_LIMIT_REACHED = True
+    _TOKEN_LIMIT_DETAIL = (detail or "API token/quota limit reached").strip()[:400]
+    logger.error(
+        "TOKEN LIMIT REACHED — pausing applies until quotas reset (%s)",
+        _TOKEN_LIMIT_DETAIL,
+    )
+
+
+def clear_token_limit_reached() -> None:
+    global _TOKEN_LIMIT_REACHED, _TOKEN_LIMIT_DETAIL
+    _TOKEN_LIMIT_REACHED = False
+    _TOKEN_LIMIT_DETAIL = ""
 
 
 def _load_dotenv() -> None:
@@ -472,8 +499,17 @@ def invoke_with_failover(
             _mark_provider_cooldown(provider, exc)
             errors.append(f"{provider}: {exc}")
             if idx >= len(chain) - 1:
+                joined = " | ".join(errors)
+                hard = any(
+                    any(n in e.lower() for n in _HARD_BURN_NEEDLES) for e in errors
+                ) or all(_cooldown_remaining(p) > 0 for p in chain)
+                if hard:
+                    mark_token_limit_reached(joined)
+                    raise RuntimeError(
+                        f"TOKEN_LIMIT_REACHED: All providers failed for role={role}. {joined}"
+                    ) from exc
                 raise RuntimeError(
-                    f"All providers failed for role={role}. " + " | ".join(errors)
+                    f"All providers failed for role={role}. " + joined
                 ) from exc
             nxt = chain[idx + 1]
             kind = "failover" if _is_failover_error(exc) else "non-failover"
@@ -486,7 +522,13 @@ def invoke_with_failover(
                 exc,
             )
 
-    raise RuntimeError(f"All providers failed for role={role}. " + " | ".join(errors))
+    joined = " | ".join(errors)
+    if any(any(n in e.lower() for n in _HARD_BURN_NEEDLES) for e in errors):
+        mark_token_limit_reached(joined)
+        raise RuntimeError(
+            f"TOKEN_LIMIT_REACHED: All providers failed for role={role}. {joined}"
+        )
+    raise RuntimeError(f"All providers failed for role={role}. {joined}")
 
 
 def gemini_browser_model_name() -> str:

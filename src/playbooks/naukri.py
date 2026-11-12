@@ -17,6 +17,7 @@ from src.playbooks._common import (
     load_applicant_profile,
     raise_if_cloudflare,
     success_text,
+    confirm_application_success,
     try_cdp_assist,
     wait_for_any,
 )
@@ -139,9 +140,11 @@ def run_naukri(
             apply_btn.click(timeout=5000)
         except Exception as exc:
             reason = f"naukri: Apply not clickable ({type(exc).__name__})"
-            if try_cdp_assist(cdp_assist, reason):
+            unblocked = try_cdp_assist(cdp_assist, reason, page=pg)
+            if unblocked and confirm_application_success(pg):
                 return True
-            raise PlaybookFallback(reason) from exc
+            if not unblocked:
+                raise PlaybookFallback(reason) from exc
 
         # Wait for post-apply UI (success toast, form, or redirect)
         wait_for_any(
@@ -234,7 +237,7 @@ def run_naukri(
             if not advanced:
                 # Unknown custom question / stuck DOM → CDP assist once, else handoff
                 reason = f"naukri: unknown form / stuck at step {step}"
-                if try_cdp_assist(cdp_assist, reason):
+                if try_cdp_assist(cdp_assist, reason, page=pg):
                     force_upload_resume(pg, pdf)
                     continue
                 raise PlaybookFallback(reason)

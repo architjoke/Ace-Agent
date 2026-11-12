@@ -43,13 +43,17 @@ the open dialog; do not reload the job page.
 Absolute path (ONLY this file):
 {pdf_abs_path}
 On-screen name must show: {pdf_stem}
-- Do NOT select any already-listed / previously uploaded resume.
+- Do NOT select any already-listed / previously uploaded resume (even if the name looks similar).
 - Always click Upload resume / Upload file / Replace, then upload_file with the path above.
 - Confirm "{pdf_stem}" is attached before Next/Submit.
+- After Submit succeeds, the runner deletes this agent upload from LinkedIn Resumes — do not skip the disk upload.
 
 ## Form filling
 Use APPLICATION FORM ANSWERS when matching fields appear.
 Do not invent facts.
+- CTC Example 200000/350000 → type current_ctc_inr / expected_ctc_inr digits only.
+- Portfolio URL → portfolio_url only; NEVER GitHub; leave blank if empty.
+- Experience dropdowns → years_of_experience + additional_months_of_experience.
 
 ## HARD RULES
 - Stay on the current modal/tab — do not open a new job URL.
@@ -83,13 +87,23 @@ Always upload {pdf_abs_path} via the file input — never reuse a previously sav
 ## Form filling (mandatory)
 Use the APPLICATION FORM ANSWERS block below for every matching field.
 - Phone: use phone_country_code + phone_national / phone_display (never invent another country).
-- Notice / availability / join date: use notice_period / earliest_join_date (never claim same-day join unless forced — then pick within that window).
+- Notice / availability: narrative keys describe a window; numeric "days" boxes use
+  notice_period_days as ONE integer (7). Never type 7-14 / 7 to 14 into digit boxes.
 - Address / pincode / ZIP / postal: use the listed city, state, country, pincode fields.
 - Do not invent street/house numbers if not listed — use city/state/PIN/country.
 - Never fabricate salary history, foreign citizenship, or security-clearance eligibility.
-- Expected salary / CTC / compensation: ALWAYS use the annual INR figure from APPLICATION FORM ANSWERS
-  (default band ₹6,00,000–₹7,00,000 per annum). If the field is monthly, enter annual÷12.
-  If the JD posts a salary range, stay inside that range when possible, still as per annum.
+- Expected / current CTC: If the field example looks like `200000` / `350000` (digits only,
+  often max 20 chars), type ONLY plain INR digits from expected_ctc_inr / current_ctc_inr
+  (e.g. 650000 and 0). Do NOT type ₹, commas, or "per annum" into those boxes.
+- Years / months of experience dropdowns: use years_of_experience and
+  additional_months_of_experience (typically 0 years and 6 months for internships).
+- Education dates: university Aug 2024–May 2027 (currently attending); Class XII Apr 2022–May 2023;
+  Class X Apr 2020–Mar 2021. If month/year dropdowns appear, use university_start_month/year
+  (August, 2024) and university_end_month/year (May, 2027); mark currently attending when asked.
+- LinkedIn Easy Apply can be 5–7 pages — keep going through education + additional questions to Submit.
+- Portfolio / online portfolio URL: use portfolio_url only. NEVER put a GitHub URL in
+  portfolio. If portfolio_url is empty, leave the portfolio field blank.
+- LinkedIn URL field: use linkedin_url. GitHub field (if separate): use github_url.
 - JOB CLOSED: If the page says the job does not exist, is closed, expired, filled, or no longer
   available — STOP immediately. Do not apply. Describe the closed signal.
 
@@ -121,21 +135,32 @@ CRITICAL AUTHENTICATION RULE: If you encounter a login, signup, or account creat
 DO NOT click final Submit. When filled + OUR file is attached, output: {ready_token}
 """
 
-TASK_LINKEDIN_CLEANUP = """Go to LinkedIn Job application settings / Resumes library:
+TASK_LINKEDIN_CLEANUP = """Delete the agent-uploaded LinkedIn resume after apply.
+
+Start at LinkedIn Jobs (open this URL first if needed):
 {resumes_url}
 
-Goal: DELETE the agent-uploaded resume named exactly:
+Goal: DELETE only the agent upload named exactly:
 {pdf_filename}
 
-Steps:
-1) Open Resumes (Jobs → Preferences → Job application settings → Resumes).
-2) Find "{pdf_filename}" in the uploaded list (exact agent upload name).
-3) Delete / Remove ONLY that file.
-4) NEVER delete these permanent resumes (user keep-list):
+Exact UI path (follow in order — do NOT invent other settings URLs):
+1) Top nav → click Jobs.
+2) On the Jobs page → click Preferences.
+3) Open Resumes and applications (LinkedIn may label it "Resumes and application data").
+4) Scroll the uploaded-resumes list until you see "{pdf_filename}".
+5) Open that row's menu (⋯ / Delete / Remove) and delete ONLY "{pdf_filename}".
+6) NEVER delete these permanent keep-list resumes:
 {keep_list}
-5) When "{pdf_filename}" is gone (or already absent), output exactly: {cleanup_token}
+7) When "{pdf_filename}" is gone from the list (or was already absent), your final answer
+   must be exactly this token and nothing else:
+{cleanup_token}
 
-Abort on CAPTCHA. Do not touch any other resume.
+Rules:
+- Prefer Jobs → Preferences → Resumes and applications clicks over /mypreferences URLs.
+- If page-not-found, return to Jobs and use Preferences again.
+- Keep scrolling inside the resumes modal until the agent file appears or the list ends.
+- Abort on CAPTCHA. Do not touch any other resume.
+- Do NOT output the cleanup token unless the file is actually gone (or was never there).
 """
 
 # ── Copilot ─────────────────────────────────────────────────────────

@@ -20,6 +20,7 @@ VALID_STATUSES = frozenset(
         "REQUIRES_HUMAN_INTERVENTION",
         "REQUIRES_HUMAN_CITIZENSHIP_REVIEW",
         "JOB_CLOSED",
+        "TOKEN_LIMIT_REACHED",
     }
 )
 VALID_OUTCOMES = frozenset(
@@ -105,7 +106,10 @@ def init_db(db_path: Path | None = None) -> Path:
 
 
 def has_applied(job_url: str, db_path: Path | None = None) -> bool:
-    """Return True if this job_url was already logged (any status)."""
+    """Return True if this job_url was already logged (any status).
+
+    Diagnostics / legacy only — triage must use ``should_suppress_apply``.
+    """
     url = (job_url or "").strip()
     if not url:
         return False
@@ -128,6 +132,65 @@ def has_successful_apply(job_url: str, db_path: Path | None = None) -> bool:
             (url,),
         ).fetchone()
     return row is not None
+
+
+def has_terminal_apply_status(job_url: str, db_path: Path | None = None) -> bool:
+    """True when memory says never retry this URL (success / already / closed)."""
+    from src.core.apply_policy import SUPPRESS_MEMORY_STATUSES
+
+    url = (job_url or "").strip()
+    if not url:
+        return False
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT status FROM applications WHERE job_url = ? LIMIT 1",
+            (url,),
+        ).fetchone()
+    if not row:
+        return False
+    return str(row["status"] or "").strip().upper() in SUPPRESS_MEMORY_STATUSES
+
+
+def count_failed_apply_attempts(job_url: str, db_path: Path | None = None) -> int:
+    """Count non-terminal logged attempts for retry budgeting.
+
+    ``applications`` is unique on job_url, so this is 0 or 1 for a failed row.
+    Prefer queue ``attempt_count`` when available; this backs triage when the
+    queue row is gone.
+    """
+    from src.core.apply_policy import SUPPRESS_MEMORY_STATUSES
+
+    url = (job_url or "").strip()
+    if not url:
+        return 0
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT status, error_log FROM applications WHERE job_url = ? LIMIT 1",
+            (url,),
+        ).fetchone()
+    if not row:
+        return 0
+    status = str(row["status"] or "").strip().upper()
+    if status in SUPPRESS_MEMORY_STATUSES:
+        return 0
+    # Parse attempt=N from error_log when present; else one failed attempt.
+    err = str(row["error_log"] or "")
+    m = re.search(r"(?:^|;)\s*attempt=(\d+)\s*(?:;|$)", err, re.I)
+    if m:
+        try:
+            return max(1, int(m.group(1)))
+        except ValueError:
+            pass
+    if status:
+        return 1
+    return 0
+
+
+def should_suppress_apply(job_url: str, db_path: Path | None = None) -> bool:
+    """Triage gate: skip URL only for terminal memory or retry exhaustion."""
+    from src.core.apply_policy import should_suppress_apply as _policy_suppress
+
+    return _policy_suppress(job_url, db_path=db_path)
 
 
 def _norm_company(name: str) -> str:

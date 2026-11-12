@@ -174,31 +174,138 @@ def test_requeue_claimed(tmp_path):
     assert row["status"] == "READY"
 
 
-def test_apply_queue_schema_unchanged(tmp_path):
-    """Guard: no new columns from this performance pass."""
+def test_apply_queue_has_host_key_and_schedule(tmp_path):
     from src.core.memory import _connect
-    from src.core.queue import init_queue
+    from src.core.queue import enqueue_apply, init_queue
 
     db = tmp_path / "s.db"
     init_queue(db)
+    enqueue_apply(
+        company="LI",
+        job_url="https://www.linkedin.com/jobs/view/schema",
+        track="SDE",
+        jd_text="x",
+        pdf_path=str(tmp_path / "a.pdf"),
+        db_path=db,
+    )
     with _connect(db) as conn:
         cols = {
             str(r["name"])
             for r in conn.execute("PRAGMA table_info(apply_queue)").fetchall()
         }
-    expected = {
-        "id",
-        "company",
-        "job_url",
-        "track",
-        "jd_text",
-        "pdf_path",
-        "yaml_snapshot",
-        "job_title",
-        "status",
-        "worker_id",
-        "error_log",
-        "created_at",
-        "updated_at",
-    }
-    assert cols == expected
+        tables = {
+            str(r[0])
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        row = conn.execute(
+            "SELECT host_key FROM apply_queue WHERE job_url LIKE '%schema'"
+        ).fetchone()
+    assert "host_key" in cols
+    assert "attempt_count" in cols
+    assert "host_schedule" in tables
+    assert row["host_key"] == "linkedin.com"
+
+
+def test_claim_skips_cooling_prefix_beyond_peek(tmp_path, monkeypatch):
+    """Eligible host after many cooling LinkedIn rows must still be claimable."""
+    from src.core.queue import WAIT_SENTINEL_KEY, claim_next, enqueue_apply, init_queue, reserve_host
+
+    monkeypatch.setenv("ACE_CLAIM_SCAN_LIMIT", "500")
+    db = tmp_path / "peek.db"
+    init_queue(db)
+    now = 1_000_000.0
+    for i in range(30):
+        enqueue_apply(
+            company=f"LI{i}",
+            job_url=f"https://www.linkedin.com/jobs/view/{i}",
+            track="SDE",
+            jd_text="x",
+            pdf_path=str(tmp_path / f"a{i}.pdf"),
+            db_path=db,
+        )
+    enqueue_apply(
+        company="LV",
+        job_url="https://jobs.lever.co/acme/beyond",
+        track="SDE",
+        jd_text="y",
+        pdf_path=str(tmp_path / "lever.pdf"),
+        db_path=db,
+    )
+    # Cool LinkedIn for a long window; Lever remains free.
+    reserve_host("linkedin.com", db_path=db, now=now)
+    item = claim_next("w1", db_path=db, now=now)
+    assert item is not None
+    assert WAIT_SENTINEL_KEY not in item
+    assert "id" in item
+    assert "lever.co" in str(item.get("job_url"))
+
+
+def test_dual_workers_cannot_both_claim_same_host(tmp_path):
+    from src.core.memory import _connect
+    from src.core.queue import WAIT_SENTINEL_KEY, claim_next, enqueue_apply, init_queue
+
+    db = tmp_path / "dual.db"
+    init_queue(db)
+    now = 2_000_000.0
+    enqueue_apply(
+        company="LI1",
+        job_url="https://www.linkedin.com/jobs/view/dual1",
+        track="SDE",
+        jd_text="x",
+        pdf_path=str(tmp_path / "a.pdf"),
+        db_path=db,
+    )
+    enqueue_apply(
+        company="LI2",
+        job_url="https://www.linkedin.com/jobs/view/dual2",
+        track="SDE",
+        jd_text="y",
+        pdf_path=str(tmp_path / "b.pdf"),
+        db_path=db,
+    )
+    first = claim_next("w1", db_path=db, now=now)
+    assert first and "id" in first
+    second = claim_next("w2", db_path=db, now=now)
+    # Host schedule reserved — second LinkedIn must wait (not both claimed).
+    assert second is not None
+    assert WAIT_SENTINEL_KEY in second
+    with _connect(db) as conn:
+        claimed = conn.execute(
+            "SELECT COUNT(*) AS n FROM apply_queue WHERE status='CLAIMED'"
+        ).fetchone()["n"]
+        ready = conn.execute(
+            "SELECT COUNT(*) AS n FROM apply_queue WHERE status='READY'"
+        ).fetchone()["n"]
+    assert int(claimed) == 1
+    assert int(ready) == 1
+
+
+def test_host_schedule_survives_restart(tmp_path):
+    from src.core.memory import _connect
+    from src.core.queue import claim_next, enqueue_apply, init_queue, reserve_host
+
+    db = tmp_path / "persist.db"
+    init_queue(db)
+    now = 3_000_000.0
+    enqueue_apply(
+        company="LI",
+        job_url="https://www.linkedin.com/jobs/view/persist",
+        track="SDE",
+        jd_text="x",
+        pdf_path=str(tmp_path / "a.pdf"),
+        db_path=db,
+    )
+    reserve_host("linkedin.com", db_path=db, now=now)
+    with _connect(db) as conn:
+        row = conn.execute(
+            "SELECT next_eligible_at FROM host_schedule WHERE host_key='linkedin.com'"
+        ).fetchone()
+    assert float(row["next_eligible_at"]) > now
+    # Re-init simulates process restart — schedule row must remain.
+    init_queue(db)
+    item = claim_next("w1", db_path=db, now=now)
+    from src.core.queue import WAIT_SENTINEL_KEY
+
+    assert item is not None and WAIT_SENTINEL_KEY in item

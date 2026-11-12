@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlparse
@@ -37,15 +38,61 @@ def pick_chrome_user_agent() -> str:
 GOTO_DOM_TIMEOUT_MS = 15_000
 
 
-def try_cdp_assist(cdp_assist, reason: str) -> bool:
-    """Invoke optional sync CDP assist callback; False on missing/failure."""
+def try_cdp_assist(
+    cdp_assist,
+    reason: str,
+    *,
+    page=None,
+    company: str = "",
+    job_url: str = "",
+) -> bool:
+    """Run optional CDP assist. True means *unblocked/ran*, NOT application success.
+
+    When ``page`` is provided, snapshots fields before assist and learns afterward
+    (promote fixed keys into local master). Callers must still confirm submit via
+    ``confirm_application_success`` / ``assist_and_confirm``.
+    """
     if cdp_assist is None:
         return False
+    before: list[tuple[str, str]] | None = None
+    if page is not None:
+        try:
+            from src.core.human_assist import snapshot_filled_fields
+
+            before = snapshot_filled_fields(page)
+        except Exception:
+            before = None
     try:
-        return bool(cdp_assist(str(reason or "stuck")))
+        ok = bool(cdp_assist(str(reason or "stuck")))
     except Exception:
         logger.debug("cdp_assist raised", exc_info=True)
         return False
+    if ok and page is not None:
+        try:
+            from src.core.human_assist import learn_from_page
+
+            learn_from_page(
+                page, company=company or "", job_url=job_url or "", before=before
+            )
+        except Exception:
+            logger.debug("learn_from_page after cdp_assist failed", exc_info=True)
+    return ok
+
+
+def assist_and_confirm(
+    page,
+    cdp_assist,
+    reason: str,
+    *,
+    company: str = "",
+    job_url: str = "",
+) -> bool:
+    """Assist then verify submission markers. Never treat assist alone as applied."""
+    if not try_cdp_assist(
+        cdp_assist, reason, page=page, company=company, job_url=job_url
+    ):
+        return False
+    return confirm_application_success(page)
 
 
 def _norm_host(host: str) -> str:
@@ -185,6 +232,7 @@ def load_applicant_profile(
         else {}
     )
     try:
+        from src.core.form_answers import sanitize_application_answers
         from src.core.salary import inject_salary_answers
 
         answers = inject_salary_answers(
@@ -192,8 +240,15 @@ def load_applicant_profile(
             jd_text=jd_text,
             yaml_snapshot=yaml_snapshot,
         )
+        answers = sanitize_application_answers(answers)
     except Exception:
         answers = answers if isinstance(answers, dict) else {}
+    try:
+        from src.core.learned_answers import merge_into_answers
+
+        answers = merge_into_answers(answers if isinstance(answers, dict) else {})
+    except Exception:
+        pass
     cv = data.get("cv") if isinstance(data.get("cv"), dict) else {}
     name = str(cv.get("name") or answers.get("full_name") or "").strip()
     parts = name.split(None, 1)
@@ -209,7 +264,7 @@ def load_applicant_profile(
         or ""
     ).strip()
     email = str(answers.get("email") or cv.get("email") or "").strip()
-    return {
+    profile: dict[str, Any] = {
         "full_name": full,
         "first_name": first,
         "last_name": last,
@@ -228,9 +283,141 @@ def load_applicant_profile(
         "country": str(answers.get("country") or "India").strip(),
         "linkedin": str(answers.get("linkedin_url") or "").strip(),
         "github": str(answers.get("github_url") or "").strip(),
-        "expected_ctc": str(answers.get("expected_ctc") or "").strip(),
-        "salary_expectation": str(answers.get("salary_expectation") or "").strip(),
+        # Never reuse GitHub for portfolio/website screening questions.
+        "portfolio": str(answers.get("portfolio_url") or answers.get("website_url") or "").strip(),
+        "portfolio_url": str(answers.get("portfolio_url") or "").strip(),
+        "website_url": str(answers.get("website_url") or "").strip(),
+        "expected_ctc": str(
+            answers.get("expected_ctc_inr")
+            or answers.get("expected_ctc_digits")
+            or answers.get("expected_ctc")
+            or ""
+        ).strip(),
+        "expected_ctc_inr": str(
+            answers.get("expected_ctc_inr") or answers.get("expected_ctc_digits") or ""
+        ).strip(),
+        "current_ctc": str(
+            answers.get("current_ctc_inr")
+            or answers.get("current_ctc_digits")
+            or answers.get("current_ctc")
+            or "0"
+        ).strip(),
+        "current_ctc_inr": str(
+            answers.get("current_ctc_inr") or answers.get("current_ctc_digits") or "0"
+        ).strip(),
+        "salary_expectation": str(
+            answers.get("expected_ctc_inr")
+            or answers.get("salary_expectation")
+            or ""
+        ).strip(),
+        "years_of_experience": str(answers.get("years_of_experience") or "0").strip(),
+        "additional_months_of_experience": str(
+            answers.get("additional_months_of_experience") or "0"
+        ).strip(),
     }
+    # Pass through remaining application_answers for form engine kinds.
+    for key, value in (answers or {}).items():
+        k = str(key)
+        if k in profile and profile[k]:
+            continue
+        if value is None or value == "":
+            continue
+        profile[k] = (
+            value if isinstance(value, (int, float, bool)) else str(value).strip()
+        )
+    try:
+        from src.core.form_engine import enrich_profile_skills
+
+        profile = enrich_profile_skills(profile, data)
+    except Exception:
+        pass
+    return profile
+
+
+def fill_application_form(
+    page,
+    master_yaml_path: Path | str,
+    *,
+    yaml_snapshot: str | None = None,
+    jd_text: str | None = None,
+) -> dict[str, Any]:
+    """Shared playbook entry: load personal profile → FormFillEngine (general rules)."""
+    from src.core.form_engine import FormFillEngine
+
+    master = Path(master_yaml_path)
+    profile = load_applicant_profile(
+        master, yaml_snapshot=yaml_snapshot, jd_text=jd_text
+    )
+    master_data = None
+    try:
+        raw = yaml.safe_load(master.read_text(encoding="utf-8")) or {}
+        master_data = raw if isinstance(raw, dict) else None
+    except Exception:
+        master_data = None
+    return FormFillEngine(
+        profile, jd_text=jd_text, master_data=master_data
+    ).fill_visible(page)
+
+
+_NEXT_PAGE = re.compile(r"^(Next|Continue|Next\s*page)$", re.I)
+
+
+def fill_ats_form(
+    page,
+    master_yaml_path: Path | str | None = None,
+    *,
+    profile: dict[str, Any] | None = None,
+    yaml_snapshot: str | None = None,
+    jd_text: str | None = None,
+    max_pages: int = 2,
+) -> dict[str, Any]:
+    """FormFillEngine + optional Next/Continue for multi-page ATS / Google Forms."""
+    from src.core.form_engine import FormFillEngine
+
+    if profile is None:
+        if master_yaml_path is None:
+            raise ValueError("fill_ats_form requires profile or master_yaml_path")
+        return_stats = fill_application_form(
+            page,
+            master_yaml_path,
+            yaml_snapshot=yaml_snapshot,
+            jd_text=jd_text,
+        )
+        engine = None
+    else:
+        engine = FormFillEngine(profile, jd_text=jd_text)
+        return_stats = engine.fill_visible(page)
+
+    total_filled = int(return_stats.get("filled") or 0)
+    unknown = list(return_stats.get("unknown_labels") or [])
+
+    for _ in range(max(0, int(max_pages) - 1)):
+        advanced = False
+        try:
+            btn = page.get_by_role("button", name=_NEXT_PAGE).first
+            if btn.count() and btn.is_visible(timeout=800):
+                btn.click(timeout=3000)
+                advanced = True
+        except Exception:
+            advanced = False
+        if not advanced:
+            break
+        settle(page, timeout_ms=1500)
+        if engine is None and master_yaml_path is not None:
+            stats = fill_application_form(
+                page,
+                master_yaml_path,
+                yaml_snapshot=yaml_snapshot,
+                jd_text=jd_text,
+            )
+        elif engine is not None:
+            stats = engine.fill_visible(page)
+        else:
+            break
+        total_filled += int(stats.get("filled") or 0)
+        unknown.extend(stats.get("unknown_labels") or [])
+
+    return {"filled": total_filled, "unknown_labels": unknown}
 
 
 def clear_profile_locks(profile: Path) -> None:
@@ -557,7 +744,7 @@ def _resume_ui_attached(page, pdf_path: Path) -> bool:
     return False
 
 
-def _confirm_resume_upload(page, pdf_path: Path, *, wait_ms: int = 2500) -> bool:
+def _confirm_resume_upload(page, pdf_path: Path, *, wait_ms: int = 1200) -> bool:
     """Event-driven confirm: UI markers, else input.files.length > 0."""
     deadline_markers = (
         '[data-testid="attached-resume-card"]',
@@ -621,12 +808,66 @@ def success_text(body: str) -> bool:
         "thank you for applying",
         "thanks for applying",
         "application submitted",
+        "your application was sent",
+        "application was sent",
         "we have received your application",
         "application received",
         "successfully submitted",
         "you applied",
+        "application has been submitted",
+        "thanks for your application",
+        "your application has been received",
     )
     return any(m in blob for m in markers)
+
+
+_SUCCESS_URL_NEEDLES = (
+    "application-submitted",
+    "application_submitted",
+    "applicationsubmitted",
+    "/thank",
+    "thank-you",
+    "thankyou",
+    "confirmation",
+    "applied=true",
+)
+
+
+def confirm_application_success(page) -> bool:
+    """True only when the page shows verified post-submit evidence.
+
+    Never treat a Submit click alone as success.
+    """
+    if page is None:
+        return False
+    try:
+        body = page.inner_text("body", timeout=2500) or ""
+    except Exception:
+        body = ""
+    if success_text(body):
+        return True
+    try:
+        url = (page.url or "").lower()
+    except Exception:
+        url = ""
+    if url and any(n in url for n in _SUCCESS_URL_NEEDLES):
+        return True
+    try:
+        title = (page.title() or "").lower()
+    except Exception:
+        title = ""
+    if title and any(
+        m in title
+        for m in ("thank you", "application submitted", "application received")
+    ):
+        return True
+    return False
+
+
+def submission_result(page, *, submitted_click: bool = False) -> bool:
+    """Shared submit contract: click is ignored; confirmation required."""
+    _ = submitted_click  # documented so callers pass intent without changing semantics
+    return confirm_application_success(page)
 
 
 # --- Enterprise harden helpers (new boards) ---------------------------------
@@ -666,18 +907,27 @@ def cloudflare_turnstile_present(page) -> bool:
     return any(n in blob for n in needles)
 
 
-def raise_if_cloudflare(page, site: str) -> None:
-    """Hard-exit CF walls — never hand to Gemini vision (unsolvable quota burn).
+def raise_if_cloudflare(
+    page,
+    site: str,
+    *,
+    company: str = "",
+    job_url: str = "",
+) -> None:
+    """CF/Turnstile: human assist first; unresolved → Manual_Action (no Gemini).
 
     Circuit recording happens in browser_worker_loop on ApplicationBlockedError
     so we do not double-count the same wall.
     """
     if not cloudflare_turnstile_present(page):
         return
-    from src.core.executor import ApplicationBlockedError
+    from src.core.human_assist import ensure_captcha_cleared
 
-    raise ApplicationBlockedError(
-        f"{site}: cloudflare/turnstile wall — requires human (no vision)"
+    ensure_captcha_cleared(
+        page,
+        company=company or site,
+        job_url=job_url,
+        site=site,
     )
 
 
@@ -756,6 +1006,59 @@ def wait_for_any(page, selectors: list[str], *, timeout_ms: int = 5000):
         return combined
     except Exception:
         return None
+
+
+def settle(
+    page,
+    *,
+    timeout_ms: int = 2000,
+    selectors: list[str] | None = None,
+) -> bool:
+    """Wait until a selector is visible, success markers appear, or timeout.
+
+    Prefer event-driven readiness; never burns the full budget if ready early.
+    """
+    if page is None:
+        return False
+    budget = max(100, int(timeout_ms))
+    if selectors:
+        return wait_for_any(page, selectors, timeout_ms=budget) is not None
+
+    try:
+        start_url = (page.url or "").strip()
+    except Exception:
+        start_url = ""
+
+    deadline = time.monotonic() + (budget / 1000.0)
+    slice_ms = 150
+    while time.monotonic() < deadline:
+        try:
+            if confirm_application_success(page):
+                return True
+        except Exception:
+            pass
+        try:
+            cur = (page.url or "").strip()
+            if start_url and cur and cur != start_url:
+                return True
+        except Exception:
+            pass
+        try:
+            ready = page.evaluate("() => document.readyState") or ""
+            if ready == "complete":
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.2:
+                    return True
+        except Exception:
+            pass
+        try:
+            page.wait_for_timeout(slice_ms)
+        except Exception:
+            time.sleep(slice_ms / 1000.0)
+    try:
+        return confirm_application_success(page)
+    except Exception:
+        return False
 
 
 def close_extra_pages(context, keep) -> None:

@@ -89,14 +89,6 @@ Complete these before Ace can apply smoothly on native boards:
 _LOCK_NAMES = ("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile")
 
 
-def _profile_locked(profile_dir: Path) -> bool:
-    for name in _LOCK_NAMES:
-        lock = profile_dir / name
-        if lock.exists():
-            return True
-    return False
-
-
 def _ace_chrome_running(profile_dir: Path) -> bool:
     needle = str(profile_dir).lower().replace("/", "\\")
     try:

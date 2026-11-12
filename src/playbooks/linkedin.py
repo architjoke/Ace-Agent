@@ -9,21 +9,23 @@ from pathlib import Path
 
 from src.playbooks import PlaybookFallback
 from src.playbooks._common import (
+    _confirm_resume_upload,
     close_context_safe,
     force_upload_resume,
     goto_dom,
     launch_persistent_context,
     load_applicant_profile,
+    settle,
     success_text,
 )
 from src.playbooks.session import raise_handoff
 
 logger = logging.getLogger(__name__)
 
-_WIDGET_TIMEOUT_MS = 5_000
-# Deep Easy Apply modals (7+ screens) need headroom beyond the old 12-step cap.
-_MAX_STEPS = 15
-_OVERALL_BUDGET_S = 120
+_WIDGET_TIMEOUT_MS = 2_500
+# Deep Easy Apply modals (5–7 screens). Deterministic fills — keep budget tight.
+_MAX_STEPS = 22
+_OVERALL_BUDGET_S = 180
 
 _EASY_APPLY = re.compile(r"Easy Apply", re.I)
 _APPLIED = re.compile(r"^Applied$", re.I)
@@ -50,8 +52,8 @@ _ERROR_BANNER_SELS = (
 )
 
 # Easy Apply click budget (was ~3s — too tight on warm LI).
-_EA_VISIBLE_MS = 1800
-_EA_CLICK_MS = 1500
+_EA_VISIBLE_MS = 1200
+_EA_CLICK_MS = 1000
 
 _EA_CSS = (
     "button.jobs-apply-button--top-card, "
@@ -466,45 +468,172 @@ def _click_easy_apply(page) -> None:
     )
 
 
-def _fill_step(page, *, answers: dict, pdf: Path) -> None:
-    from src.core.semantic_dom import extract_interactive, plan_semantic_actions
+def _fill_education_dates(page, answers: dict) -> None:
+    """Fill education From/To from master.yaml; check currently attending.
 
-    elements = extract_interactive(page)
-    if not elements:
-        return
-    actions = plan_semantic_actions(
-        elements, answers=answers, resume_path=str(pdf)
-    )
-    if not actions:
-        return
-    # Cap per-action timeouts for stuck detection
-    for step in actions:
-        ace_id = step.get("id")
-        action = step.get("action")
-        loc = page.locator(f'[data-ace-id="{ace_id}"]').first
+    Values come from application_answers (already provided). One JS pass for
+    native <select>s, then combobox click+option, then attending checkbox.
+    If still red after this, playbook asks human once and learns — no extra scripts.
+    """
+    start_m = str(answers.get("university_start_month") or "August").strip()
+    start_y = str(answers.get("university_start_year") or "2024").strip()
+    end_m = str(answers.get("university_end_month") or "May").strip()
+    end_y = str(
+        answers.get("university_end_year") or answers.get("graduation_year") or "2027"
+    ).strip()
+    attending = str(answers.get("university_currently_attending") or "").strip().lower() in {
+        "yes",
+        "true",
+        "1",
+        "y",
+    }
+    month_num = {
+        "january": "1", "february": "2", "march": "3", "april": "4",
+        "may": "5", "june": "6", "july": "7", "august": "8",
+        "september": "9", "october": "10", "november": "11", "december": "12",
+    }
+
+    try:
+        page.evaluate(
+            """({ startM, startY, endM, endY, monthNum }) => {
+              const root = document.querySelector(
+                "dialog[open], .jobs-easy-apply-modal, [data-test-modal-id='easy-apply-modal'], div[role='dialog']"
+              ) || document;
+              const vis = (el) => {
+                if (!el) return false;
+                const st = getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden') return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 1 && r.height > 1;
+              };
+              const months = [], years = [];
+              for (const sel of root.querySelectorAll('select')) {
+                if (!vis(sel)) continue;
+                const joined = Array.from(sel.options||[]).map(o => (o.textContent||'').trim()).join(' ').toLowerCase();
+                const meta = ((sel.getAttribute('aria-label')||'')+' '+(sel.id||'')+' '+(sel.name||'')).toLowerCase();
+                if (joined.includes('january') || joined.includes('august') || meta.includes('month')) months.push(sel);
+                else if (/\\b20\\d{2}\\b/.test(joined) || meta.includes('year')) years.push(sel);
+              }
+              const setSel = (sel, label) => {
+                if (!sel || !label) return;
+                const want = String(label).toLowerCase();
+                for (const o of sel.options||[]) {
+                  const t = (o.textContent||'').trim().toLowerCase();
+                  const v = String(o.value||'');
+                  if (t === want || v.toLowerCase() === want || v === monthNum[want]) {
+                    sel.value = o.value;
+                    sel.dispatchEvent(new Event('input', { bubbles: true }));
+                    sel.dispatchEvent(new Event('change', { bubbles: true }));
+                    return;
+                  }
+                }
+              };
+              setSel(months[0], startM); setSel(years[0], startY);
+              setSel(months[1], endM); setSel(years[1], endY);
+            }""",
+            {
+                "startM": start_m,
+                "startY": start_y,
+                "endM": end_m,
+                "endY": end_y,
+                "monthNum": month_num,
+            },
+        )
+    except Exception:
+        logger.debug("education JS select fill failed", exc_info=True)
+
+    def _pick(kind: str, values: list[str]) -> None:
+        locs = []
         try:
-            if loc.count() == 0:
+            locs.extend(page.get_by_role("combobox", name=re.compile(kind, re.I)).all())
+        except Exception:
+            pass
+        try:
+            locs.extend(page.get_by_text(re.compile(rf"^{kind}$", re.I)).all())
+        except Exception:
+            pass
+        seen = 0
+        for loc in locs:
+            if seen >= len(values):
+                break
+            try:
+                if not loc.is_visible(timeout=200):
+                    continue
+                loc.click(timeout=_WIDGET_TIMEOUT_MS, force=True)
+                page.wait_for_timeout(200)
+                opt = page.get_by_role(
+                    "option", name=re.compile(rf"^{re.escape(values[seen])}$", re.I)
+                ).first
+                if opt.count():
+                    opt.click(timeout=_WIDGET_TIMEOUT_MS)
+                    seen += 1
+            except Exception:
                 continue
-            if action == "fill":
-                loc.fill(str(step.get("text") or ""), timeout=_WIDGET_TIMEOUT_MS)
-            elif action == "click":
-                loc.click(timeout=_WIDGET_TIMEOUT_MS)
-            elif action == "upload" and pdf.is_file():
-                if not force_upload_resume(page, pdf):
-                    try:
-                        tag = (loc.evaluate("el => el.tagName") or "").lower()
-                    except Exception:
-                        tag = ""
-                    if tag == "input":
-                        loc.set_input_files(str(pdf), timeout=_WIDGET_TIMEOUT_MS)
-                    else:
-                        page.locator('input[type="file"]').first.set_input_files(
-                            str(pdf), timeout=_WIDGET_TIMEOUT_MS
-                        )
-        except Exception as exc:
-            raise PlaybookFallback(
-                f"linkedin playbook: widget stuck action={action} id={ace_id} ({exc})"
-            ) from exc
+
+    _pick("Month", [start_m, end_m])
+    _pick("Year", [start_y, end_y])
+
+    if attending:
+        try:
+            box = page.get_by_role(
+                "checkbox", name=re.compile(r"currently attend|still attend", re.I)
+            ).first
+            if box.count() and box.is_visible(timeout=400):
+                try:
+                    if not box.is_checked():
+                        box.check(timeout=_WIDGET_TIMEOUT_MS)
+                except Exception:
+                    box.click(timeout=_WIDGET_TIMEOUT_MS, force=True)
+            else:
+                lab = page.get_by_text(
+                    re.compile(r"I currently attend this institution", re.I)
+                ).first
+                if lab.count() and lab.is_visible(timeout=300):
+                    lab.click(timeout=_WIDGET_TIMEOUT_MS, force=True)
+        except Exception:
+            logger.debug("currently-attending check failed", exc_info=True)
+
+
+def _fill_via_engine(page, engine) -> None:
+    """General FormFillEngine — profile facts only; no playbook Q→A paste."""
+    if engine is None:
+        return
+    engine.fill_visible(page)
+
+
+def _modal_mentions_education(page) -> bool:
+    """Cheap education-page detect — prefer modal text over full body scrape."""
+    try:
+        modal = page.locator(
+            "dialog[open], .jobs-easy-apply-modal, "
+            "[data-test-modal-id='easy-apply-modal'], div[role='dialog']"
+        ).first
+        if not modal.count():
+            return False
+        txt = (modal.inner_text(timeout=400) or "").lower()
+    except Exception:
+        return False
+    return any(
+        n in txt
+        for n in (
+            "dates attended",
+            "edit education",
+            "field of study",
+            "currently attend",
+        )
+    )
+
+
+def _fill_step(page, *, answers: dict, pdf: Path, engine=None) -> None:
+    """Fill from personal profile via shared engine — playbook stays person-agnostic.
+
+    Resume upload is owned by the step loop (once) — not repeated every fill.
+    Screening/CTC/experience come from FormFillEngine (no duplicate label pass).
+    """
+    if _modal_mentions_education(page):
+        _fill_education_dates(page, answers)
+
+    _fill_via_engine(page, engine)
 
 
 def _form_error_banner(page) -> bool:
@@ -542,11 +671,36 @@ def _form_error_banner(page) -> bool:
     return False
 
 
+def _education_date_errors(page) -> bool:
+    """True when Easy Apply education Month/Year still show required errors."""
+    try:
+        modal = page.locator(
+            "dialog[open], .jobs-easy-apply-modal, "
+            "[data-test-modal-id='easy-apply-modal'], div[role='dialog']"
+        ).first
+        txt = (
+            (modal.inner_text(timeout=400) or "").lower()
+            if modal.count()
+            else (page.inner_text("body", timeout=500) or "").lower()
+        )
+    except Exception:
+        return False
+    if "this field is required" not in txt:
+        return False
+    return any(
+        n in txt
+        for n in ("dates attended", "edit education", "currently attend", "field of study")
+    )
+
+
 def _advance(page) -> str:
     """Click Submit first (short-circuit), then Review, then Next.
 
     Returns submit|review|next|none.
     """
+    # Never burn Next while education dates are still red — fill them first.
+    if _education_date_errors(page):
+        return "none"
     for kind, pattern in (
         ("submit", _SUBMIT),
         ("review", _REVIEW),
@@ -556,10 +710,13 @@ def _advance(page) -> str:
             btn = page.get_by_role("button", name=pattern).first
             if btn.count() == 0:
                 continue
-            if not btn.is_visible(timeout=800):
+            if not btn.is_visible(timeout=500):
                 continue
-            btn.click(timeout=_WIDGET_TIMEOUT_MS)
-            page.wait_for_timeout(600)
+            try:
+                btn.click(timeout=_WIDGET_TIMEOUT_MS)
+            except Exception:
+                btn.click(timeout=_WIDGET_TIMEOUT_MS, force=True)
+            page.wait_for_timeout(350)
             return kind
         except Exception:
             continue
@@ -568,7 +725,7 @@ def _advance(page) -> str:
 
 def _confirm_success(page) -> bool:
     try:
-        body = page.inner_text("body", timeout=2000) or ""
+        body = page.inner_text("body", timeout=900) or ""
     except Exception:
         body = ""
     lower = body.lower()
@@ -578,7 +735,6 @@ def _confirm_success(page) -> bool:
         "application sent",
         "your application was sent",
         "application submitted",
-        "applied",
     )
     return any(m in lower for m in markers)
 
@@ -620,7 +776,8 @@ def run_linkedin(
 
     from src.playbooks._common import try_cdp_assist
 
-    _ = kwargs
+    company = str(kwargs.get("company") or "").strip()
+    jd_text = str(kwargs.get("jd_text") or "")
     pdf = Path(pdf_path).expanduser().resolve()
     master = Path(master_yaml_path).expanduser().resolve()
     if not pdf.is_file():
@@ -628,7 +785,43 @@ def run_linkedin(
     if not master.is_file():
         raise FileNotFoundError(f"master.yaml not found: {master}")
 
-    answers = load_applicant_profile(master, yaml_snapshot=yaml_snapshot)
+    answers = load_applicant_profile(
+        master,
+        yaml_snapshot=yaml_snapshot,
+        jd_text=jd_text or None,
+    )
+    from src.core.form_engine import FormFillEngine
+
+    fill_engine = FormFillEngine(answers, jd_text=jd_text or None)
+
+    def _reload_answers() -> None:
+        nonlocal answers, fill_engine
+        answers = load_applicant_profile(
+            master,
+            yaml_snapshot=yaml_snapshot,
+            jd_text=jd_text or None,
+        )
+        fill_engine = FormFillEngine(answers, jd_text=jd_text or None)
+
+    def _ask_human(reason: str) -> bool:
+        from src.core.human_assist import is_mechanical_stuck_reason, try_human_unknown
+
+        # Resume upload / file-input stuck → Ace handles; never popup.
+        if is_mechanical_stuck_reason(reason):
+            if pdf.is_file():
+                force_upload_resume(page, pdf)
+            return False
+        ok = try_human_unknown(
+            page,
+            company=company,
+            job_url=job_url,
+            reason=reason,
+        )
+        if ok:
+            _reload_answers()
+            if _confirm_success(page):
+                return True
+        return ok
     owned = context is None
     handoff = False
     pw = None
@@ -716,20 +909,26 @@ def run_linkedin(
                     uploaded_once = True
 
             try:
-                _fill_step(page, answers=answers, pdf=pdf)
-            except PlaybookFallback as fill_exc:
-                if try_cdp_assist(cdp_assist, str(fill_exc)):
-                    try:
-                        _fill_step(page, answers=answers, pdf=pdf)
-                    except PlaybookFallback:
-                        raise
-                else:
-                    raise
+                _fill_step(page, answers=answers, pdf=pdf, engine=fill_engine)
             except Exception as exc:
                 reason = f"linkedin playbook: step fill failed ({exc})"
-                if try_cdp_assist(cdp_assist, reason):
+                if try_cdp_assist(cdp_assist, reason, page=page):
                     try:
-                        _fill_step(page, answers=answers, pdf=pdf)
+                        _fill_step(page, answers=answers, pdf=pdf, engine=fill_engine)
+                    except Exception as retry_exc:
+                        if _ask_human(str(retry_exc)):
+                            if _confirm_success(page):
+                                return True
+                            _fill_step(page, answers=answers, pdf=pdf, engine=fill_engine)
+                        else:
+                            raise PlaybookFallback(
+                                f"linkedin playbook: step fill failed ({retry_exc})"
+                            ) from retry_exc
+                elif _ask_human(reason):
+                    if _confirm_success(page):
+                        return True
+                    try:
+                        _fill_step(page, answers=answers, pdf=pdf, engine=fill_engine)
                     except Exception as retry_exc:
                         raise PlaybookFallback(
                             f"linkedin playbook: step fill failed ({retry_exc})"
@@ -737,36 +936,103 @@ def run_linkedin(
                 else:
                     raise PlaybookFallback(reason) from exc
 
+            # Education Month/Year already known in master/learned — if still red after
+            # one deterministic fill, ask human once and learn (don't spin scripts).
+            if _education_date_errors(page):
+                _fill_education_dates(page, answers)
+                page.wait_for_timeout(400)
+                if _education_date_errors(page):
+                    reason = (
+                        "Education dates still required — set From=August 2024, "
+                        "To=May 2027, check 'I currently attend this institution', "
+                        "then click OK so Ace can learn"
+                    )
+                    if _ask_human(reason):
+                        if _confirm_success(page):
+                            return True
+                        # _ask_human already reloaded learned answers
+                        miss_advance = 0
+                        continue
+
             # Prefer Submit → Review → Next so deep modals short-circuit when ready.
             action = _advance(page)
             if action == "submit":
-                page.wait_for_timeout(1200)
+                # Never submit with a LinkedIn library resume — force disk PDF first.
+                if pdf.is_file():
+                    if not uploaded_once or not _confirm_resume_upload(page, pdf):
+                        if force_upload_resume(page, pdf):
+                            uploaded_once = True
+                        elif not _confirm_resume_upload(page, pdf):
+                            raise PlaybookFallback(
+                                "linkedin playbook: disk resume not attached before Submit "
+                                f"({pdf.name}) — refusing library reuse"
+                            )
+                settle(page, timeout_ms=800)
                 if _confirm_success(page):
                     logger.info("LinkedIn Easy Apply success for %s", job_url[:160])
                     return True
-                logger.info(
-                    "LinkedIn submit clicked — counting success for %s",
+                # Banner can lag; wait once more — never count bare Submit as success.
+                settle(page, timeout_ms=1500)
+                if _confirm_success(page):
+                    logger.info("LinkedIn Easy Apply success for %s", job_url[:160])
+                    return True
+                logger.warning(
+                    "LinkedIn submit clicked but success not confirmed for %s",
                     job_url[:160],
                 )
-                return True
-            if action == "next" and _form_error_banner(page):
+                if _ask_human(
+                    "Submit clicked but LinkedIn did not confirm — finish if needed"
+                ):
+                    if _confirm_success(page):
+                        return True
                 raise PlaybookFallback(
-                    "linkedin playbook: error banner after Next — Gemini"
+                    "linkedin playbook: submit without success confirmation"
                 )
+            if action == "next" and _form_error_banner(page):
+                # Re-resolve required fields from profile via general engine.
+                _fill_via_engine(page, fill_engine)
+                page.wait_for_timeout(200)
+                if not _form_error_banner(page):
+                    miss_advance = 0
+                    continue
+                reason = "linkedin playbook: error banner after Next — unknown/invalid fields"
+                if try_cdp_assist(cdp_assist, reason, page=page):
+                    miss_advance = 0
+                    continue
+                if _ask_human(reason):
+                    if _confirm_success(page):
+                        return True
+                    miss_advance = 0
+                    continue
+                raise PlaybookFallback(reason)
             if action == "none":
                 miss_advance += 1
                 if miss_advance >= 2:
-                    reason = "linkedin playbook: Next/Review/Submit missing — Gemini"
-                    if try_cdp_assist(cdp_assist, reason):
+                    reason = "linkedin playbook: Next/Review/Submit missing — unknown step"
+                    if try_cdp_assist(cdp_assist, reason, page=page):
+                        miss_advance = 0
+                        continue
+                    if _ask_human(reason):
+                        if _confirm_success(page):
+                            return True
                         miss_advance = 0
                         continue
                     raise PlaybookFallback(reason)
             else:
                 miss_advance = 0
 
-        raise PlaybookFallback(
-            "linkedin playbook: too many steps without submit — Gemini"
-        )
+        reason = "linkedin playbook: too many steps without submit — need human"
+        if _ask_human(reason):
+            if _confirm_success(page):
+                return True
+            # One last fill+advance after human teaching.
+            try:
+                _fill_step(page, answers=answers, pdf=pdf, engine=fill_engine)
+            except Exception:
+                pass
+            if _advance(page) == "submit" or _confirm_success(page):
+                return True
+        raise PlaybookFallback(reason)
     except PlaywrightTimeout as exc:
         handoff = context is not None and page is not None
         raise_handoff(

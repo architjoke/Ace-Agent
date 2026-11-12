@@ -11,6 +11,7 @@ from src.playbooks import PlaybookFallback
 from src.playbooks._common import (
     launch_persistent_context,
     load_applicant_profile,
+    settle,
     success_text,
 )
 
@@ -106,16 +107,16 @@ def _start_apply(page) -> None:
         r"Begin",
     ):
         if _click_role(page, "button", re.compile(pat, re.I)):
-            page.wait_for_timeout(1000)
+            settle(page, timeout_ms=1200)
             return
         if _click_role(page, "link", re.compile(pat, re.I)):
-            page.wait_for_timeout(1000)
+            settle(page, timeout_ms=1200)
             return
         try:
             t = page.get_by_text(re.compile(pat, re.I))
             if t.count() and t.first.is_visible(timeout=1000):
                 t.first.click(timeout=5000)
-                page.wait_for_timeout(1000)
+                settle(page, timeout_ms=1200)
                 return
         except Exception:
             continue
@@ -127,7 +128,7 @@ def _wait_parser(page) -> None:
             state="visible", timeout=8000
         )
     except Exception:
-        page.wait_for_timeout(2500)
+        settle(page, timeout_ms=2500)
 
 
 def _fill_known_fields(page, fields: dict) -> None:
@@ -271,7 +272,7 @@ def run_workday(
 
         if not _upload_resume_aria(page, pdf):
             reason = "Workday playbook: Resume/CV upload control not found"
-            if try_cdp_assist(cdp_assist, reason) and _upload_resume_aria(page, pdf):
+            if try_cdp_assist(cdp_assist, reason, page=page) and _upload_resume_aria(page, pdf):
                 pass
             else:
                 raise PlaybookFallback(reason)
@@ -287,13 +288,13 @@ def run_workday(
 
             if _custom_unanswered(page):
                 reason = "Workday playbook: unanswered custom/required fields — Gemini"
-                if try_cdp_assist(cdp_assist, reason) and not _custom_unanswered(page):
+                if try_cdp_assist(cdp_assist, reason, page=page) and not _custom_unanswered(page):
                     pass
                 else:
                     raise PlaybookFallback(reason)
 
             action = _click_next_or_submit(page)
-            page.wait_for_timeout(1200)
+            settle(page, timeout_ms=1500)
 
             try:
                 body = page.inner_text("body") or ""
@@ -306,19 +307,20 @@ def run_workday(
                 return True
 
             if action == "submit":
-                page.wait_for_timeout(2000)
+                settle(page, timeout_ms=2500)
                 try:
                     body = page.inner_text("body") or ""
                 except Exception:
                     body = ""
                 if success_text(body):
                     return True
-                logger.info("Workday playbook submit clicked — counting success")
-                return True
+                raise PlaybookFallback(
+                    "Workday playbook: submit clicked without confirmation — Gemini"
+                )
 
             if action is None:
                 reason = "Workday playbook: Next/Submit control not found — Gemini"
-                if try_cdp_assist(cdp_assist, reason):
+                if try_cdp_assist(cdp_assist, reason, page=page):
                     continue
                 raise PlaybookFallback(reason)
 

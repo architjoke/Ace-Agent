@@ -18,6 +18,7 @@ from src.playbooks._common import (
     raise_if_cloudflare,
     resolve_pitch_short,
     success_text,
+    confirm_application_success,
     try_cdp_assist,
     wait_for_any,
 )
@@ -117,9 +118,11 @@ def run_wellfound(
             apply_btn.click(timeout=5000)
         except Exception as exc:
             reason = f"wellfound: Apply not clickable ({type(exc).__name__})"
-            if try_cdp_assist(cdp_assist, reason):
+            unblocked = try_cdp_assist(cdp_assist, reason, page=pg)
+            if unblocked and confirm_application_success(pg):
                 return True
-            raise PlaybookFallback(reason) from exc
+            if not unblocked:
+                raise PlaybookFallback(reason) from exc
 
         wait_for_any(
             pg,
@@ -190,8 +193,11 @@ def run_wellfound(
                 pass
             # Unknown custom question → CDP assist once, then handoff (keep warm session)
             reason = f"wellfound: custom question / send blocked (step {step})"
-            if try_cdp_assist(cdp_assist, reason):
+            unblocked = try_cdp_assist(cdp_assist, reason, page=pg)
+            if unblocked and confirm_application_success(pg):
                 return True
+            if unblocked:
+                continue
             raise PlaybookFallback(reason)
 
         raise PlaybookFallback("wellfound: too many steps")

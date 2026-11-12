@@ -150,7 +150,7 @@ def test_classify_google_forms_and_blocked_bridge():
 def test_triage_skips_internshala_in_jd(monkeypatch):
     from src.core import pipeline as pl
 
-    monkeypatch.setattr(pl, "has_applied", lambda *a, **k: False)
+    monkeypatch.setattr(pl, "should_suppress_apply", lambda *a, **k: False)
     monkeypatch.setattr(pl, "has_recent_company_role_apply", lambda *a, **k: False)
     job = {
         "company": "Jarvis",

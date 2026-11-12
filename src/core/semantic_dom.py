@@ -111,19 +111,72 @@ def plan_semantic_actions(
         }
         for e in elements
     ]
+    # Prioritize screening keys so truncation never drops CTC / education / notice.
+    _priority = (
+        "full_name",
+        "first_name",
+        "last_name",
+        "email",
+        "phone",
+        "linkedin",
+        "current_ctc_inr",
+        "expected_ctc_inr",
+        "years_of_experience",
+        "additional_months_of_experience",
+        "notice_period_days",
+        "portfolio_url",
+        "university_start_month",
+        "university_start_year",
+        "university_end_month",
+        "university_end_year",
+        "university_currently_attending",
+        "graduation_year",
+        "class_12_start_month",
+        "class_12_start_year",
+        "class_12_end_month",
+        "class_12_end_year",
+        "class_10_start_month",
+        "class_10_start_year",
+        "class_10_end_month",
+        "class_10_end_year",
+    )
+    try:
+        from src.core.learned_answers import merge_into_answers
+
+        answers = merge_into_answers(answers)
+    except Exception:
+        pass
+    ordered: dict[str, Any] = {}
+    for key in _priority:
+        if key in answers and answers[key] not in (None, ""):
+            ordered[key] = answers[key]
+    for key, value in (answers or {}).items():
+        if key in ordered or value in (None, ""):
+            continue
+        ordered[key] = value
     prompt = (
         "You plan Playwright actions for a job application form.\n"
         "Return ONLY a JSON array of actions. Allowed actions:\n"
         '{"action":"fill","id":N,"text":"..."}, '
         '{"action":"click","id":N}, '
         '{"action":"upload","id":N}\n'
+        "For <select> dropdowns, fill.text must be an exact visible option label "
+        "(e.g. years_of_experience '0', months '6') — never phone codes like +91.\n"
         "Fill ALL visible identity fields from ANSWERS in ONE list. "
         "Use upload once for the resume file input — NEVER click a saved/library "
         "resume card; always Upload/Replace from disk. "
+        "CTC fields with examples like 200000/350000: use current_ctc_inr / "
+        "expected_ctc_inr digits only (no ₹, commas, or 'per annum'). "
+        "Portfolio URL: use portfolio_url only — NEVER github. Leave blank if empty. "
+        "Experience year/month dropdowns: years_of_experience + "
+        "additional_months_of_experience. "
+        "Notice period in days: notice_period_days as a single integer (e.g. 7). "
+        "Education month/year dropdowns: university_start_month/year, "
+        "university_end_month/year (August/2024, May/2027, currently attending). "
         "Click Apply/Submit/Continue/Next only after fields are filled. "
         "Skip disabled elements. Do not invent facts.\n\n"
         f"RESUME_PATH: {resume_path}\n"
-        f"ANSWERS: {json.dumps(answers, ensure_ascii=False)[:2500]}\n"
+        f"ANSWERS: {json.dumps(ordered, ensure_ascii=False)[:3500]}\n"
         f"ELEMENTS: {json.dumps(slim, ensure_ascii=False)[:6000]}\n"
     )
     try:
@@ -182,10 +235,24 @@ def execute_semantic_actions(page, actions: list[dict[str, Any]], resume_path: s
             if loc.count() == 0:
                 continue
             if action == "fill":
-                loc.fill(str(step.get("text") or ""), timeout=5000)
+                text = str(step.get("text") or "")
+                try:
+                    tag = (loc.evaluate("el => (el.tagName || '').toLowerCase()") or "")
+                except Exception:
+                    tag = ""
+                if tag == "select":
+                    try:
+                        loc.select_option(label=text, timeout=5000)
+                    except Exception:
+                        loc.select_option(value=text, timeout=5000)
+                else:
+                    loc.fill(text, timeout=5000)
                 ran = True
             elif action == "click":
-                loc.click(timeout=5000)
+                try:
+                    loc.click(timeout=5000)
+                except Exception:
+                    loc.click(timeout=5000, force=True)
                 ran = True
                 page.wait_for_timeout(300)
             elif action == "upload" and pdf.is_file():
@@ -226,6 +293,7 @@ def page_blocked(page) -> bool:
 
 
 def _semantic_fill(page, job_url: str, pdf: Path, answers: dict) -> bool:
+    from src.core.form_engine import FormFillEngine
     from src.playbooks._common import force_upload_resume, goto_dom, success_text
 
     goto_dom(page, job_url)
@@ -234,13 +302,41 @@ def _semantic_fill(page, job_url: str, pdf: Path, answers: dict) -> bool:
     # Prefer fresh disk upload before planning clicks that might hit library cards.
     if pdf.is_file():
         force_upload_resume(page, pdf)
+
+    # Deterministic profile fill first — skip LLM when fields resolve from master.
+    engine_filled = 0
+    try:
+        stats = FormFillEngine(answers).fill_visible(page)
+        engine_filled = int(stats.get("filled") or 0)
+        if engine_filled:
+            logger.info("semantic DOM: FormFillEngine filled %s fields", engine_filled)
+    except Exception:
+        logger.debug("semantic DOM FormFillEngine pass failed", exc_info=True)
+
+    page.wait_for_timeout(400)
+    try:
+        body = page.inner_text("body") or ""
+    except Exception:
+        body = ""
+    if success_text(body):
+        logger.info("semantic DOM apply succeeded (engine) for %s", job_url[:160])
+        return True
+
     elements = extract_interactive(page)
     if len(elements) < 2:
-        logger.info("semantic DOM: too few elements (%s) — skip", len(elements))
+        logger.info(
+            "semantic DOM: too few elements (%s) after engine — skip LLM",
+            len(elements),
+        )
         return False
+
+    # Only spend an LLM plan when unknowns remain or engine filled nothing.
     actions = plan_semantic_actions(elements, answers=answers, resume_path=str(pdf))
     if not actions:
-        logger.info("semantic DOM: empty plan — skip")
+        logger.info(
+            "semantic DOM: empty LLM plan (engine_filled=%s) — skip",
+            engine_filled,
+        )
         return False
     execute_semantic_actions(page, actions, str(pdf))
     elements2 = extract_interactive(page)

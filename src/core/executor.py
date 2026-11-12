@@ -33,6 +33,9 @@ DEFAULT_TIMEOUT_SECONDS = int(os.environ.get("ACE_BROWSER_USE_TIMEOUT_SECONDS", 
 DEFAULT_MAX_STEPS = int(os.environ.get("ACE_BROWSER_USE_MAX_STEPS", "10"))
 WORKDAY_TIMEOUT_SECONDS = int(os.environ.get("ACE_WORKDAY_TIMEOUT_SECONDS", "300"))
 WORKDAY_MAX_STEPS = int(os.environ.get("ACE_WORKDAY_MAX_STEPS", "20"))
+# Multi-page LinkedIn Easy Apply (often 5–7 screens) needs a larger CDP budget.
+LINKEDIN_MAX_STEPS = int(os.environ.get("ACE_LINKEDIN_MAX_STEPS", "18"))
+LINKEDIN_TIMEOUT_SECONDS = int(os.environ.get("ACE_LINKEDIN_TIMEOUT_SECONDS", "240"))
 SUBMITTED_TOKEN = "APPLICATION_SUBMITTED"
 READY_TOKEN = "READY_FOR_REVIEW"  # legacy / dry-run only
 CLEANUP_TOKEN = "LINKEDIN_RESUME_DELETED"
@@ -78,6 +81,9 @@ def _is_heavy_ats(job_url: str) -> bool:
 
 def _step_budget(job_url: str) -> tuple[int, int]:
     """Return (max_steps, timeout_seconds) for this apply URL."""
+    url = (job_url or "").lower()
+    if "linkedin.com" in url:
+        return LINKEDIN_MAX_STEPS, LINKEDIN_TIMEOUT_SECONDS
     if _is_heavy_ats(job_url):
         return WORKDAY_MAX_STEPS, WORKDAY_TIMEOUT_SECONDS
     return DEFAULT_MAX_STEPS, DEFAULT_TIMEOUT_SECONDS
@@ -88,8 +94,8 @@ APPLY_RESUME_FILENAME = (
     os.environ.get("ACE_APPLY_RESUME_FILENAME") or "Ace_Agent_Resume.pdf"
 ).strip() or "Ace_Agent_Resume.pdf"
 
-# LinkedIn Job application settings → Resumes library
-LINKEDIN_RESUMES_URL = "https://www.linkedin.com/mypreferences/d/job-application-settings"
+# Start cleanup on Jobs; agent then clicks Preferences → Resumes and applications.
+LINKEDIN_RESUMES_URL = "https://www.linkedin.com/jobs/"
 
 # User's permanent LinkedIn resumes — NEVER delete these (substring match).
 # Set ACE_LINKEDIN_KEEP_RESUMES=Name1|Name2 (empty default = delete only the agent upload name).
@@ -157,6 +163,10 @@ class JobClosedError(RuntimeError):
 
 class RequiresHumanInterventionError(RuntimeError):
     """Playbook + CDP handoff failed — soft-fail without Manual_Action package."""
+
+
+class TokenLimitReachedError(RuntimeError):
+    """LLM / vision API quota exhausted — pause applies until quotas reset."""
 
 
 class WarmBrowserUnavailable(RuntimeError):
@@ -251,21 +261,19 @@ def _application_answers_block(
     answers = data.get("application_answers")
     if not isinstance(answers, dict) or not answers:
         return ""
+    from src.core.form_answers import answers_prompt_block
     from src.core.salary import inject_salary_answers
 
     answers = inject_salary_answers(
         answers, jd_text=jd_text, yaml_snapshot=yaml_snapshot
     )
-    lines = ["## APPLICATION FORM ANSWERS (authoritative — use these on the form)"]
-    for key, value in answers.items():
-        if value is None or value == "":
-            continue
-        lines.append(f"- {key}: {value}")
-    lines.append(
-        "- salary_rule: Always enter expected salary as INR per annum "
-        "(never monthly unless the field label forces monthly — then divide annual by 12)."
-    )
-    return "\n".join(lines)
+    try:
+        from src.core.learned_answers import merge_into_answers
+
+        answers = merge_into_answers(answers)
+    except Exception:
+        pass
+    return answers_prompt_block(answers)
 
 
 def unique_apply_pdf(pdf_path: Path | str, company: str = "") -> Path:
@@ -543,12 +551,28 @@ def _reached_token(history, token: str, *, pdf_stem: str = "") -> bool:
     if token == SUBMITTED_TOKEN:
         return _verified_auto_submit(history, pdf_stem)
     if token == CLEANUP_TOKEN:
-        blob = _history_blob(history)
-        return CLEANUP_TOKEN in blob or (
-            history.is_done()
-            and ("deleted" in blob.lower() or "removed" in blob.lower())
-            and (pdf_stem.lower() in blob.lower() if pdf_stem else True)
-        )
+        # Only the agent's final_result — task text also contains the token string.
+        try:
+            final = str(history.final_result() or "")
+        except Exception:
+            final = ""
+        if CLEANUP_TOKEN not in final:
+            return False
+        low = final.lower()
+        # Reject "could not delete" / failure narrations that echo the token.
+        if any(
+            n in low
+            for n in (
+                "could not",
+                "wasn't deleted",
+                "was not deleted",
+                "failed",
+                "not found/deleted",
+                "unable to",
+            )
+        ):
+            return False
+        return True
     blob = _history_blob(history)
     if token in blob:
         if pdf_stem and not _resume_upload_verified(blob, pdf_stem):
@@ -843,10 +867,14 @@ async def _run_agent(
                     task, file_paths, profile=profile, stuck=stuck
                 )
                 agent_ref["agent"] = agent
-        # Exhausted retries — do not crash the warm worker; yield for next job.
+        # Exhausted retries — pause applies; do not keep burning the batch.
         detail = f"{type(last_capacity).__name__}: {last_capacity}" if last_capacity else "unknown"
-        raise ApplicationTimeoutError(
-            f"requires_human_api_error: Gemini capacity exhausted after 3 attempts ({detail[:400]})"
+        from src.core.llm_router import mark_token_limit_reached
+
+        mark_token_limit_reached(detail[:400])
+        raise TokenLimitReachedError(
+            f"TOKEN LIMIT REACHED — pausing applies until quotas reset "
+            f"(Gemini capacity exhausted after 3 attempts: {detail[:400]})"
         ) from last_capacity
     finally:
         try:
@@ -860,12 +888,37 @@ async def _run_agent(
             await _detach_agent(agent)
 
 
+async def _linkedin_cleanup_safe(
+    pdf_path: Path | str,
+    *,
+    job_url: str,
+    user_data_dir: Path | str | None = None,
+    reason: str = "",
+) -> None:
+    """Best-effort delete of ACE_APPLY_RESUME_FILENAME after a LinkedIn apply."""
+    if "linkedin.com" not in (job_url or "").lower():
+        return
+    try:
+        ok = await cleanup_linkedin_uploaded_resume(
+            pdf_path, user_data_dir=user_data_dir
+        )
+        logger.info(
+            "LinkedIn resume cleanup %s (%s)",
+            "ok" if ok else "unconfirmed",
+            reason or "post-apply",
+        )
+    except Exception:
+        logger.exception(
+            "LinkedIn resume cleanup failed (%s)", reason or "post-apply"
+        )
+
+
 async def cleanup_linkedin_uploaded_resume(
     pdf_path: Path | str,
     *,
     user_data_dir: Path | str | None = None,
 ) -> bool:
-    """Delete the agent upload PDF from LinkedIn Jobs → Preferences → Resumes."""
+    """Delete agent upload via Jobs → Preferences → Resumes and applications."""
     if pdf_path:
         Path(pdf_path).expanduser().resolve()
     keep = _keep_resume_names()
@@ -886,8 +939,8 @@ async def cleanup_linkedin_uploaded_resume(
         history = await _run_agent(
             task,
             [],
-            max_steps=12,
-            timeout_seconds=180,
+            max_steps=24,
+            timeout_seconds=300,
             user_data_dir=user_data_dir,
         )
     except TimeoutError:
@@ -920,13 +973,114 @@ def _loop_usable(loop) -> bool:
         return False
 
 
-def make_cdp_assist(loop, session_factory):
+def _try_click_submit_application(page) -> bool:
+    """Click LinkedIn Easy Apply Submit (or Review→Submit). Returns True on success UI."""
+    if page is None:
+        return False
+    import re
+
+    from src.playbooks._common import success_text
+
+    submit_re = re.compile(r"^Submit( application)?$", re.I)
+    review_re = re.compile(r"^Review$", re.I)
+    for pattern in (submit_re, review_re):
+        try:
+            btn = page.get_by_role("button", name=pattern).first
+            if btn.count() == 0 or not btn.is_visible(timeout=800):
+                continue
+            try:
+                btn.click(timeout=5000)
+            except Exception:
+                btn.click(timeout=5000, force=True)
+            page.wait_for_timeout(450)
+            if pattern is review_re:
+                # After Review, Submit should appear — click it too.
+                try:
+                    sub = page.get_by_role("button", name=submit_re).first
+                    if sub.count() and sub.is_visible(timeout=600):
+                        try:
+                            sub.click(timeout=3000)
+                        except Exception:
+                            sub.click(timeout=3000, force=True)
+                        page.wait_for_timeout(450)
+                except Exception:
+                    pass
+            break
+        except Exception:
+            continue
+    try:
+        body = page.inner_text("body", timeout=900) or ""
+    except Exception:
+        body = ""
+    lower = body.lower()
+    if success_text(body):
+        return True
+    return any(
+        m in lower
+        for m in (
+            "application sent",
+            "your application was sent",
+            "application submitted",
+        )
+    )
+
+
+async def _try_finish_easy_apply_submit(
+    user_data_dir: Path | str | None,
+    *,
+    job_url: str,
+    pdf_path: Path | str | None = None,
+) -> bool:
+    """Last-chance Submit on warm LinkedIn modal; else human popup + learn."""
+    if not user_data_dir or "linkedin.com" not in (job_url or "").lower():
+        return False
+
+    def _sync() -> bool:
+        try:
+            from src.core.browser_warmup import get_or_create_slot
+            from src.core.human_assist import (
+                form_looks_submitted,
+                resolve_unknown_with_human,
+            )
+
+            slot = get_or_create_slot(user_data_dir)
+            page = getattr(slot, "page", None)
+            if page is None:
+                return False
+            if _try_click_submit_application(page):
+                return True
+            if form_looks_submitted(page):
+                return True
+            helped = resolve_unknown_with_human(
+                page,
+                company="",
+                job_url=job_url,
+                reason="Reached Review/final page — click Submit application, then OK",
+            )
+            if not helped:
+                return False
+            if form_looks_submitted(page):
+                return True
+            return _try_click_submit_application(page)
+        except Exception:
+            logger.debug("easy-apply submit salvage failed", exc_info=True)
+            return False
+
+    return bool(await asyncio.to_thread(_sync))
+
+
+def make_cdp_assist(loop, session_factory, *, job_url: str = ""):
     """Sync bridge: playbook thread → asyncio CDP assist on the worker's loop.
 
     Playwright runs in ``asyncio.to_thread``; Gemini assist must be scheduled onto
     the *same* worker event loop captured before the thread started — never
     ``asyncio.run`` / a new loop inside the sync playbook.
     """
+    url = (job_url or "").lower()
+    # LinkedIn Easy Apply gets a longer assist budget (dialog intercept / multi-page).
+    assist_steps = 6 if "linkedin.com" in url else 2
+    assist_timeout = 120.0 if "linkedin.com" in url else 60.0
+    fut_wait = 150 if "linkedin.com" in url else 90
 
     def cdp_assist(reason: str) -> bool:
         if not _loop_usable(loop):
@@ -935,14 +1089,19 @@ def make_cdp_assist(loop, session_factory):
         session = session_factory()
         try:
             fut = asyncio.run_coroutine_threadsafe(
-                _execute_cdp_assist(session, reason, max_steps=2),
+                _execute_cdp_assist(
+                    session,
+                    reason,
+                    max_steps=assist_steps,
+                    timeout_sec=assist_timeout,
+                ),
                 loop,
             )
         except Exception:
             logger.debug("cdp_assist schedule failed", exc_info=True)
             return False
         try:
-            return bool(fut.result(timeout=90))
+            return bool(fut.result(timeout=fut_wait))
         except TimeoutError:
             fut.cancel()
             logger.debug("cdp_assist timed out — cancelled")
@@ -984,7 +1143,6 @@ _ATS_KINDS = frozenset(
         "aggregator",
         "google_forms",
         "career_site",
-        "mailto",
     }
 )
 
@@ -1030,37 +1188,9 @@ def _playbook_runner(kind: str):
         from src.playbooks.google_forms import run_google_forms as run
     elif kind == "career_site":
         from src.playbooks.career_site import run_career_site as run
-    elif kind == "mailto":
-        return _run_mailto_kind
     else:
         return None
     return run
-
-
-def _run_mailto_kind(
-    job_url: str,
-    pdf_path: Path,
-    master_path: Path,
-    *,
-    user_data_dir: Path | str | None = None,
-    yaml_snapshot: str | None = None,
-    company: str = "",
-    job_title: str = "",
-    jd_text: str = "",
-    **_kwargs,
-) -> bool:
-    from src.core.mailto_apply import send_mailto_application
-
-    return bool(
-        send_mailto_application(
-            mailto_url=job_url,
-            company=company or "Company",
-            job_title=job_title or "",
-            jd_text=jd_text or "",
-            pdf_path=pdf_path,
-            yaml_snapshot=yaml_snapshot or "",
-        )
-    )
 
 
 async def _warm_ats_apply(
@@ -1201,7 +1331,9 @@ async def _warm_ats_apply(
                         playwright=local_slot.playwright,
                     )
 
-                local["cdp_assist"] = make_cdp_assist(assist_loop, _session_factory)
+                local["cdp_assist"] = make_cdp_assist(
+                    assist_loop, _session_factory, job_url=job_url
+                )
 
             try:
                 with time_stage("playbook_execution_ms", kind=kind, warm=True):
@@ -1291,7 +1423,6 @@ async def _run_ats_playbook(
     *,
     user_data_dir: Path | str | None = None,
     yaml_snapshot: str | None = None,
-    loop=None,
 ) -> bool:
     """Dispatch playbook (owned cold launch when no warm slot / no user_data_dir)."""
     from src.core.telemetry import time_stage
@@ -1350,12 +1481,18 @@ async def _execute_cdp_assist(
                 browser_profile=_browser_profile_cdp(cdp_url),
                 teardown=False,
             )
+        except TokenLimitReachedError as exc:
+            logger.warning(
+                "CDP assist yielding after TOKEN LIMIT REACHED: %s", exc
+            )
+            return False
         except RequiresHumanInterventionError:
             return False
         except ApplicationTimeoutError as exc:
-            if "requires_human_api_error" in str(exc):
+            if "requires_human_api_error" in str(exc) or "TOKEN LIMIT" in str(exc):
                 logger.warning(
-                    "CDP assist yielding after Gemini API capacity: %s", exc
+                    "CDP assist yielding after Gemini API capacity / token limit: %s",
+                    exc,
                 )
             return False
         except RuntimeError as exc:
@@ -1381,6 +1518,7 @@ async def _execute_cdp_handoff(
     *,
     yaml_snapshot: str | None = None,
     jd_text: str | None = None,
+    cleanup_linkedin_resume: bool = False,
 ) -> bool:
     """Inject Gemini into the open playbook Chromium via CDP; always close session."""
     from src.core.browser_warmup import invalidate_slot
@@ -1410,6 +1548,21 @@ async def _execute_cdp_handoff(
             raise RequiresHumanInterventionError(
                 f"No live CDP endpoint for handoff: {reason}"
             )
+
+        # Prefer deterministic disk upload before Gemini so library resumes are not reused.
+        page = getattr(session, "page", None)
+        if page is not None and Path(pdf_path).is_file():
+            try:
+                from src.playbooks._common import force_upload_resume
+
+                uploaded = await asyncio.to_thread(force_upload_resume, page, pdf_path)
+                logger.info(
+                    "CDP handoff pre-upload %s for %s",
+                    "ok" if uploaded else "miss",
+                    Path(pdf_path).name,
+                )
+            except Exception:
+                logger.debug("CDP handoff pre-upload failed", exc_info=True)
 
         form_answers = _application_answers_block(
             master_path, jd_text=jd_text, yaml_snapshot=yaml_snapshot
@@ -1441,20 +1594,89 @@ async def _execute_cdp_handoff(
                 browser_profile=_browser_profile_cdp(cdp_url),
                 teardown=False,
             )
+        hist_blob = _history_blob(history) if history is not None else ""
         if _reached_token(history, SUBMITTED_TOKEN, pdf_stem=pdf_stem):
             logger.info("CDP handoff verified %s for %s", SUBMITTED_TOKEN, job_url[:160])
             succeeded = True
+            if cleanup_linkedin_resume:
+                await _linkedin_cleanup_safe(
+                    pdf_path,
+                    job_url=job_url,
+                    user_data_dir=getattr(session, "user_data_dir", None),
+                    reason="cdp_handoff_success",
+                )
             return True
+        # Playbook / pre-upload already attached the disk PDF — trust LinkedIn
+        # confirmation copy even when Gemini history has no upload_file event.
+        if SUBMITTED_TOKEN in hist_blob and _submit_confirmed(hist_blob):
+            logger.info(
+                "CDP handoff accepting LinkedIn submit confirm without CDP upload event for %s",
+                job_url[:160],
+            )
+            succeeded = True
+            if cleanup_linkedin_resume:
+                await _linkedin_cleanup_safe(
+                    pdf_path,
+                    job_url=job_url,
+                    user_data_dir=getattr(session, "user_data_dir", None),
+                    reason="cdp_handoff_submit_confirm",
+                )
+            return True
+        # Gemini stuck on unknown fields — popup so human can finish + Ace learns.
+        page = getattr(session, "page", None)
+        if page is not None:
+            from src.core.human_assist import (
+                form_looks_submitted,
+                resolve_unknown_with_human,
+            )
+
+            helped = await asyncio.to_thread(
+                resolve_unknown_with_human,
+                page,
+                company="",
+                job_url=job_url,
+                reason=f"CDP handoff incomplete: {reason}",
+            )
+            page_ok = False
+            if helped:
+                try:
+                    page_ok = bool(await asyncio.to_thread(form_looks_submitted, page))
+                except Exception:
+                    page_ok = False
+            if helped and (
+                page_ok
+                or _submit_confirmed(hist_blob)
+                or SUBMITTED_TOKEN in hist_blob
+            ):
+                logger.info(
+                    "Human finished apply after CDP handoff for %s", job_url[:160]
+                )
+                succeeded = True
+                if cleanup_linkedin_resume:
+                    await _linkedin_cleanup_safe(
+                        pdf_path,
+                        job_url=job_url,
+                        user_data_dir=getattr(session, "user_data_dir", None),
+                        reason="human_unknown_success",
+                    )
+                return True
         raise RequiresHumanInterventionError(
             f"CDP handoff did not verify submit after: {reason}"
         )
     except RequiresHumanInterventionError:
         raise
+    except TokenLimitReachedError:
+        raise
     except ApplicationTimeoutError as exc:
         # Clean yield — warm Chromium stays owned by session teardown below;
         # worker moves to the next job without crashing the slot.
-        if "requires_human_api_error" in str(exc):
-            raise RequiresHumanInterventionError("requires_human_api_error") from exc
+        if "requires_human_api_error" in str(exc) or "TOKEN LIMIT" in str(exc):
+            from src.core.llm_router import mark_token_limit_reached
+
+            mark_token_limit_reached(str(exc))
+            raise TokenLimitReachedError(
+                f"TOKEN LIMIT REACHED — pausing applies until quotas reset ({exc})"
+            ) from exc
         raise RequiresHumanInterventionError(
             f"CDP handoff timed out: {exc}"
         ) from exc
@@ -1567,6 +1789,13 @@ async def execute_application(
                 )
                 if ok:
                     logger.info("Warm ATS playbook succeeded for %s", job_url)
+                    if do_cleanup:
+                        await _linkedin_cleanup_safe(
+                            pdf_path,
+                            job_url=job_url,
+                            user_data_dir=user_data_dir,
+                            reason="warm_success",
+                        )
                     return True
             except AlreadyAppliedError:
                 raise
@@ -1596,6 +1825,7 @@ async def execute_application(
                     master_path,
                     yaml_snapshot=yaml_snapshot,
                     jd_text=jd_text,
+                    cleanup_linkedin_resume=do_cleanup,
                 )
             except WarmBrowserUnavailable:
                 # No live Chromium — skip zombie CDP attach; cold-launch same profile.
@@ -1609,6 +1839,11 @@ async def execute_application(
                         f"FAILED_EXTERNAL_LOAD: {exc}"
                     ) from exc
                 logger.warning("Warm playbook miss → fallback (%s)", exc)
+            except (
+                TokenLimitReachedError,
+                RequiresHumanInterventionError,
+            ):
+                raise
             except Exception:
                 logger.exception("Warm ATS path crashed — falling back")
 
@@ -1641,6 +1876,13 @@ async def execute_application(
                         yaml_snapshot=yaml_snapshot,
                     )
                     if ok:
+                        if do_cleanup:
+                            await _linkedin_cleanup_safe(
+                                pdf_path,
+                                job_url=job_url,
+                                user_data_dir=user_data_dir,
+                                reason="cold_playbook_success",
+                            )
                         return True
                 except PlaybookHandoff as handoff:
                     if is_portal_load_failure(handoff.reason) or _handoff_should_skip_cdp(
@@ -1657,12 +1899,29 @@ async def execute_application(
                         master_path,
                         yaml_snapshot=yaml_snapshot,
                         jd_text=jd_text,
+                        cleanup_linkedin_resume=do_cleanup,
                     )
-                except (TimeoutError, PlaybookFallback, Exception):
+                except (
+                    AlreadyAppliedError,
+                    JobClosedError,
+                    ApplicationBlockedError,
+                    ExternalPortalLoadError,
+                    TokenLimitReachedError,
+                    RequiresHumanInterventionError,
+                ):
+                    raise
+                except Exception:
                     logger.warning("Cold playbook path failed — continuing", exc_info=True)
 
-        # Cold semantic only when no warm profile (warm path already tried on-page).
+        # Cold semantic only when no warm profile and quotas are still alive.
         if do_submit and not user_data_dir:
+            from src.core.llm_router import token_limit_detail, token_limit_reached
+
+            if token_limit_reached():
+                raise TokenLimitReachedError(
+                    f"TOKEN LIMIT REACHED — pausing applies until quotas reset "
+                    f"({token_limit_detail()})"
+                )
             try:
                 from src.core.semantic_dom import try_semantic_apply
 
@@ -1675,9 +1934,24 @@ async def execute_application(
                 )
                 if semantic_ok:
                     logger.info("Semantic DOM apply succeeded for %s", job_url[:160])
+                    if do_cleanup:
+                        await _linkedin_cleanup_safe(
+                            pdf_path,
+                            job_url=job_url,
+                            user_data_dir=user_data_dir,
+                            reason="cold_semantic_success",
+                        )
                     return True
             except Exception:
                 logger.exception("Semantic DOM apply crashed — continuing to Gemini")
+
+        from src.core.llm_router import token_limit_detail, token_limit_reached
+
+        if token_limit_reached():
+            raise TokenLimitReachedError(
+                f"TOKEN LIMIT REACHED — pausing applies until quotas reset "
+                f"({token_limit_detail()})"
+            )
 
         return await _execute_with_browser_use(
             job_url,
@@ -1816,10 +2090,100 @@ async def _execute_with_browser_use(
                 browser_profile=None,
                 teardown=True,
             )
+
+        if _reached_token(history, win_token, pdf_stem=pdf_stem):
+            logger.info("Verified %s for %s (resume=%s)", win_token, job_url, pdf_stem)
+            if do_submit and do_cleanup:
+                await _linkedin_cleanup_safe(
+                    pdf_path,
+                    job_url=job_url,
+                    user_data_dir=user_data_dir,
+                    reason="vision_success",
+                )
+            return True
+
+        # Lumenci-class miss: agent reaches Review then burns budget / 503 before Submit.
+        # Must run before slot reset in finally.
+        if do_submit and await _try_finish_easy_apply_submit(
+            user_data_dir, job_url=job_url, pdf_path=pdf_path
+        ):
+            logger.info(
+                "Salvaged LinkedIn Submit after vision miss for %s", job_url[:160]
+            )
+            if do_cleanup:
+                await _linkedin_cleanup_safe(
+                    pdf_path,
+                    job_url=job_url,
+                    user_data_dir=user_data_dir,
+                    reason="review_submit_salvage",
+                )
+            return True
+
+        _raise_if_blocked(history)
+
+        blob = _history_blob(history)
+        if do_submit and SUBMITTED_TOKEN in blob and not _resume_upload_verified(
+            blob, pdf_stem
+        ):
+            raise RuntimeError(
+                "Agent claimed submit but fresh resume upload was NOT verified. "
+                "Treat as failed apply — do not count SUCCESS."
+            )
+
+        success = history.is_successful() if history is not None else None
+        final = history.final_result() if history is not None else None
+        # Oracle/TriNet desert page etc. — skip quietly, never Manual_Action.
+        try:
+            from src.core.job_closed import text_shows_job_closed
+
+            if text_shows_job_closed(f"{final or ''}\n{blob}"):
+                raise JobClosedError(
+                    f"Job closed/unavailable (agent reported): {str(final or blob)[:240]}"
+                )
+        except JobClosedError:
+            raise
+        except Exception:
+            logger.debug("job-closed text check failed", exc_info=True)
+        raise RuntimeError(
+            f"browser-use agent finished without verified {win_token}. "
+            f"is_done={history.is_done() if history else None}, "
+            f"is_successful={success}, final={final!r}"
+        )
     except TimeoutError as exc:
+        if do_submit and await _try_finish_easy_apply_submit(
+            user_data_dir, job_url=job_url, pdf_path=pdf_path
+        ):
+            logger.info(
+                "Salvaged LinkedIn Submit after vision timeout for %s", job_url[:160]
+            )
+            if do_cleanup:
+                await _linkedin_cleanup_safe(
+                    pdf_path,
+                    job_url=job_url,
+                    user_data_dir=user_data_dir,
+                    reason="timeout_submit_salvage",
+                )
+            return True
         raise ApplicationTimeoutError(
             f"browser-use agent timed out after {timeout_sec}s on {job_url}"
         ) from exc
+    except ApplicationTimeoutError:
+        if do_submit and await _try_finish_easy_apply_submit(
+            user_data_dir, job_url=job_url, pdf_path=pdf_path
+        ):
+            logger.info(
+                "Salvaged LinkedIn Submit after capacity/timeout for %s",
+                job_url[:160],
+            )
+            if do_cleanup:
+                await _linkedin_cleanup_safe(
+                    pdf_path,
+                    job_url=job_url,
+                    user_data_dir=user_data_dir,
+                    reason="capacity_submit_salvage",
+                )
+            return True
+        raise
     finally:
         if used_cdp and user_data_dir and env_truthy("ACE_BROWSER_KEEP_ALIVE", "1"):
             try:
@@ -1828,35 +2192,3 @@ async def _execute_with_browser_use(
                 await asyncio.to_thread(get_or_create_slot(user_data_dir).reset)
             except Exception:
                 logger.debug("slot reset after vision CDP failed", exc_info=True)
-
-    if _reached_token(history, win_token, pdf_stem=pdf_stem):
-        logger.info("Verified %s for %s (resume=%s)", win_token, job_url, pdf_stem)
-        if do_submit and do_cleanup and "linkedin.com" in job_url.lower():
-            try:
-                await cleanup_linkedin_uploaded_resume(
-                    pdf_path, user_data_dir=user_data_dir
-                )
-            except Exception:
-                logger.exception(
-                    "Post-apply LinkedIn resume cleanup failed for %s", pdf_path.name
-                )
-        return True
-
-    _raise_if_blocked(history)
-
-    blob = _history_blob(history)
-    if do_submit and SUBMITTED_TOKEN in blob and not _resume_upload_verified(
-        blob, pdf_stem
-    ):
-        raise RuntimeError(
-            "Agent claimed submit but fresh resume upload was NOT verified. "
-            "Treat as failed apply — do not count SUCCESS."
-        )
-
-    success = history.is_successful() if history is not None else None
-    final = history.final_result() if history is not None else None
-    raise RuntimeError(
-        f"browser-use agent finished without verified {win_token}. "
-        f"is_done={history.is_done() if history else None}, "
-        f"is_successful={success}, final={final!r}"
-    )

@@ -11,10 +11,12 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from src.playbooks import PlaybookFallback
 from src.playbooks._common import (
     close_context_safe,
+    fill_ats_form,
     force_upload_resume,
     goto_dom,
     launch_persistent_context,
     load_applicant_profile,
+    settle,
     success_text,
 )
 
@@ -143,7 +145,20 @@ def run_career_site(
             page.wait_for_load_state("domcontentloaded", timeout=8000)
         except Exception:
             pass
-        page.wait_for_timeout(1100)
+        settle(page, timeout_ms=1200)
+        # Oracle HCM / TriNet: "This job is no longer available." → skip, no Manual_Action.
+        try:
+            from src.core.job_closed import page_shows_job_closed
+            from src.core.executor import JobClosedError
+
+            if page_shows_job_closed(page):
+                raise JobClosedError(
+                    f"Career-site job closed/unavailable at {target[:160]}"
+                )
+        except JobClosedError:
+            raise
+        except Exception:
+            logger.debug("career_site closed-job probe failed", exc_info=True)
 
         def _dismiss_cookies(root) -> None:
             try:
@@ -190,7 +205,7 @@ def run_career_site(
                     if loc.count() and loc.is_visible(timeout=1200):
                         loc.scroll_into_view_if_needed(timeout=1500)
                         loc.click(timeout=4500, force=True)
-                        page.wait_for_timeout(1100)
+                        settle(page, timeout_ms=1200)
                         return True
                 except Exception:
                     continue
@@ -214,7 +229,7 @@ def run_career_site(
                     break
             if not clicked:
                 # One more settle pass — Zoho/Eightfold hydrate CTAs late.
-                page.wait_for_timeout(1800)
+                settle(page, timeout_ms=2000)
                 for root in _roots():
                     if _form_visible(root) or _click_apply(root):
                         clicked = True
@@ -228,93 +243,31 @@ def run_career_site(
                 if any(
                     n in body_l
                     for n in (
+                        "this job is no longer available",
+                        "job is no longer available",
+                        "no longer accepting",
+                        "no longer available",
+                    )
+                ):
+                    from src.core.executor import JobClosedError
+
+                    raise JobClosedError(
+                        f"Career-site job closed/unavailable at {target[:160]}"
+                    )
+                if any(
+                    n in body_l
+                    for n in (
                         "sign in to apply",
                         "log in to apply",
                         "login to apply",
                         "create an account",
-                        "job is no longer available",
-                        "no longer accepting",
                     )
                 ):
-                    _fail("career_site: Apply gated (login/closed) — needs manual")
+                    _fail("career_site: Apply gated (login) — needs manual")
                 _fail("career_site: Apply CTA not found")
 
-        def _hint(el) -> str:
-            parts: list[str] = []
-            for attr in ("aria-label", "placeholder", "name", "id", "autocomplete"):
-                try:
-                    parts.append(str(el.get_attribute(attr) or ""))
-                except Exception:
-                    pass
-            try:
-                parts.append(
-                    str(
-                        el.evaluate(
-                            "e => (e.closest('label,div,li,tr')||e.parentElement||e)"
-                            ".innerText||''"
-                        )
-                        or ""
-                    )[:180]
-                )
-            except Exception:
-                pass
-            return " ".join(parts).lower()
-
-        filled = 0
-        for root in _roots():
-            try:
-                fields = root.locator(
-                    "input[type='text'], input[type='email'], input[type='tel'], "
-                    "input:not([type]), textarea"
-                )
-                n = min(fields.count(), 30)
-            except Exception:
-                continue
-            for i in range(n):
-                if time.monotonic() - started > _BUDGET_S:
-                    break
-                el = fields.nth(i)
-                try:
-                    if not el.is_visible(timeout=350):
-                        continue
-                except Exception:
-                    continue
-                hint = _hint(el)
-                value = ""
-                if any(k in hint for k in ("email", "e-mail")):
-                    value = answers.get("email") or ""
-                elif any(k in hint for k in ("phone", "mobile", "tel", "whatsapp")):
-                    value = answers.get("phone") or ""
-                elif any(k in hint for k in ("first name", "given name", "firstname")):
-                    value = answers.get("first_name") or ""
-                elif any(k in hint for k in ("last name", "surname", "family", "lastname")):
-                    value = answers.get("last_name") or ""
-                elif any(k in hint for k in ("full name", "your name", "candidate name")) or (
-                    "name" in hint and "user" not in hint and "file" not in hint
-                ):
-                    value = answers.get("full_name") or ""
-                elif any(
-                    k in hint for k in ("city", "location", "address", "current location")
-                ):
-                    value = answers.get("location") or ""
-                elif any(
-                    k in hint
-                    for k in ("linkedin", "portfolio", "github", "website", "url")
-                ):
-                    value = (
-                        answers.get("linkedin_url")
-                        or answers.get("portfolio_url")
-                        or answers.get("github_url")
-                        or ""
-                    )
-                if not value:
-                    continue
-                try:
-                    el.click(timeout=600)
-                    el.fill(str(value), timeout=2000)
-                    filled += 1
-                except Exception:
-                    continue
+        stats = fill_ats_form(page, profile=answers, max_pages=2)
+        filled = int(stats.get("filled") or 0)
 
         if pdf.is_file():
             try:
@@ -323,16 +276,23 @@ def run_career_site(
                 logger.debug("career_site resume upload miss", exc_info=True)
 
         from src.core.human_assist import (
+            ensure_captcha_cleared,
+            learn_from_page,
             page_shows_captcha,
-            resolve_captcha_with_human,
+            snapshot_filled_fields,
         )
 
         if page_shows_captcha(page):
-            # Pause for human solve instead of hard-failing the apply.
-            if not resolve_captcha_with_human(
-                page, company=company, job_url=job_url
-            ):
-                _fail("career_site: captcha gate — human did not clear in time")
+            before = snapshot_filled_fields(page)
+            ensure_captcha_cleared(
+                page, company=company, job_url=job_url, site="career_site"
+            )
+            try:
+                learn_from_page(
+                    page, company=company, job_url=job_url, before=before
+                )
+            except Exception:
+                logger.debug("career_site learn after captcha failed", exc_info=True)
 
         submitted = False
         for root in _roots():
@@ -358,7 +318,7 @@ def run_career_site(
         if not submitted:
             _fail("career_site: Submit/Apply not clickable")
 
-        page.wait_for_timeout(1600)
+        settle(page, timeout_ms=2000)
         try:
             body = page.inner_text("body", timeout=3000) or ""
         except Exception:
@@ -372,16 +332,22 @@ def run_career_site(
                 "thank you for applying",
             )
         ):
-            if not resolve_captcha_with_human(
-                page, company=company, job_url=job_url
-            ):
-                _fail("career_site: captcha still present after submit")
+            before = snapshot_filled_fields(page)
+            ensure_captcha_cleared(
+                page, company=company, job_url=job_url, site="career_site"
+            )
+            try:
+                learn_from_page(
+                    page, company=company, job_url=job_url, before=before
+                )
+            except Exception:
+                logger.debug("career_site learn after post-submit captcha failed", exc_info=True)
             # Operator cleared captcha — try submit once more.
             try:
                 page.locator("button, input[type='submit']").filter(
                     has_text=re.compile(r"submit|apply|send", re.I)
                 ).first.click(timeout=4000)
-                page.wait_for_timeout(1200)
+                settle(page, timeout_ms=1500)
                 body = page.inner_text("body", timeout=3000) or ""
                 body_l = body.lower()
             except Exception:
@@ -399,14 +365,10 @@ def run_career_site(
         ):
             logger.info("Career-site submit success for %s", job_url[:160])
             return True
-        if filled >= 2 and submitted and not page_shows_captcha(page):
-            logger.info(
-                "Career-site submitted (%s fields) — counting success %s",
-                filled,
-                job_url[:160],
-            )
-            return True
-        _fail(f"career_site: no confirmation after submit (filled={filled})")
+        _fail(
+            f"career_site: no confirmation after submit "
+            f"(filled={filled}, submitted={submitted})"
+        )
     finally:
         if owned:
             close_context_safe(context, user_data_dir=user_data_dir)

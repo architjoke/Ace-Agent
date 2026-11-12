@@ -158,10 +158,19 @@ def inject_salary_answers(
         if jd_text:
             legacy = resolve_expected_ctc(answers=out, jd_text=jd_text)
             if legacy and legacy != default_expected_ctc():
-                out["expected_ctc"] = legacy
-                out["salary_expectation"] = legacy
-                out.setdefault("expected_salary", legacy)
+                digits = re.sub(r"[^\d]", "", legacy.split("–")[0].split("-")[0]) or ""
+                if len(digits) >= 5:
+                    out["expected_ctc"] = digits
+                    out["expected_ctc_inr"] = digits
+                    out["salary_expectation"] = digits
+                    out["expected_salary"] = digits
+                else:
+                    out["expected_ctc"] = legacy
+                    out["salary_expectation"] = legacy
+                    out.setdefault("expected_salary", legacy)
+                out["expected_ctc_display"] = legacy
                 out.setdefault("expected_ctc_per_annum", legacy)
+                out.setdefault("current_ctc_inr", str(out.get("current_ctc_inr") or "0"))
                 return out
         comp = {}
 
@@ -170,11 +179,20 @@ def inject_salary_answers(
         field_format="ANNUAL",
         field_kind="CTC",
     )
+    annual = int(decision.annual_inr)
+    digits = str(annual)
     ctc = f"₹{decision.display} per annum"
-    out["expected_ctc"] = ctc
-    out["salary_expectation"] = ctc
-    out["expected_salary"] = ctc
+    # LinkedIn/ATS numeric CTC boxes (Example: 350000, often max 20 chars).
+    out["expected_ctc_inr"] = digits
+    out["expected_ctc_digits"] = digits
+    out["salary_annual_inr"] = annual
+    out.setdefault("current_ctc_inr", str(out.get("current_ctc_inr") or "0"))
+    out.setdefault("current_ctc_digits", out["current_ctc_inr"])
+    # Keep a human display form, but prefer digits when the field example is numeric.
+    out["expected_ctc_display"] = ctc
+    out["expected_ctc"] = digits
+    out["salary_expectation"] = digits
+    out["expected_salary"] = digits
     out["expected_ctc_per_annum"] = ctc
-    out["salary_annual_inr"] = decision.annual_inr
     out["salary_rationale"] = decision.rationale
     return out

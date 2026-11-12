@@ -15,6 +15,7 @@ _CLOSED_RE = re.compile(
     r"("
     r"does\s+not\s+exist|"
     r"page\s+does\s+not\s+exist|"
+    r"this\s+job\s+is\s+no\s+longer\s+available|"  # Oracle HCM / TriNet desert page
     r"job\s+(is\s+)?(no\s+longer\s+available|not\s+available|closed|expired|removed)|"
     r"this\s+(job|position|posting|role)\s+(has\s+been\s+)?(closed|filled|removed|expired)|"
     r"no\s+longer\s+accepting\s+applications|"
@@ -29,6 +30,33 @@ _CLOSED_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Soft CTA alone is not enough; require a closed headline nearby.
+_CLOSED_HEADLINE_RE = re.compile(
+    r"("
+    r"this\s+job\s+is\s+no\s+longer\s+available|"
+    r"job\s+(is\s+)?(no\s+longer\s+available|not\s+available|closed|expired|removed)|"
+    r"no\s+longer\s+accepting\s+applications|"
+    r"position\s+has\s+been\s+filled|"
+    r"job\s+not\s+found|page\s+not\s+found|"
+    r"does\s+not\s+exist"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def text_shows_job_closed(text: str) -> bool:
+    """True when agent/page text clearly says the posting is gone (skip, no Manual_Action)."""
+    raw = text or ""
+    if not raw.strip():
+        return False
+    if _CLOSED_HEADLINE_RE.search(raw):
+        return True
+    # Oracle desert page: headline + VIEW ALL JOBS
+    low = raw.lower()
+    if "no longer available" in low and "view all jobs" in low:
+        return True
+    return bool(_CLOSED_RE.search(raw) and len(raw) < 6000)
+
 
 def page_shows_job_closed(page) -> bool:
     """True when the loaded page clearly indicates the job is gone/closed."""
@@ -36,7 +64,7 @@ def page_shows_job_closed(page) -> bool:
         title = (page.title() or "").strip()
     except Exception:
         title = ""
-    if _CLOSED_RE.search(title):
+    if text_shows_job_closed(title):
         return True
     try:
         body = page.locator("main, [role='main'], body").first.inner_text(timeout=2000)
@@ -45,15 +73,7 @@ def page_shows_job_closed(page) -> bool:
             body = page.content()
         except Exception:
             body = ""
-    text = f"{title}\n{body or ''}"
-    if _CLOSED_RE.search(text):
-        if len(text) < 6000 or re.search(
-            r"does\s+not\s+exist|404|no\s+longer\s+available|job\s+closed",
-            text,
-            re.I,
-        ):
-            return True
-    return False
+    return text_shows_job_closed(f"{title}\n{body or ''}")
 
 
 def probe_on_page(page, job_url: str, *, timeout_ms: int = 15_000) -> JobProbeResult:

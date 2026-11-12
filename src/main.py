@@ -20,7 +20,7 @@ REPO_ROOT = PROJECT_ROOT
 load_dotenv(ENV_FILE)
 
 from src.core.discovery import pick_apply_url
-from src.core.memory import has_applied
+from src.core.memory import should_suppress_apply
 from src.core.pipeline import apply_job, run_parallel, tailor_job, triage_job
 from src.core.settings import get_settings
 
@@ -37,7 +37,7 @@ async def process_job(job, master_yaml: Path, master_text: str, min_fit: int) ->
         job_url = pick_apply_url(job)
         if not job_url or not str(job.get("description") or "").strip():
             return "failed"
-        if has_applied(job_url):
+        if should_suppress_apply(job_url):
             return "skipped"
         return "dropped"
 

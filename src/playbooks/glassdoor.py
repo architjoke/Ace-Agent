@@ -19,6 +19,7 @@ from src.playbooks._common import (
     raise_if_cloudflare,
     resolve_pitch_short,
     success_text,
+    confirm_application_success,
     try_cdp_assist,
     wait_for_any,
 )
@@ -130,9 +131,11 @@ def run_glassdoor(
             easy.click(timeout=5000)
         except Exception as exc:
             reason = f"glassdoor: no Easy Apply / Apply Now ({type(exc).__name__})"
-            if try_cdp_assist(cdp_assist, reason):
+            unblocked = try_cdp_assist(cdp_assist, reason, page=pg)
+            if unblocked and confirm_application_success(pg):
                 return True
-            raise PlaybookFallback(reason) from exc
+            if not unblocked:
+                raise PlaybookFallback(reason) from exc
 
         wait_for_any(
             pg,
@@ -203,7 +206,7 @@ def run_glassdoor(
                     continue
             if not advanced:
                 reason = f"glassdoor: stuck step {step}"
-                if try_cdp_assist(cdp_assist, reason):
+                if try_cdp_assist(cdp_assist, reason, page=pg):
                     force_upload_resume(pg, pdf)
                     continue
                 raise PlaybookFallback(reason)

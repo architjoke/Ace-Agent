@@ -5,8 +5,15 @@
 # application_answers: browser/ATS form fill (ignored by RenderCV resume render).
 
 application_answers:
+  # Narrative prefs (never typed into digit-only boxes):
   notice_period: "7 to 14 days"
   earliest_join_date: "Within 7–14 days of offer acceptance"
+  # Form-safe integers / digits (FormFillEngine reads these):
+  notice_period_days: "7"
+  current_ctc_inr: "0"
+  expected_ctc_inr: "650000"
+  years_of_experience: "0"
+  additional_months_of_experience: "6"
   phone_e164: "+91XXXXXXXXXX"
   phone_display: "+91 XXXXXXXXXX"
   phone_national: "XXXXXXXXXX"
@@ -20,6 +27,17 @@ application_answers:
   require_visa_sponsorship_india: "No"
   willing_to_relocate_india: "Yes"
   preferred_work_mode: "Remote, hybrid, or on-site"
+  # Eligibility prefs for yes/no screening (not employer Q→A):
+  open_to_internship_months: "6"
+  can_commit_hours_per_day: "8"
+  has_ai_llm_projects: "Yes"
+  portfolio_url: ""
+  university_start_month: "August"
+  university_start_year: "2024"
+  university_end_month: "May"
+  university_end_year: "2027"
+  university_currently_attending: "Yes"
+  graduation_year: "2027"
   expected_ctc: "₹6,00,000 – ₹7,00,000 per annum"
   salary_expectation: "₹6,00,000 – ₹7,00,000 per annum"
   how_did_you_hear: "LinkedIn"

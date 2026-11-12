@@ -1,4 +1,4 @@
-"""Google Forms apply — fill identity fields, upload resume, submit."""
+"""Google Forms apply — FormFillEngine fill, upload resume, submit."""
 
 from __future__ import annotations
 
@@ -10,10 +10,13 @@ from pathlib import Path
 from src.playbooks import PlaybookFallback
 from src.playbooks._common import (
     close_context_safe,
+    confirm_application_success,
+    fill_ats_form,
     force_upload_resume,
     goto_dom,
     launch_persistent_context,
     load_applicant_profile,
+    settle,
     success_text,
 )
 
@@ -41,7 +44,7 @@ def run_google_forms(
     cdp_assist=None,
     **kwargs,
 ) -> bool:
-    """Fill a Google Form application and submit. No CDP handoff on hard miss."""
+    """Fill a Google Form application and submit via shared FormFillEngine."""
     _ = kwargs
     _ = cdp_assist
     pdf = Path(pdf_path).expanduser().resolve()
@@ -72,71 +75,15 @@ def run_google_forms(
                 f"google_forms: not a Google Form URL ({(page.url or job_url)[:160]})"
             )
 
-        # Text inputs / textareas — map by nearby label / aria / placeholder.
-        filled = 0
-        try:
-            fields = page.locator(
-                "input[type='text'], input[type='email'], input[type='tel'], "
-                "input:not([type]), textarea"
-            )
-            n = min(fields.count(), 24)
-        except Exception:
-            n = 0
-
-        def _hint(el) -> str:
-            parts = []
-            for attr in ("aria-label", "placeholder", "name", "autocomplete"):
-                try:
-                    parts.append(str(el.get_attribute(attr) or ""))
-                except Exception:
-                    pass
-            try:
-                parts.append(str(el.evaluate(
-                    "e => (e.closest('div[role=listitem]')||e.parentElement||e)"
-                    ".innerText||''"
-                ) or "")[:200])
-            except Exception:
-                pass
-            return " ".join(parts).lower()
-
-        for i in range(n):
-            if time.monotonic() - started > _BUDGET_S:
-                break
-            el = fields.nth(i)
-            try:
-                if not el.is_visible(timeout=400):
-                    continue
-            except Exception:
-                continue
-            hint = _hint(el)
-            value = ""
-            if any(k in hint for k in ("email", "e-mail")):
-                value = answers.get("email") or ""
-            elif any(k in hint for k in ("phone", "mobile", "tel")):
-                value = answers.get("phone") or ""
-            elif any(k in hint for k in ("first name", "given name")):
-                value = answers.get("first_name") or ""
-            elif any(k in hint for k in ("last name", "surname", "family name")):
-                value = answers.get("last_name") or ""
-            elif any(k in hint for k in ("full name", "your name", "name")):
-                value = answers.get("full_name") or ""
-            elif any(k in hint for k in ("location", "city", "address")):
-                value = answers.get("location") or ""
-            elif any(k in hint for k in ("linkedin", "portfolio", "github", "url", "website")):
-                value = (
-                    answers.get("linkedin_url")
-                    or answers.get("portfolio_url")
-                    or answers.get("github_url")
-                    or ""
-                )
-            if not value:
-                continue
-            try:
-                el.click(timeout=800)
-                el.fill(str(value), timeout=2000)
-                filled += 1
-            except Exception:
-                continue
+        stats = fill_ats_form(
+            page,
+            profile=answers,
+            yaml_snapshot=yaml_snapshot,
+            max_pages=3,
+        )
+        filled = int(stats.get("filled") or 0)
+        if time.monotonic() - started > _BUDGET_S:
+            raise PlaybookFallback("google_forms: budget exceeded during fill")
 
         if pdf.is_file():
             try:
@@ -144,7 +91,6 @@ def run_google_forms(
             except Exception:
                 logger.debug("google_forms resume upload miss", exc_info=True)
 
-        # Submit
         submitted = False
         try:
             btn = page.get_by_role("button", name=_SUBMIT).first
@@ -164,31 +110,28 @@ def run_google_forms(
                     f"google_forms: Submit not clickable ({type(exc).__name__})"
                 ) from exc
 
-        page.wait_for_timeout(1500)
+        settle(page, timeout_ms=2000)
         try:
             body = page.inner_text("body", timeout=3000) or ""
         except Exception:
             body = ""
-        if success_text(body) or any(
-            m in body.lower()
-            for m in (
-                "your response has been recorded",
-                "response has been recorded",
-                "thanks for",
-                "thank you",
+        if (
+            confirm_application_success(page)
+            or success_text(body)
+            or any(
+                m in body.lower()
+                for m in (
+                    "your response has been recorded",
+                    "response has been recorded",
+                    "thanks for",
+                    "thank you",
+                )
             )
         ):
             logger.info("Google Forms submit success for %s", job_url[:160])
             return True
-        if filled >= 2 and submitted:
-            logger.info(
-                "Google Forms submitted (%s fields) — counting success %s",
-                filled,
-                job_url[:160],
-            )
-            return True
         raise PlaybookFallback(
-            f"google_forms: no confirmation after submit (filled={filled})"
+            f"google_forms: no confirmation after submit (filled={filled}, submitted={submitted})"
         )
     finally:
         if owned:

@@ -15,6 +15,7 @@ from src.playbooks._common import (
     goto_dom,
     launch_persistent_context,
     load_applicant_profile,
+    settle,
     success_text,
     try_cdp_assist,
 )
@@ -222,28 +223,34 @@ def run_indeed(
             raise JobClosedError(f"Indeed job closed/missing at {job_url[:160]}")
 
         if _amazon_or_hard_captcha(page):
-            from src.core.executor import ApplicationBlockedError
+            from src.core.human_assist import ensure_captcha_cleared
 
-            raise ApplicationBlockedError(
-                "indeed playbook: hard bot/captcha wall on job page"
+            ensure_captcha_cleared(
+                page,
+                company=str(kwargs.get("company") or "Indeed"),
+                job_url=job_url,
+                site="indeed",
             )
 
         _dismiss_cookies(page)
         _click_apply(page)
-        page.wait_for_timeout(1000)
+        settle(page, timeout_ms=1200)
 
         if _amazon_or_hard_captcha(page):
-            from src.core.executor import ApplicationBlockedError
+            from src.core.human_assist import ensure_captcha_cleared
 
-            raise ApplicationBlockedError(
-                "indeed playbook: hard bot/captcha wall after Apply"
+            ensure_captcha_cleared(
+                page,
+                company=str(kwargs.get("company") or "Indeed"),
+                job_url=job_url,
+                site="indeed",
             )
 
         # Soft Apply often needs Edit (beside CV on review) → upload other resume.
         uploaded = force_upload_resume(page, pdf)
         if not uploaded:
             reason = "indeed playbook: resume upload failed"
-            if try_cdp_assist(cdp_assist, reason):
+            if try_cdp_assist(cdp_assist, reason, page=page):
                 uploaded = force_upload_resume(page, pdf)
             if not uploaded:
                 raise PlaybookFallback(reason)
@@ -263,19 +270,18 @@ def run_indeed(
             action = _advance(page)
             if action == "submit":
                 _wait_preparing_review(page, timeout_s=25.0)
-                page.wait_for_timeout(1000)
+                settle(page, timeout_ms=1500)
                 if _confirm_success(page):
                     logger.info("Indeed Soft Apply success for %s", job_url[:160])
                     return True
-                logger.info(
-                    "Indeed submit clicked — counting success for %s", job_url[:160]
+                raise PlaybookFallback(
+                    f"indeed playbook: submit clicked without confirmation for {job_url}"
                 )
-                return True
             if action == "none":
                 miss += 1
                 if miss >= 2:
                     reason = "indeed playbook: Continue/Submit missing — Gemini"
-                    if try_cdp_assist(cdp_assist, reason):
+                    if try_cdp_assist(cdp_assist, reason, page=page):
                         miss = 0
                         continue
                     raise PlaybookFallback(reason)

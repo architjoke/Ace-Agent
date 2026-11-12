@@ -52,11 +52,12 @@ data/browser_profile/
 data/browser_profile_w*/
 data/lessons_learned.md
 data/master.yaml
-data/master_profile.yaml
+data/learned_form_answers.yaml
 # Keep templates / placeholders tracked:
 !data/.gitkeep
 !data/master.yaml.example
 !data/lessons_learned.md.example
+!data/learned_form_answers.yaml.example
 
 # ── Personal resumes / media (users supply their own) ────────────
 resumes/**

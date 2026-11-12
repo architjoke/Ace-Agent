@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 from typing import Any
 from urllib.parse import quote_plus, urljoin, urlparse
 
@@ -112,6 +111,42 @@ def _std_frame(rows: list[dict[str, Any]], *, track: str | None) -> pd.DataFrame
     return df
 
 
+def _scrape_jobdrop_site(
+    site: str,
+    keywords: str,
+    *,
+    location: str,
+    max_results: int,
+    track: str | None,
+    country_indeed: str,
+    proxies: list | None,
+) -> pd.DataFrame:
+    """In-process Jobdrop scrape for a single site (used inside child workers)."""
+    try:
+        from jobdrop import scrape_jobs
+    except ImportError:
+        logger.warning("jobdrop not installed — skip WWR/Wellfound/HiringCafe discovery")
+        return _empty()
+    kwargs: dict[str, Any] = {
+        "site_name": [site],
+        "search_term": keywords,
+        "location": location,
+        "results_wanted": max_results,
+        "country_indeed": country_indeed,
+        "is_remote": True,
+        "verbose": 0,
+    }
+    if proxies:
+        kwargs["proxies"] = proxies
+    jobs = scrape_jobs(**kwargs)
+    if jobs is None or getattr(jobs, "empty", True):
+        return _empty()
+    if track:
+        jobs = jobs.copy()
+        jobs["track"] = track
+    return jobs.reset_index(drop=True)
+
+
 def fetch_jobdrop_jobs(
     keywords: str,
     *,
@@ -121,14 +156,9 @@ def fetch_jobdrop_jobs(
     sites: list[str] | None = None,
     country_indeed: str = "India",
     per_site_timeout_s: float = 35.0,
+    isolate_sites: bool = True,
 ) -> pd.DataFrame:
-    """Scrape Jobdrop boards one site at a time (timeout-isolated, no Camoufox stall)."""
-    try:
-        from jobdrop import scrape_jobs
-    except ImportError:
-        logger.warning("jobdrop not installed — skip WWR/Wellfound/HiringCafe discovery")
-        return _empty()
-
+    """Scrape Jobdrop boards one site at a time (process-isolated when requested)."""
     wanted = sites or jobdrop_sites_for_hunt()
     site_names = [s for s in wanted if s in JOBDROP_SITES]
     if not _env_truthy("ACE_JOBDROP_ALLOW_CAMOUFOX", "0") and not _camoufox_cached():
@@ -147,39 +177,19 @@ def fetch_jobdrop_jobs(
 
     frames: list[pd.DataFrame] = []
 
-    def _one(site: str) -> pd.DataFrame:
-        kwargs: dict[str, Any] = {
-            "site_name": [site],
-            "search_term": keywords,
-            "location": location,
-            "results_wanted": max_results,
-            "country_indeed": country_indeed,
-            "is_remote": True,
-            "verbose": 0,
-        }
-        if proxies:
-            kwargs["proxies"] = proxies
-        jobs = scrape_jobs(**kwargs)
-        if jobs is None or getattr(jobs, "empty", True):
-            return _empty()
-        if track:
-            jobs = jobs.copy()
-            jobs["track"] = track
-        return jobs.reset_index(drop=True)
-
-    # Isolate each site so one hung scraper cannot block the hunt cycle.
-    with ThreadPoolExecutor(max_workers=1) as pool:
+    # Child workers call with isolate_sites=False to scrape in-process.
+    if not isolate_sites:
         for site in site_names:
-            fut = pool.submit(_one, site)
             try:
-                frame = fut.result(timeout=max(10.0, float(per_site_timeout_s)))
-            except FuturesTimeout:
-                logger.warning(
-                    "Jobdrop site=%s timed out after %.0fs — skipping",
+                frame = _scrape_jobdrop_site(
                     site,
-                    per_site_timeout_s,
+                    keywords,
+                    location=location,
+                    max_results=max_results,
+                    track=track,
+                    country_indeed=country_indeed,
+                    proxies=proxies,
                 )
-                continue
             except Exception:
                 logger.exception("jobdrop scrape failed site=%s", site)
                 continue
@@ -191,6 +201,64 @@ def fetch_jobdrop_jobs(
                     len(frame),
                     track or "custom",
                 )
+        if not frames:
+            return _empty()
+        out = pd.concat(frames, ignore_index=True)
+        if "job_url" in out.columns:
+            out = out.drop_duplicates(subset=["job_url"], keep="first")
+        return out.reset_index(drop=True)
+
+    from src.core.discovery_runners import (
+        jobdrop_site_timeout_s,
+        records_to_frame,
+        run_parallel_deadlines,
+    )
+
+    site_timeout = max(10.0, float(per_site_timeout_s or jobdrop_site_timeout_s()))
+    jobs = [
+        (
+            "jobdrop_site",
+            {
+                "site": site,
+                "keywords": keywords,
+                "location": location,
+                "max_results": max_results,
+                "track": track,
+                "country_indeed": country_indeed,
+                "per_site_timeout_s": site_timeout,
+            },
+            site_timeout,
+            f"jobdrop:{site}",
+        )
+        for site in site_names
+    ]
+    for result in run_parallel_deadlines(
+        jobs, overall_timeout_s=site_timeout * max(1, len(site_names)) + 5.0
+    ):
+        if result.timed_out:
+            logger.warning(
+                "Jobdrop site=%s timed out after %.0fs — skipping",
+                result.label,
+                site_timeout,
+            )
+            continue
+        if not result.ok:
+            if result.error:
+                logger.warning(
+                    "jobdrop scrape failed %s: %s",
+                    result.label,
+                    (result.error or "")[:240],
+                )
+            continue
+        frame = records_to_frame(result.records)
+        if frame is not None and not frame.empty:
+            frames.append(frame)
+            logger.info(
+                "Jobdrop site=%s returned %s jobs track=%s",
+                result.label,
+                len(frame),
+                track or "custom",
+            )
 
     if not frames:
         return _empty()
@@ -348,56 +416,62 @@ def fetch_extra_jobs_by_track(
     location: str = "India",
     max_results_per_track: int = 8,
     country_indeed: str = "India",
+    overall_deadline_s: float | None = None,
 ) -> pd.DataFrame:
-    """Parallel Jobdrop + Himalayas + YC discovery across tracks."""
+    """Process-isolated Jobdrop + Himalayas + YC discovery across tracks."""
+    from src.core.discovery_runners import (
+        extra_timeout_s,
+        jobdrop_site_timeout_s,
+        records_to_frame,
+        run_parallel_deadlines,
+    )
+
+    site_timeout = jobdrop_site_timeout_s()
+    # One process per track covering Jobdrop+Himalayas+YC (killable as a unit).
+    per_track_timeout = max(
+        30.0,
+        site_timeout * max(1, len(jobdrop_sites_for_hunt())) + 40.0,
+    )
+    jobs = [
+        (
+            "extra_track",
+            {
+                "keywords": query,
+                "location": location,
+                "max_results": max_results_per_track,
+                "country_indeed": country_indeed,
+                "track": track,
+                "per_site_timeout_s": site_timeout,
+            },
+            per_track_timeout,
+            f"extra:{track}",
+        )
+        for track, query in queries.items()
+    ]
+    wall = float(
+        overall_deadline_s
+        if overall_deadline_s is not None
+        else max(extra_timeout_s(), per_track_timeout)
+    )
     frames: list[pd.DataFrame] = []
-
-    def _one(track: str, query: str) -> list[pd.DataFrame]:
-        out: list[pd.DataFrame] = []
-        try:
-            out.append(
-                fetch_jobdrop_jobs(
-                    query,
-                    location=location,
-                    max_results=max_results_per_track,
-                    track=track,
-                    country_indeed=country_indeed,
-                    sites=jobdrop_sites_for_hunt(),
-                    per_site_timeout_s=float(
-                        os.environ.get("ACE_JOBDROP_SITE_TIMEOUT_S", "35") or 35
-                    ),
-                )
+    for result in run_parallel_deadlines(jobs, overall_timeout_s=wall):
+        if result.timed_out:
+            logger.warning(
+                "Extra discovery %s timed out — continuing with partial results",
+                result.label,
             )
-        except Exception:
-            logger.exception("Jobdrop track %s failed", track)
-        try:
-            out.append(
-                fetch_himalayas_jobs(
-                    query, max_results=max(3, max_results_per_track // 2), track=track
+            continue
+        if not result.ok:
+            if result.error:
+                logger.warning(
+                    "Extra discovery %s failed: %s",
+                    result.label,
+                    (result.error or "")[:240],
                 )
-            )
-        except Exception:
-            logger.exception("Himalayas track %s failed", track)
-        try:
-            out.append(
-                fetch_yc_waas_jobs(
-                    query, max_results=max(3, max_results_per_track // 2), track=track
-                )
-            )
-        except Exception:
-            logger.exception("YC track %s failed", track)
-        return out
-
-    max_workers = max(1, min(3, len(queries)))
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futs = {pool.submit(_one, t, q): t for t, q in queries.items()}
-        for fut in as_completed(futs):
-            try:
-                for frame in fut.result():
-                    if frame is not None and not frame.empty:
-                        frames.append(frame)
-            except Exception:
-                logger.exception("Extra discovery track failed")
+            continue
+        frame = records_to_frame(result.records)
+        if frame is not None and not frame.empty:
+            frames.append(frame)
 
     if not frames:
         return _empty()

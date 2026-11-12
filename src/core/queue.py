@@ -5,9 +5,11 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.core.host_limiter import host_bucket_key, spacing_interval_for
 from src.core.memory import _connect, init_db
 
 logger = logging.getLogger(__name__)
@@ -15,12 +17,44 @@ logger = logging.getLogger(__name__)
 QUEUE_STATUSES = frozenset({"READY", "CLAIMED", "DONE", "CANCELLED"})
 _RECLAIM_RE = re.compile(r"(?:^|;)\s*reclaim=(\d+)\s*(?:;|$)", re.I)
 
+# Soft safety cap — eligibility is host-aware across this window, not a fixed peek of 25.
+CLAIM_SCAN_LIMIT_DEFAULT = 500
+# Legacy name kept for imports; eligibility no longer stops at 25.
+CLAIM_PEEK_LIMIT = CLAIM_SCAN_LIMIT_DEFAULT
+WAIT_SENTINEL_KEY = "__wait__"
+
+
+def claim_scan_limit() -> int:
+    raw = (os.environ.get("ACE_CLAIM_SCAN_LIMIT") or str(CLAIM_SCAN_LIMIT_DEFAULT)).strip()
+    try:
+        return max(50, int(raw))
+    except ValueError:
+        return CLAIM_SCAN_LIMIT_DEFAULT
+
 
 def _ensure_queue_columns(conn) -> None:
     rows = conn.execute("PRAGMA table_info(apply_queue)").fetchall()
     cols = {str(r["name"] if hasattr(r, "keys") else r[1]) for r in rows}
     if "job_title" not in cols:
         conn.execute("ALTER TABLE apply_queue ADD COLUMN job_title TEXT")
+    if "attempt_count" not in cols:
+        conn.execute(
+            "ALTER TABLE apply_queue ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
+        )
+    if "host_key" not in cols:
+        conn.execute("ALTER TABLE apply_queue ADD COLUMN host_key TEXT")
+
+
+def _ensure_host_schedule(conn) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS host_schedule (
+            host_key TEXT PRIMARY KEY,
+            next_eligible_at REAL NOT NULL DEFAULT 0,
+            jitter_sec REAL NOT NULL DEFAULT 0
+        )
+        """
+    )
 
 
 def init_queue(db_path: Path | None = None) -> Path:
@@ -41,15 +75,31 @@ def init_queue(db_path: Path | None = None) -> Path:
                 error_log TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                job_title TEXT
+                job_title TEXT,
+                host_key TEXT
             )
             """
         )
         _ensure_queue_columns(conn)
+        _ensure_host_schedule(conn)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_apply_queue_status "
             "ON apply_queue(status, id)"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_apply_queue_host "
+            "ON apply_queue(status, host_key, id)"
+        )
+        # Backfill missing host_key for older READY/CLAIMED rows.
+        rows = conn.execute(
+            "SELECT id, job_url FROM apply_queue "
+            "WHERE host_key IS NULL OR host_key = ''"
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                "UPDATE apply_queue SET host_key=? WHERE id=?",
+                (host_bucket_key(str(row["job_url"] or "")), int(row["id"])),
+            )
         conn.commit()
     return path
 
@@ -74,15 +124,18 @@ def enqueue_apply(
     url = (job_url or "").strip()
     ts = _now()
     title = (job_title or "").strip()
+    hkey = host_bucket_key(url)
     with _connect(db_path) as conn:
         _ensure_queue_columns(conn)
+        _ensure_host_schedule(conn)
         conn.execute(
             """
             INSERT INTO apply_queue (
                 company, job_url, track, jd_text, pdf_path, yaml_snapshot,
-                status, worker_id, error_log, created_at, updated_at, job_title
+                status, worker_id, error_log, created_at, updated_at, job_title,
+                host_key
             )
-            VALUES (?, ?, ?, ?, ?, ?, 'READY', NULL, '', ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 'READY', NULL, '', ?, ?, ?, ?)
             ON CONFLICT(job_url) DO UPDATE SET
                 company=excluded.company,
                 track=excluded.track,
@@ -90,6 +143,7 @@ def enqueue_apply(
                 pdf_path=excluded.pdf_path,
                 yaml_snapshot=excluded.yaml_snapshot,
                 job_title=COALESCE(NULLIF(excluded.job_title, ''), apply_queue.job_title),
+                host_key=excluded.host_key,
                 status='READY',
                 worker_id=NULL,
                 error_log='',
@@ -106,6 +160,7 @@ def enqueue_apply(
                 ts,
                 ts,
                 title,
+                hkey,
             ),
         )
         row = conn.execute(
@@ -115,8 +170,52 @@ def enqueue_apply(
     return int(row["id"]) if row else 0
 
 
-CLAIM_PEEK_LIMIT = 25
-WAIT_SENTINEL_KEY = "__wait__"
+def _schedule_ready_in(conn, host_key: str, *, now: float) -> float:
+    row = conn.execute(
+        "SELECT next_eligible_at FROM host_schedule WHERE host_key = ?",
+        (host_key,),
+    ).fetchone()
+    if not row:
+        return 0.0
+    try:
+        nxt = float(row["next_eligible_at"] or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, nxt - now)
+
+
+def _reserve_host(conn, host_key: str, *, now: float) -> float:
+    """Upsert next_eligible_at for host_key. Returns interval used."""
+    interval = spacing_interval_for(host_key)
+    nxt = float(now) + interval
+    conn.execute(
+        """
+        INSERT INTO host_schedule (host_key, next_eligible_at, jitter_sec)
+        VALUES (?, ?, ?)
+        ON CONFLICT(host_key) DO UPDATE SET
+            next_eligible_at=excluded.next_eligible_at,
+            jitter_sec=excluded.jitter_sec
+        """,
+        (host_key, nxt, interval),
+    )
+    return interval
+
+
+def reserve_host(
+    host_key: str,
+    *,
+    db_path: Path | None = None,
+    now: float | None = None,
+) -> float:
+    """Public helper: reserve host spacing (tests / dual-write)."""
+    init_queue(db_path)
+    t = float(now if now is not None else time.time())
+    key = (host_key or "default").strip() or "default"
+    with _connect(db_path) as conn:
+        _ensure_host_schedule(conn)
+        interval = _reserve_host(conn, key, now=t)
+        conn.commit()
+    return interval
 
 
 def claim_next(
@@ -124,18 +223,23 @@ def claim_next(
     db_path: Path | None = None,
     *,
     host_limiter: object | None = None,
+    now: float | None = None,
 ) -> dict | None:
-    """Atomically claim a READY row, preferring hosts that are off cooldown.
+    """Claim the oldest READY row whose host is off cooldown (durable schedule).
 
-    When ``host_limiter`` is set and every peeked READY host is cooling down,
-    returns ``{"__wait__": seconds}`` without claiming a row so workers can
-    sleep and retry (domain interleaving).
+    Scans up to ``ACE_CLAIM_SCAN_LIMIT`` READY rows (default 500) so a free host
+    beyond a cooling prefix is still claimed. When every scanned host is cooling,
+    returns ``{"__wait__": seconds}`` without claiming.
     """
     init_queue(db_path)
     ts = _now()
     wid = (worker_id or "w").strip() or "w"
+    clock = float(now if now is not None else time.time())
+    scan = claim_scan_limit()
     with _connect(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
+        _ensure_queue_columns(conn)
+        _ensure_host_schedule(conn)
         rows = conn.execute(
             """
             SELECT * FROM apply_queue
@@ -143,7 +247,7 @@ def claim_next(
             ORDER BY id ASC
             LIMIT ?
             """,
-            (CLAIM_PEEK_LIMIT,),
+            (scan,),
         ).fetchall()
         if not rows:
             conn.commit()
@@ -151,38 +255,62 @@ def claim_next(
 
         pick = None
         best_wait: float | None = None
-        if host_limiter is None:
-            pick = rows[0]
-        else:
-            ready_in = getattr(host_limiter, "ready_in", None)
-            if not callable(ready_in):
-                pick = rows[0]
-            else:
-                for row in rows:
-                    wait = float(ready_in(str(row["job_url"] or "")) or 0.0)
-                    if wait <= 0:
-                        pick = row
-                        break
-                    best_wait = wait if best_wait is None else min(best_wait, wait)
-                if pick is None:
-                    conn.commit()
-                    return {WAIT_SENTINEL_KEY: float(best_wait if best_wait is not None else 1.0)}
+        ready_in_mem = getattr(host_limiter, "ready_in", None) if host_limiter else None
 
+        for row in rows:
+            hkey = str(row["host_key"] or "").strip() or host_bucket_key(
+                str(row["job_url"] or "")
+            )
+            wait_sched = _schedule_ready_in(conn, hkey, now=clock)
+            wait_mem = 0.0
+            if callable(ready_in_mem):
+                try:
+                    wait_mem = float(ready_in_mem(str(row["job_url"] or "")) or 0.0)
+                except Exception:
+                    wait_mem = 0.0
+            wait = max(wait_sched, wait_mem)
+            if wait <= 0:
+                pick = row
+                break
+            best_wait = wait if best_wait is None else min(best_wait, wait)
+
+        if pick is None:
+            conn.commit()
+            return {
+                WAIT_SENTINEL_KEY: float(
+                    best_wait if best_wait is not None else 1.0
+                )
+            }
+
+        hkey = str(pick["host_key"] or "").strip() or host_bucket_key(
+            str(pick["job_url"] or "")
+        )
         conn.execute(
             """
             UPDATE apply_queue
-            SET status='CLAIMED', worker_id=?, updated_at=?
+            SET status='CLAIMED', worker_id=?, updated_at=?, host_key=?
             WHERE id=? AND status='READY'
             """,
-            (wid, ts, pick["id"]),
+            (wid, ts, hkey, pick["id"]),
         )
         if conn.total_changes == 0:
             conn.commit()
             return None
+        _reserve_host(conn, hkey, now=clock)
         conn.commit()
         claimed = conn.execute(
             "SELECT * FROM apply_queue WHERE id = ?", (pick["id"],)
         ).fetchone()
+
+    # Keep optional in-memory limiter in sync for callers that still pass it.
+    if host_limiter is not None and claimed is not None:
+        mark = getattr(host_limiter, "mark_dispatched", None)
+        if callable(mark):
+            try:
+                mark(str(claimed["job_url"] or ""))
+            except Exception:
+                logger.debug("host_limiter.mark_dispatched sync failed", exc_info=True)
+
     return dict(claimed) if claimed else None
 
 
@@ -209,21 +337,83 @@ def requeue_claimed(
     queue_id: int,
     *,
     error_log: str = "circuit_cooldown",
+    bump_attempt: bool = False,
     db_path: Path | None = None,
 ) -> bool:
-    """Return a CLAIMED row to READY (ban-armor circuit / pacing pause)."""
+    """Return a CLAIMED row to READY (ban-armor circuit / pacing / policy retry)."""
     init_queue(db_path)
     with _connect(db_path) as conn:
-        cur = conn.execute(
-            """
-            UPDATE apply_queue
-            SET status='READY', worker_id=NULL, error_log=?, updated_at=?
-            WHERE id=? AND status='CLAIMED'
-            """,
-            (error_log or "circuit_cooldown", _now(), int(queue_id)),
-        )
+        _ensure_queue_columns(conn)
+        if bump_attempt:
+            cur = conn.execute(
+                """
+                UPDATE apply_queue
+                SET status='READY',
+                    worker_id=NULL,
+                    error_log=?,
+                    updated_at=?,
+                    attempt_count=COALESCE(attempt_count, 0) + 1
+                WHERE id=? AND status='CLAIMED'
+                """,
+                (error_log or "circuit_cooldown", _now(), int(queue_id)),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE apply_queue
+                SET status='READY', worker_id=NULL, error_log=?, updated_at=?
+                WHERE id=? AND status='CLAIMED'
+                """,
+                (error_log or "circuit_cooldown", _now(), int(queue_id)),
+            )
         conn.commit()
         return cur.rowcount > 0
+
+
+def get_attempt_count(job_url: str, db_path: Path | None = None) -> int:
+    """Current attempt_count for a queue row (0 if missing)."""
+    init_queue(db_path)
+    url = (job_url or "").strip()
+    if not url:
+        return 0
+    with _connect(db_path) as conn:
+        _ensure_queue_columns(conn)
+        row = conn.execute(
+            "SELECT attempt_count FROM apply_queue WHERE job_url = ? LIMIT 1",
+            (url,),
+        ).fetchone()
+    if not row:
+        return 0
+    try:
+        return max(0, int(row["attempt_count"] or 0))
+    except (TypeError, ValueError, KeyError):
+        return 0
+
+
+def bump_attempt_on_claim(queue_id: int, db_path: Path | None = None) -> int:
+    """Increment attempt_count when a worker starts an apply. Returns new count."""
+    init_queue(db_path)
+    with _connect(db_path) as conn:
+        _ensure_queue_columns(conn)
+        conn.execute(
+            """
+            UPDATE apply_queue
+            SET attempt_count=COALESCE(attempt_count, 0) + 1, updated_at=?
+            WHERE id=?
+            """,
+            (_now(), int(queue_id)),
+        )
+        row = conn.execute(
+            "SELECT attempt_count FROM apply_queue WHERE id = ?",
+            (int(queue_id),),
+        ).fetchone()
+        conn.commit()
+    if not row:
+        return 1
+    try:
+        return max(1, int(row["attempt_count"] or 1))
+    except (TypeError, ValueError, KeyError):
+        return 1
 
 
 def _parse_reclaim_count(error_log: str | None) -> int:

@@ -217,7 +217,9 @@ def test_inject_uses_calculator_median():
             "salary_expectation": "negotiable",
         }
     )
-    assert "6,50,000" in out["expected_ctc"]
+    assert out["expected_ctc"] == "650000"
+    assert out["expected_ctc_inr"] == "650000"
+    assert "6,50,000" in out["expected_ctc_display"]
     assert out["salary_annual_inr"] == 650_000
     assert out["salary_expectation"] == out["expected_ctc"]
 
@@ -237,7 +239,8 @@ def test_inject_from_yaml_snapshot_company_range():
     )
     out = inject_salary_answers({}, yaml_snapshot=snap)
     assert out["salary_annual_inr"] == 720_000
-    assert "7,20,000" in out["expected_ctc"]
+    assert out["expected_ctc"] == "720000"
+    assert "7,20,000" in out["expected_ctc_display"]
 
 def test_default_expected_ctc_band():
     from src.core.salary import default_expected_ctc, resolve_expected_ctc

@@ -14,8 +14,10 @@ from typing import Any, Callable, Awaitable
 
 from src.core.config import PROJECT_ROOT, WORKER_STATUS
 from src.core.host_limiter import HostRateLimiter
+from src.core.apply_policy import decide as decide_apply_outcome
 from src.core.queue import (
     WAIT_SENTINEL_KEY,
+    bump_attempt_on_claim,
     claim_next,
     mark_done,
     queue_counts,
@@ -266,6 +268,7 @@ async def browser_worker_loop(
 ) -> dict[str, int]:
     """Pull READY queue items until producers finish and the queue is empty."""
     from src.core.executor import ApplicationBlockedError, ApplicationTimeoutError
+    from src.core.llm_router import token_limit_detail, token_limit_reached
 
     # Pool default: warm Chromium keep-alive unless user explicitly set 0.
     user_keep_alive_pin = (
@@ -298,6 +301,14 @@ async def browser_worker_loop(
 
     while True:
         if stop_event.is_set():
+            break
+        if token_limit_reached():
+            logger.error(
+                "[%s] TOKEN LIMIT REACHED — pausing applies until quotas reset (%s)",
+                worker_id,
+                token_limit_detail(),
+            )
+            stop_event.set()
             break
 
         # Ban armor: human-like apply hours (default 08–22 local).
@@ -414,6 +425,12 @@ async def browser_worker_loop(
             os.environ["ACE_BROWSER_KEEP_ALIVE"] = "1"
 
         try:
+            attempt = bump_attempt_on_claim(qid)
+        except Exception:
+            logger.debug("[%s] bump_attempt_on_claim failed", worker_id, exc_info=True)
+            attempt = int(item.get("attempt_count") or 0) + 1
+
+        try:
             outcome = await apply_fn(
                 company=company,
                 job_url=job_url,
@@ -423,6 +440,7 @@ async def browser_worker_loop(
                 yaml_snapshot=yaml_snapshot,
                 master_yaml=master_yaml,
                 user_data_dir=profile,
+                # Per-job cleanup burns a full Gemini run — batch once per cycle instead.
                 cleanup_linkedin_resume=False,
                 job_title=job_title,
             )
@@ -458,8 +476,46 @@ async def browser_worker_loop(
                     logger.debug("[%s] slot invalidate after crash failed", worker_id, exc_info=True)
 
         counts[outcome] = counts.get(outcome, 0) + 1
-        mark_done(qid, error_log=outcome)
         update_one_worker(worker_id, status="idle", company="", last_outcome=outcome)
+
+        # Token limit always stops the pool (also covered by decide → stop_pool).
+        if outcome == "token_limit_reached" or token_limit_reached():
+            logger.error(
+                "[%s] TOKEN LIMIT REACHED — requeue job and stop browser pool",
+                worker_id,
+            )
+            try:
+                requeue_claimed(qid, error_log="token_limit_reached")
+            except Exception:
+                mark_done(qid, error_log="token_limit_reached")
+            stop_event.set()
+            break
+
+        disposition = decide_apply_outcome(str(outcome), int(attempt))
+        if disposition == "stop_pool":
+            try:
+                requeue_claimed(qid, error_log=str(outcome))
+            except Exception:
+                mark_done(qid, error_log=str(outcome))
+            stop_event.set()
+            break
+        if disposition == "requeue":
+            logger.info(
+                "[%s] policy requeue %s after %s (attempt %s)",
+                worker_id,
+                company,
+                outcome,
+                attempt,
+            )
+            try:
+                requeue_claimed(qid, error_log=f"retry;{outcome}")
+            except Exception:
+                mark_done(qid, error_log=f"retry_failed;{outcome}")
+        else:
+            err = str(outcome)
+            if str(outcome) in {"timeout", "requires_human", "failed", "fallback"}:
+                err = f"retry_exhausted;{outcome}"
+            mark_done(qid, error_log=err)
 
         # Between warm jobs, avoid panic lock clears that race a live Chromium.
         if not env_truthy("ACE_BROWSER_KEEP_ALIVE", "1") or force_cold_next:

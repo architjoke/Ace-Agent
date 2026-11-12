@@ -19,6 +19,7 @@ from src.playbooks._common import (
     close_extra_pages,
     goto_dom,
     launch_persistent_context,
+    assist_and_confirm,
     try_cdp_assist,
     wait_for_any,
 )
@@ -190,7 +191,7 @@ def run_aggregator(
                 ctx, pg, lambda: _click_apply(pg), popup_timeout_ms=6000
             )
         except PlaybookFallback as exc:
-            if try_cdp_assist(cdp_assist, str(exc)):
+            if assist_and_confirm(pg, cdp_assist, str(exc)):
                 return True
             raise
 
@@ -241,7 +242,7 @@ def run_aggregator(
         if time.monotonic() > deadline:
             raise PlaybookFallback("aggregator bridge: budget exhausted")
         reason = f"aggregator bridge: unresolved destination {(final_url or pg.url or '')[:160]}"
-        if try_cdp_assist(cdp_assist, reason):
+        if assist_and_confirm(pg, cdp_assist, reason):
             return True
         raise PlaybookFallback(reason)
     except PlaybookFallback as exc:

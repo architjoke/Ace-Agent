@@ -1,0 +1,15 @@
+# Optional local overrides after a human teaches an unknown field.
+# Copy to data/learned_form_answers.yaml (gitignored). Primary answers live in master.yaml.
+# Prefer storing `kind` (from FormFillEngine) over raw employer question text.
+version: 1
+entries: []
+# Example entry shape (do not commit real answers):
+# - question: Example unknown label
+#   question_norm: example unknown label
+#   answer: Example value
+#   key: null
+#   kind: skills_tech
+#   company: ""
+#   job_url: ""
+#   updated_at: "2026-01-01T00:00:00Z"
+#   hits: 1

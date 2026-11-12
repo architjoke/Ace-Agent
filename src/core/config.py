@@ -16,7 +16,6 @@ ENV_FILE: Path = PROJECT_ROOT / ".env"
 
 # Canonical user artifacts under data/
 MASTER_YAML: Path = DATA_DIR / "master.yaml"
-MASTER_PROFILE_YAML: Path = DATA_DIR / "master_profile.yaml"
 MEMORY_DB: Path = DATA_DIR / "ace_memory.db"
 CHAT_MEMORY_DB: Path = DATA_DIR / "ace_chat_memory.db"
 LESSONS_LEARNED: Path = DATA_DIR / "lessons_learned.md"
@@ -39,10 +38,9 @@ def ensure_runtime_dirs() -> None:
 
 
 def resolve_master_yaml() -> Path:
-    """Prefer data/master.yaml, then master_profile.yaml, then legacy root master.yaml."""
+    """Prefer data/master.yaml, then legacy root master.yaml."""
     for candidate in (
         MASTER_YAML,
-        MASTER_PROFILE_YAML,
         PROJECT_ROOT / "master.yaml",
     ):
         if candidate.is_file():

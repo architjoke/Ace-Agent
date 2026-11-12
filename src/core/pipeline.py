@@ -22,6 +22,7 @@ from src.core.executor import (
     AlreadyAppliedError,
     ApplicationBlockedError,
     ApplicationTimeoutError,
+    TokenLimitReachedError,
     APPLY_RESUME_FILENAME,
     ExternalPortalLoadError,
     JobClosedError,
@@ -33,7 +34,7 @@ from src.core.executor import (
 )
 from src.core.fallback import generate_manual_package
 from src.core.memory import (
-    has_applied,
+    should_suppress_apply,
     has_recent_company_role_apply,
     has_successful_apply,
     init_db,
@@ -110,8 +111,12 @@ def triage_job(
         )
         return None
 
-    if has_applied(job_url):
-        logger.info("Skipping %s — already in memory (%s)", company, job_url[:120])
+    if should_suppress_apply(job_url):
+        logger.info(
+            "Skipping %s — terminal apply or retries exhausted (%s)",
+            company,
+            job_url[:120],
+        )
         return None
 
     if has_recent_company_role_apply(company, title):
@@ -237,7 +242,7 @@ async def apply_job(
     yaml_snapshot: str,
     master_yaml: Path,
     user_data_dir: Path | str | None = None,
-    cleanup_linkedin_resume: bool = False,
+    cleanup_linkedin_resume: bool | None = None,
     job_url_direct: str = "",
     job_title: str = "",
 ) -> str:
@@ -273,11 +278,17 @@ async def apply_job(
             raise ApplicationBlockedError(
                 f"No applyable career URL (aggregator listing only): {job_url[:120]}"
             )
+        # Default: clean LinkedIn agent upload after apply (pool/serial can override).
+        do_li_cleanup = (
+            cleanup_linkedin_resume
+            if cleanup_linkedin_resume is not None
+            else ("linkedin.com" in job_url.lower())
+        )
         ok = await execute_application(
             job_url,
             pdf_path,
             master_yaml,
-            cleanup_linkedin_resume=cleanup_linkedin_resume,
+            cleanup_linkedin_resume=do_li_cleanup,
             user_data_dir=user_data_dir,
             yaml_snapshot=yaml_snapshot,
             jd_text=jd_text,
@@ -329,7 +340,45 @@ async def apply_job(
             job_title=title,
         )
         return "job_closed"
+    except TokenLimitReachedError as exc:
+        logger.error(
+            "[TOKEN LIMIT REACHED] pausing applies until quotas reset — %s (%s)",
+            company,
+            exc,
+        )
+        log_application(
+            company,
+            job_url,
+            track,
+            "TOKEN_LIMIT_REACHED",
+            error_log=f"{type(exc).__name__}: {exc}",
+            jd_text=jd_text,
+            tailored_yaml_snapshot=yaml_snapshot,
+            job_title=title,
+        )
+        return "token_limit_reached"
     except RequiresHumanInterventionError as exc:
+        # Gemini capacity used to surface as requires_human_api_error — treat as token stop.
+        msg = str(exc)
+        if "requires_human_api_error" in msg.lower() or "TOKEN LIMIT" in msg:
+            from src.core.llm_router import mark_token_limit_reached
+
+            mark_token_limit_reached(msg)
+            logger.error(
+                "[TOKEN LIMIT REACHED] pausing applies until quotas reset — %s",
+                company,
+            )
+            log_application(
+                company,
+                job_url,
+                track,
+                "TOKEN_LIMIT_REACHED",
+                error_log=f"{type(exc).__name__}: {exc}",
+                jd_text=jd_text,
+                tailored_yaml_snapshot=yaml_snapshot,
+                job_title=title,
+            )
+            return "token_limit_reached"
         logger.warning(
             "[human] %s needs intervention — skipping Manual_Action (%s)",
             company,
@@ -425,7 +474,8 @@ async def apply_job(
                 tailored_yaml_snapshot=yaml_snapshot,
                 job_title=title,
             )
-            return "fallback"
+            # Terminal for queue policy — package is the handoff; do not re-hammer.
+            return "manual_action"
         except Exception as fallback_exc:
             logger.exception(
                 "Fallback package generation also failed for %s — continuing",
@@ -655,8 +705,14 @@ async def run_parallel(
     if isinstance(pool_result, dict):
         logger.info("Browser pool finished: %s", pool_result)
 
-    # Batch LinkedIn resume cleanup once per cycle (not after every apply).
-    if counts.get("success", 0) > 0:
+    # Batch LinkedIn resume cleanup once per cycle (success or after LI attempts).
+    li_touched = (
+        int(counts.get("success", 0))
+        + int(counts.get("fallback", 0))
+        + int(counts.get("requires_human", 0))
+        + int(counts.get("failed", 0))
+    )
+    if li_touched > 0:
         logger.info("Batch LinkedIn resume cleanup (%s)…", APPLY_RESUME_FILENAME)
         try:
             from src.core.settings import get_settings as _gs

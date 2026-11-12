@@ -76,32 +76,58 @@ def test_normalize_role_title_sde_backend():
     assert "backend" in a
 
 
-def test_archetype_cache_hit_skips_rendercv(tmp_path, monkeypatch):
+def _stub_jd_keywords(monkeypatch):
+    monkeypatch.setattr(
+        "src.core.ats_scanner.extract_jd_keywords",
+        lambda jd_text, top_k=20: ["Python", "FastAPI"][:top_k],
+    )
+    monkeypatch.setattr(
+        "src.core.ats_scanner.filter_supportable_keywords",
+        lambda raw, master: (list(raw), []),
+    )
+    monkeypatch.setattr(
+        "src.core.ats_scanner.resolve_ats_pass_score",
+        lambda **k: {"pass_score": 85, "reason": "test"},
+    )
+
+
+def test_artifact_cache_hit_skips_rendercv(tmp_path, monkeypatch):
+    from src.core import resume_artifacts as ra
     from src.core import tailor as t
 
+    _stub_jd_keywords(monkeypatch)
     pdf = tmp_path / "arch.pdf"
     pdf.write_bytes(b"%PDF-1.4")
-    monkeypatch.setattr(t, "_ARCHETYPE_CACHE_FILE", tmp_path / "cache.json")
-    monkeypatch.setattr(t, "ensure_runtime_dirs", lambda: None)
+    db = tmp_path / "artifacts.db"
+    monkeypatch.setattr(ra, "_ARTIFACTS_PATH", db)
     monkeypatch.setattr(
         "src.core.security.validate_safe_path",
         lambda p, **k: Path(p),
     )
-    t.store_archetype_pdf("SDE", "SDE II - Backend", str(pdf), "cv: {}\n")
+    jd = "Requirements\n- Python\n- FastAPI\nBuild APIs."
+    master = "skills:\n  - Python\n  - FastAPI\n"
+    key, supportable = ra.jd_signature(jd, master, track="SDE", title="SDE II - Backend")
+    ra.store_artifact(
+        key,
+        pdf_path=str(pdf),
+        yaml_text="cv: {}\n",
+        supportable=supportable,
+        track="SDE",
+        title="SDE II - Backend",
+        db_path=db,
+    )
 
-    def _boom(*a, **k):
-        raise AssertionError("RenderCV must not run on cache hit")
-
-    monkeypatch.setattr(t, "_run_rendercv", _boom)
     monkeypatch.setattr(
         t,
         "get_tailor_graph",
-        lambda: SimpleNamespace(invoke=lambda *a, **k: (_ for _ in ()).throw(AssertionError("graph"))),
+        lambda: SimpleNamespace(
+            invoke=lambda *a, **k: (_ for _ in ()).throw(AssertionError("graph"))
+        ),
     )
 
     path, yaml_text = t.tailor_with_graph(
-        "jd",
-        "master: {}",
+        jd,
+        master,
         job_track="SDE",
         job_title="SDE II - Backend",
     )
@@ -109,13 +135,19 @@ def test_archetype_cache_hit_skips_rendercv(tmp_path, monkeypatch):
     assert "cv:" in yaml_text
 
 
-def test_archetype_cache_miss_runs_graph(tmp_path, monkeypatch):
+def test_artifact_cache_same_fingerprint_hits(tmp_path, monkeypatch):
+    from src.core import resume_artifacts as ra
     from src.core import tailor as t
 
-    monkeypatch.setattr(t, "_ARCHETYPE_CACHE_FILE", tmp_path / "cache.json")
-    monkeypatch.setattr(t, "ensure_runtime_dirs", lambda: None)
+    _stub_jd_keywords(monkeypatch)
+    db = tmp_path / "artifacts.db"
+    monkeypatch.setattr(ra, "_ARTIFACTS_PATH", db)
     pdf = tmp_path / "out.pdf"
     pdf.write_bytes(b"%PDF")
+    monkeypatch.setattr(
+        "src.core.security.validate_safe_path",
+        lambda p, **k: Path(p),
+    )
 
     class _G:
         def invoke(self, *_a, **_k):
@@ -129,20 +161,21 @@ def test_archetype_cache_miss_runs_graph(tmp_path, monkeypatch):
             }
 
     monkeypatch.setattr(t, "get_tailor_graph", lambda: _G())
-    monkeypatch.setattr(
-        "src.core.security.validate_safe_path",
-        lambda p, **k: Path(p),
+    jd = "Requirements\n- Python\nUnique Title XYZ role."
+    master = "skills:\n  - Python\n"
+    path, y = t.tailor_with_graph(
+        jd, master, job_track="SDE", job_title="Unique Title XYZ"
     )
-    path, y = t.tailor_with_graph("jd", "m", job_track="SDE", job_title="Unique Title XYZ")
     assert Path(path) == pdf.resolve()
     assert y.startswith("x:")
-    # Second call hits cache
     monkeypatch.setattr(
         t,
         "get_tailor_graph",
         lambda: (_ for _ in ()).throw(AssertionError("should cache")),
     )
-    path2, _ = t.tailor_with_graph("jd", "m", job_track="SDE", job_title="Unique Title XYZ")
+    path2, _ = t.tailor_with_graph(
+        jd, master, job_track="SDE", job_title="Unique Title XYZ"
+    )
     assert Path(path2) == pdf.resolve()
 
 

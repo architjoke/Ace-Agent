@@ -196,8 +196,8 @@ def test_force_upload_falls_back_to_files_length(tmp_path):
 def test_linkedin_budget_and_advance_order():
     from src.playbooks import linkedin as li
 
-    assert li._MAX_STEPS == 15
-    assert li._OVERALL_BUDGET_S >= 90
+    assert li._MAX_STEPS == 22
+    assert li._OVERALL_BUDGET_S >= 180
 
     clicks: list[str] = []
 
@@ -298,7 +298,7 @@ def test_run_agent_retries_then_yields_api_error(monkeypatch):
     monkeypatch.setattr(ex.asyncio, "sleep", _noop)
 
     async def _run():
-        with pytest.raises(ex.ApplicationTimeoutError, match="requires_human_api_error"):
+        with pytest.raises(ex.TokenLimitReachedError, match="TOKEN LIMIT REACHED"):
             await ex._run_agent("task", [], max_steps=1, timeout_seconds=5, teardown=False)
         assert calls["n"] == 3
 
