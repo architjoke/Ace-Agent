@@ -85,10 +85,86 @@ def digits_only(raw: Any, *, default: str = "0") -> str:
     return digits if digits else default
 
 
+def normalize_phone_fields(answers: dict[str, Any] | None) -> dict[str, Any]:
+    """Shared phone contract: national + calling code → display / e164 / phone.
+
+    Invariant: never invent a trunk-0 national; never hardcode ``+91`` when
+    ``country_calling_code`` / ``phone_country_code`` is present.
+    """
+    out: dict[str, Any] = dict(answers or {})
+    cc = digits_only(
+        out.get("country_calling_code") or out.get("phone_country_code"),
+        default="",
+    )
+    if cc == "0":
+        cc = ""
+
+    national = digits_only(out.get("phone_national"), default="")
+    if national == "0":
+        national = ""
+    # Trunk prefix 0 on an otherwise 10-digit mobile (e.g. 08572855980).
+    if national.startswith("0") and len(national) == 11:
+        national = national[1:]
+    if cc and national.startswith(cc) and len(national) == len(cc) + 10:
+        national = national[len(cc) :]
+
+    raw_digits = digits_only(
+        out.get("phone") or out.get("phone_e164") or out.get("phone_display"),
+        default="",
+    )
+    if raw_digits == "0":
+        raw_digits = ""
+
+    if not national and raw_digits:
+        if raw_digits.startswith("0") and len(raw_digits) == 11:
+            national = raw_digits[1:]
+        elif cc and raw_digits.startswith(cc) and len(raw_digits) > len(cc):
+            national = raw_digits[len(cc) :]
+        elif len(raw_digits) == 10:
+            national = raw_digits
+        elif len(raw_digits) > 10:
+            # +CCNNNNNNNNNN → last 10 as national when CC unknown/ambiguous.
+            national = raw_digits[-10:]
+            if not cc:
+                cc = raw_digits[:-10]
+
+    if cc and national.startswith(cc) and len(national) == len(cc) + 10:
+        national = national[len(cc) :]
+
+    if not cc:
+        e164_src = str(out.get("phone_e164") or out.get("phone") or "").strip()
+        if e164_src.startswith("+"):
+            dig = digits_only(e164_src, default="")
+            if national and dig.endswith(national) and len(dig) > len(national):
+                cc = dig[: len(dig) - len(national)]
+            elif len(dig) > 10:
+                cc = dig[:-10]
+                if not national:
+                    national = dig[-10:]
+        # Locale default only when we have a clean 10-digit national and no CC.
+        if not cc and len(national) == 10:
+            cc = "91"
+
+    out["phone_national"] = national
+    out["country_calling_code"] = cc
+    if cc:
+        out["phone_country_code"] = f"+{cc}"
+    if national and cc:
+        display = f"+{cc} {national}"
+        e164 = f"+{cc}{national}"
+        out["phone_display"] = display
+        out["phone_e164"] = e164
+        raw_phone = digits_only(out.get("phone"), default="")
+        if not str(out.get("phone") or "").strip() or raw_phone.startswith("0") or (
+            raw_phone == national or (raw_phone.endswith(national) if national else False)
+        ):
+            out["phone"] = display
+    return out
+
+
 def sanitize_application_answers(answers: dict[str, Any] | None) -> dict[str, Any]:
     """Return a copy with constrained form fields normalized to single values."""
     out: dict[str, Any] = dict(answers or {})
-
     # Notice: "7 to 14 days" → days field = 7 (not "7-14").
     out["notice_period_days"] = first_int(
         out.get("notice_period_days_numeric")
@@ -132,11 +208,7 @@ def sanitize_application_answers(answers: dict[str, Any] | None) -> dict[str, An
         out["cgpa_numeric"] = m.group(1)
 
     out["graduation_year"] = first_int(out.get("graduation_year"), default="2027")
-    out["phone_national"] = digits_only(out.get("phone_national"), default="")
-    out["country_calling_code"] = digits_only(
-        out.get("country_calling_code") or out.get("phone_country_code"),
-        default="91",
-    )
+    out.update(normalize_phone_fields(out))
     out["pincode"] = digits_only(out.get("pincode") or out.get("postal_code"), default="")
     out["postal_code"] = out["pincode"]
     out["zip_code"] = out["pincode"]

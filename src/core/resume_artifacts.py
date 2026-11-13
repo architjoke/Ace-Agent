@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -17,7 +18,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 _LOCK = threading.Lock()
 _ARTIFACTS_PATH = Path(__file__).resolve().parents[2] / "data" / "resume_artifacts.db"
 
@@ -78,6 +79,7 @@ def jd_signature(
     *,
     track: str = "",
     title: str = "",
+    company: str = "",
     ats_pass_score: int | None = None,
 ) -> tuple[str, list[str]]:
     """Compute artifact fingerprint + supportable keywords (cheap path before lookup)."""
@@ -96,10 +98,11 @@ def jd_signature(
     supportable_sorted = sorted(
         {str(s).strip().lower() for s in supportable if str(s).strip()}
     )
+    company_norm = re.sub(r"\s+", " ", (company or "").strip().lower())
     if ats_pass_score is None:
         try:
             threshold = resolve_ats_pass_score(
-                company="",
+                company=company or "",
                 supportable_keywords=supportable,
                 unsupported_keywords=unsupported,
             )
@@ -124,6 +127,8 @@ def jd_signature(
     h.update(track_norm.encode("utf-8", errors="replace"))
     h.update(b"|")
     h.update(title_norm.encode("utf-8", errors="replace"))
+    h.update(b"|")
+    h.update(company_norm.encode("utf-8", errors="replace"))
     h.update(b"|")
     h.update(str(pass_score).encode("ascii"))
     h.update(b"|")

@@ -83,6 +83,17 @@ def format_status() -> str:
     init_queue()
     q = queue_counts()
     wstatus = read_worker_status().get("workers") or {}
+    from datetime import datetime
+
+    from src.core.llm_router import (
+        blocks_browser_applies,
+        sync_token_limit_state,
+        token_limit_detail,
+        token_limit_reached,
+        token_limit_reset_at,
+    )
+
+    sync_token_limit_state()
     lines = [
         "Ace Agent status",
         "────────────────",
@@ -97,6 +108,20 @@ def format_status() -> str:
             f"CLAIMED={q.get('CLAIMED', 0)} DONE={q.get('DONE', 0)}"
         ),
     ]
+    if token_limit_reached():
+        reset_at = token_limit_reset_at()
+        reset_s = (
+            datetime.fromtimestamp(reset_at).strftime("%Y-%m-%d %H:%M")
+            if reset_at
+            else "unknown"
+        )
+        lines.append(
+            f"HIT LIMIT: YES until {reset_s} "
+            f"(browser_blocked={blocks_browser_applies()}) — "
+            f"{token_limit_detail()[:120]}"
+        )
+    else:
+        lines.append("HIT LIMIT: no")
     if wstatus:
         busy = []
         idle = 0

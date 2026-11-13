@@ -244,32 +244,35 @@ true facts with the XYZ formula; do not invent history.
 {guardrail}
 
 DUAL GOAL:
-1) Dense 1-page fresher resume that fills the page (no sparse whitespace).
+1) Dense 1-page resume that fills the page (no sparse whitespace).
 2) ATS coverage ≥ {pass_score}% of supportable keywords for {company}.
 
 SECTION ORDER (exact):
 summary → education → experience → projects → skills → hackathons_and_activities
 
+DYNAMIC 1-PAGE BUDGET (from fact-bank volume — do not invent extra roles):
+{budget_block}
+
 DENSITY + TRUTH LAW (non-negotiable):
-- Experience: exactly 2 JD-best roles (MSG + Infosys preferred). EACH role has
-  3–4 impressive XYZ bullets rewritten ONLY from fact-bank highlights.
-- Projects: exactly 2 JD-best projects (prefer Road Inspection + Earthquake or
-  DCGAN). EACH has 3–4 weighty technical bullets from the fact bank.
+- Rewrite ONLY from fact-bank highlights; JD-rank which roles/projects to keep.
 - NEVER invent metrics (%, req/day, mAP, F1, latency wins) unless present in facts.
-- NEVER invent orgs/events (no HackathonX, no GDSC) — use only RIDEhack / LNMIIT /
-  IIT Madras / Amazon ML / NEP Saarthi / workshops from the fact bank.
-- Bullets should feel handmade: strong verb + concrete stack + what shipped.
-  Bold 2–4 JD/tech tokens with **markdown**. Target ~120–170 chars.
-- Education: ONE college row; optional highlight exactly `CGPA: 8.8/10`.
+- NEVER invent orgs/events — only fact-bank hackathons/leadership/workshops.
+- Bullets: strong verb + concrete stack + what shipped. Bold 2–4 JD/tech tokens
+  with **markdown**. Each bullet {min_bullet}–{max_bullet} chars (deepen from
+  facts — never pad with fluff). Short bullets = content gap, not styling.
+- Education: ONE college row; optional CGPA highlight from facts only.
 - Skills: 4–5 labeled groups from the fact bank (JD overlaps first).
-- hackathons_and_activities: 2–3 compact bullets from the fact bank.
-- Final PDF MUST be exactly ONE A4 page. No Class X/XII. No "Another U".
+- Final PDF MUST be exactly ONE A4 page. No Class X/XII. No excluded projects.
 - GitHub project links in `location` as [GitHub](url) when URL exists in facts.
 - Track: {track}. {track_brief}
+- Layout/fonts are applied by the pipeline — do NOT invent a theme or design.
 
 Matching doctrine: rewrite for THIS JD and career track; mirror exact JD spellings
 when truthful; omit unsupported keywords; pick roles/projects that match the role
-family (SDE vs AI/ML vs Backend). Fill the page — do not leave sparse stub bullets.
+family (SDE vs AI/ML vs Backend vs Product/AI intern). For product/AI intern JDs,
+lead with AI product experimentation, LLM/tooling (Cursor/Claude), prototypes, APIs,
+evaluation/testing, and documentation — only when present in the fact bank.
+Fill the page — never omit summary, education, skills, or activities.
 Layout/fonts are applied by the pipeline — do not invent a theme.
 
 Output ONLY one fenced ```yaml RenderCV document (cv + sections). Do NOT invent

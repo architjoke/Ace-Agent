@@ -871,7 +871,8 @@ async def _run_agent(
         detail = f"{type(last_capacity).__name__}: {last_capacity}" if last_capacity else "unknown"
         from src.core.llm_router import mark_token_limit_reached
 
-        mark_token_limit_reached(detail[:400])
+        # Vision capacity burn — stop browser applies (not just hunt/tailor).
+        mark_token_limit_reached(detail[:400], blocks_apply=True)
         raise TokenLimitReachedError(
             f"TOKEN LIMIT REACHED — pausing applies until quotas reset "
             f"(Gemini capacity exhausted after 3 attempts: {detail[:400]})"
@@ -1673,7 +1674,7 @@ async def _execute_cdp_handoff(
         if "requires_human_api_error" in str(exc) or "TOKEN LIMIT" in str(exc):
             from src.core.llm_router import mark_token_limit_reached
 
-            mark_token_limit_reached(str(exc))
+            mark_token_limit_reached(str(exc), blocks_apply=True)
             raise TokenLimitReachedError(
                 f"TOKEN LIMIT REACHED — pausing applies until quotas reset ({exc})"
             ) from exc

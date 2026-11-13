@@ -60,10 +60,13 @@
 #let design-entries-allow-page-break-in-entries = <<design.entries.allow_page_break_in_entries|lower>>
 #let design-entries-horizontal-space-between-columns = <<design.entries.horizontal_space_between_columns>>
 #let design-entries-left-and-right-margin = <<design.entries.left_and_right_margin>>
-#let design-page-top-margin = <<design.page.top_margin>>
-#let design-page-bottom-margin = <<design.page.bottom_margin>>
-#let design-page-left-margin = <<design.page.left_margin>>
-#let design-page-right-margin = <<design.page.right_margin>>
+// Fresher 1-pager chrome: keep margins in the theme (not design.page.*_margin YAML —
+// RenderCV 2.3 can crash Typst when those keys are emitted). Default RenderCV 2cm
+// leaves a sparse “frame”; ~1.1cm fills A4 like handmade references.
+#let design-page-top-margin = 0.95cm
+#let design-page-bottom-margin = 0.9cm
+#let design-page-left-margin = 1.1cm
+#let design-page-right-margin = 1.1cm
 #let design-page-show-last-updated-date = <<design.page.show_last_updated_date|lower>>
 #let design-page-show-page-numbering = <<design.page.show_page_numbering|lower>>
 #let design-links-underline = <<design.links.underline|lower>>
@@ -91,7 +94,7 @@
   } else {
     none
   },
-  footer-descent: 0% - 0.3em + design-page-bottom-margin / 2,
+  footer-descent: design-page-bottom-margin / 2,
 )
 // Text settings:
 #let justify
@@ -326,12 +329,8 @@
   )
   let starting-index = 0
   while (starting-index < connections-list.len()) {
-    let left-sum-right-margin
-    if type(page.margin) == "dictionary" {
-      left-sum-right-margin = page.margin.left + page.margin.right
-    } else {
-      left-sum-right-margin = page.margin * 4
-    }
+    // Always set page.margin as a dictionary in #set page above.
+    let left-sum-right-margin = design-page-left-margin + design-page-right-margin
 
     let ending-index = starting-index + 1
     while (

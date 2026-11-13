@@ -1,0 +1,32 @@
+---
+description: Ace resume rendering and density invariants (theme, facts, role family)
+alwaysApply: true
+---
+
+# Resume architecture invariants
+
+## Theme monopoly
+
+- Custom theme `ace` is the **sole** RenderCV engine (`themes/ace/`, `resume_layout.yaml`).
+- Whitespace / overflow use the preset state machine only: `airy → balanced → dense → ultra_dense`.
+- Never swap to stock themes (`sb2nov`, `engineeringresumes`, `classic`) as a “fix”.
+- Never trust the LLM to emit `design:` / theme / page margins. Pipeline applies chrome via `_apply_design`.
+- Page margins live in `themes/ace/Preamble.j2.typ` — do **not** put `design.page.*_margin` in YAML (RenderCV 2.3 Typst crash).
+
+## Fact-grounded density (no padding)
+
+- Bullet depth comes from `master.yaml` outcomes/stack — never invent metrics or pad to “look long”.
+- Soft target / hard cap: about **120–175** chars per bullet (`MIN_BULLET_CHARS` / `MAX_BULLET_CHARS`).
+- Short bullets after revision = **content gap** in the fact bank, not a styling bug.
+- Seed / anchor / top-up from the fact bank; strip hallucinated claims.
+
+## Dynamic 1-page budget
+
+- Experience/project **counts are not fixed at 2 forever**. `resolve_page_budget()` sizes slots from how many strong roles exist in the fact bank, then JD-ranks what stays.
+- Soft campus filler drops first; JD-best roles/projects win; overflow densifies chrome, then hard-shrinks content.
+- Adding a new job to `master.yaml` must automatically change keep/eliminate behavior — no person-specific `if company == …` patches.
+
+## Role-based content contracts (scaling)
+
+- When multi-persona: use a `role_family` registry (SDE / AI / ML / PRODUCT / GENERAL) for section emphasis and project preference at triage — **not** JSON Resume, Reactive Resume, or visual template scraping.
+- Content policy by role family; chrome policy by volume presets. Keep ATS as text-layer keyword coverage only.

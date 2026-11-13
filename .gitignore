@@ -46,8 +46,12 @@ rendercv_output/
 data/ace_memory.db
 data/ace_memory.db-*
 data/*.db
+data/*.db-*
+data/*.sqlite
+data/*.sqlite-*
 data/ace_worker.pid
 data/browser_workers.json
+data/quota_state.json
 data/browser_profile/
 data/browser_profile_w*/
 data/lessons_learned.md
@@ -58,6 +62,11 @@ data/learned_form_answers.yaml
 !data/master.yaml.example
 !data/lessons_learned.md.example
 !data/learned_form_answers.yaml.example
+
+# ── Cursor (track project rules; ignore local/cache noise) ───────
+.cursor/**
+!.cursor/rules/
+!.cursor/rules/**
 
 # ── Personal resumes / media (users supply their own) ────────────
 resumes/**

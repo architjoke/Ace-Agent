@@ -268,7 +268,11 @@ async def browser_worker_loop(
 ) -> dict[str, int]:
     """Pull READY queue items until producers finish and the queue is empty."""
     from src.core.executor import ApplicationBlockedError, ApplicationTimeoutError
-    from src.core.llm_router import token_limit_detail, token_limit_reached
+    from src.core.llm_router import (
+        blocks_browser_applies,
+        token_limit_detail,
+        token_limit_reached,
+    )
 
     # Pool default: warm Chromium keep-alive unless user explicitly set 0.
     user_keep_alive_pin = (
@@ -302,14 +306,20 @@ async def browser_worker_loop(
     while True:
         if stop_event.is_set():
             break
-        if token_limit_reached():
+        # Draft/TPM HIT LIMIT still allows draining READY PDFs; vision burns stop pool.
+        if blocks_browser_applies():
             logger.error(
-                "[%s] TOKEN LIMIT REACHED — pausing applies until quotas reset (%s)",
+                "[%s] HIT LIMIT blocks browser applies — pausing until quotas reset (%s)",
                 worker_id,
                 token_limit_detail(),
             )
             stop_event.set()
             break
+        if token_limit_reached() and not blocks_browser_applies():
+            logger.info(
+                "[%s] draft HIT LIMIT active — continuing queue drain (hunt/tailor paused)",
+                worker_id,
+            )
 
         # Ban armor: human-like apply hours (default 08–22 local).
         try:
@@ -478,11 +488,12 @@ async def browser_worker_loop(
         counts[outcome] = counts.get(outcome, 0) + 1
         update_one_worker(worker_id, status="idle", company="", last_outcome=outcome)
 
-        # Token limit always stops the pool (also covered by decide → stop_pool).
-        if outcome == "token_limit_reached" or token_limit_reached():
+        # Vision/apply HIT LIMIT stops the pool; draft-only limit keeps draining.
+        if outcome == "token_limit_reached" or blocks_browser_applies():
             logger.error(
-                "[%s] TOKEN LIMIT REACHED — requeue job and stop browser pool",
+                "[%s] HIT LIMIT — requeue job and stop browser pool (%s)",
                 worker_id,
+                token_limit_detail()[:160],
             )
             try:
                 requeue_claimed(qid, error_log="token_limit_reached")

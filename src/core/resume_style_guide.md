@@ -2,9 +2,12 @@
 
 Distilled from the `resumes/` reference set (elite ATS templates + selected tech/ML resumes)
 and Archit's hand-made SDE/AI/ML 1-pagers.  
-**Visual layout is owned by RenderCV custom theme `ace` (labeled contacts + fresher spacing).**  
+**Visual layout is owned by RenderCV custom theme `ace` only** (presets: airy→balanced→dense→ultra_dense).  
+Never emit stock themes or YAML page margins.  
 **Truth constraint:** only use employers, tools, dates, and metrics that exist in `master.yaml`.  
-`master.yaml` is a **fact bank**, never dump it wholesale into the PDF.
+`master.yaml` is a **fact bank**, never dump it wholesale into the PDF.  
+**Dynamic budget:** experience/project slot counts come from `resolve_page_budget()` as the
+fact bank grows (e.g. a 3rd job → 3 roles × 3 bullets, fewer projects) — not a fixed “always 2”.
 
 ---
 
@@ -15,16 +18,16 @@ and Archit's hand-made SDE/AI/ML 1-pagers.
    No coursework, no campus leadership under Education (those belong in Skills / Activities).  
    Drop Class X / Class XII.
 3. **Section order (exact):** Summary → Education → Experience → Projects → Skills → Hackathons & Activities.
-4. **Experience:** exactly **2 JD-best roles** (prefer MSG + Infosys); each role has **3–4** weighty XYZ bullets  
-   rewritten only from the fact bank. Never invent % / latency / req/day metrics.  
-   Drop weak campus filler roles when two stronger roles exist.
-5. **Projects:** exactly **2** JD-best projects (prefer Road Inspection + Earthquake / DCGAN); each has **3–4**  
-   impressive technical bullets from the fact bank. Never include Another U.  
-   Put GitHub in `location` as `[GitHub](url)` — **no project year**.  
+4. **Experience:** keep the **JD-best N roles** from `resolve_page_budget()` (scales with strong
+   fact-bank jobs — e.g. 2×4 or 3×3). Each role has weighty XYZ bullets rewritten only from
+   the fact bank. Never invent % / latency / req/day metrics. Drop soft campus filler first.
+5. **Projects:** keep the **JD-best N projects** from the same budget; each has weighty technical
+   bullets from the fact bank. Exclude projects marked out of tailor policy.  
+   Put GitHub in `location` as `[GitHub](url)` from the fact bank — **no project year**.  
    Hard rule: final PDF must be **exactly one A4 page**.
-6. **Summary:** **1 dense paragraph** (handmade tone): ML + data workflow + backend SaaS. Stay truthful.
-7. **Skills:** 4–5 labeled groups from the fact bank; JD-overlapping skills first.
-8. **Hackathons & Activities:** 2–3 compact bullets only from facts (RIDEhack, LNMIIT, IIT Madras, Amazon ML, NEP Saarthi, workshops, Infosys certs, Top Ranker). No invented clubs/hackathons.
+6. **Summary:** **1 dense paragraph** (handmade tone) grounded in the fact bank. Stay truthful.
+7. **Skills:** 3–5 labeled groups from the fact bank; JD-overlapping skills first.
+8. **Hackathons & Activities:** up to budget `act_keep` compact bullets only from facts. No invented clubs/hackathons.
 9. No “Last updated”, no “Page X of Y”, photos, skill bars, or multi-column tricks.  
    Design chrome (`ace` theme + spacing presets) is applied in code — do not invent a theme.
 10. **XYZ law:** Accomplished X as measured by Y (only if in fact bank), by doing Z.  
@@ -116,8 +119,8 @@ From high-signal “SELECTED” tech resumes in the reference set:
 - Do not list tools with zero evidence elsewhere.
 
 ### Experience / Projects
-- Experience: **2 roles × 3–4 bullets** (XYZ, dense).
-- Projects: **2–3 entries × 3–4 bullets** most aligned to the track/JD.
+- Experience / projects: follow `resolve_page_budget()` slot counts (scales with strong roles).
+- Prefer XYZ, dense bullets from the fact bank only.
 - End project `summary` with tech tags when useful (`Python, FastAPI, MySQL`).
 - Bullets should sound like shipped work, not coursework regurgitation.
 

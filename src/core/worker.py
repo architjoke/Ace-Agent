@@ -25,10 +25,19 @@ async def _cycle_loop(
     cycle_sleep_sec: int,
 ) -> None:
     """One long-lived event loop for all hunt cycles (avoids 'Event loop is closed')."""
+    from src.core.llm_router import (
+        sync_token_limit_state,
+        token_limit_detail,
+        token_limit_reached,
+        token_limit_reset_at,
+    )
+    from src.core.queue import init_queue, queue_counts
+
     cycle = 0
     while True:
         cycle += 1
         logger.info("=== Ace worker cycle %s (uncapped) ===", cycle)
+        sync_token_limit_state()
         try:
             code = await run_parallel(
                 max_results_per_track=max_results_per_track,
@@ -52,7 +61,28 @@ async def _cycle_loop(
                     )
             except Exception:
                 logger.debug("blank_all_slots between cycles failed", exc_info=True)
+
+        # Quota-aware sleep: if HIT LIMIT and queue empty, wait until day reset.
+        sync_token_limit_state()
         sleep_for = max(60, int(cycle_sleep_sec))
+        try:
+            init_queue()
+            q = queue_counts()
+            backlog = int(q.get("READY", 0)) + int(q.get("CLAIMED", 0))
+        except Exception:
+            backlog = 0
+        if token_limit_reached() and backlog <= 0:
+            import time
+
+            reset_at = token_limit_reset_at()
+            if reset_at > 0:
+                wait = max(60.0, min(float(reset_at) - time.time(), 6 * 3600.0))
+                sleep_for = max(sleep_for, int(wait))
+            logger.error(
+                "[HIT LIMIT REACHED] sleeping %ss until quotas reset — %s",
+                sleep_for,
+                token_limit_detail()[:160],
+            )
         logger.info("Sleeping %ss before next hunt…", sleep_for)
         await asyncio.sleep(sleep_for)
 

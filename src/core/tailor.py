@@ -21,6 +21,12 @@ from src.core.ats_scanner import (
     filter_supportable_keywords,
     resolve_ats_pass_score,
 )
+from src.core.page_budget import (
+    PageBudget,
+    apply_budget_to_sections,
+    bullet_length_issues,
+    resolve_page_budget,
+)
 from src.core.llm_router import (
     DEFAULT_GROQ_FALLBACK_MODEL,
     invoke_with_failover,
@@ -124,7 +130,8 @@ _GROQ_MASTER_CHARS = 5500
 
 _PRESET_ORDER = ("airy", "balanced", "dense", "ultra_dense")
 
-# Soft draft target / hard shrink caps — prefer weighty handmade bullets over stubs.
+# Fact-grounded density: deepen from master (no fluff padding). Soft floor / hard cap.
+MIN_BULLET_CHARS = 120
 MAX_BULLET_CHARS = 175
 MAX_SKILL_DETAIL_CHARS = 110
 MAX_SUMMARY_LINE_CHARS = 320
@@ -192,6 +199,19 @@ def _load_layout_file() -> dict:
     return loaded if isinstance(loaded, dict) else {}
 
 
+def _locale_from_layout(layout: dict) -> dict:
+    """RenderCV locale knobs (phone format, etc.). Never invent person-specific numbers."""
+    raw = layout.get("locale") if isinstance(layout.get("locale"), dict) else {}
+    # Default international — national India formatting prepends trunk 0.
+    fmt = str(raw.get("phone_number_format") or "international").strip().lower()
+    if fmt not in {"national", "international", "e164"}:
+        fmt = "international"
+    out: dict = {"phone_number_format": fmt}
+    lang = str(raw.get("language") or "en").strip() or "en"
+    out["language"] = lang
+    return out
+
+
 def _design_for_preset(preset: str = "balanced") -> dict:
     """Merge shared chrome + spacing preset. Never emit page margins."""
     layout = _load_layout_file()
@@ -246,8 +266,8 @@ def _select_design_preset(yaml_text: str, *, force: str | None = None) -> str:
         return force
     layout = _load_layout_file()
     vol = layout.get("volume") if isinstance(layout.get("volume"), dict) else {}
-    airy_max = int(vol.get("airy_max_bullets") or 10)
-    dense_min = int(vol.get("dense_min_bullets") or 18)
+    airy_max = int(vol.get("airy_max_bullets") or 11)
+    dense_min = int(vol.get("dense_min_bullets") or 16)
     try:
         data = yaml.safe_load(yaml_text) or {}
         bullets = _count_highlights(data if isinstance(data, dict) else {})
@@ -270,8 +290,28 @@ def _next_denser_preset(preset: str) -> str | None:
     return _PRESET_ORDER[idx + 1]
 
 
-def _bullet_density_issues(yaml_text: str) -> list[str]:
-    """Return human-readable density failures (empty = OK)."""
+def _next_airier_preset(preset: str) -> str | None:
+    """Inverse of denser — used to fill leftover whitespace on a short 1-pager."""
+    try:
+        idx = _PRESET_ORDER.index(preset)
+    except ValueError:
+        return "balanced"
+    if idx <= 0:
+        return None
+    return _PRESET_ORDER[idx - 1]
+
+
+def _bullet_density_issues(
+    yaml_text: str,
+    *,
+    budget: PageBudget | None = None,
+) -> list[str]:
+    """Return human-readable density failures (empty = OK).
+
+    Slot counts come from ``resolve_page_budget`` when provided; otherwise we
+    infer a budget from the draft's own experience list (dynamic as the
+    profile grows).
+    """
     issues: list[str] = []
     try:
         data = yaml.safe_load(yaml_text) or {}
@@ -284,65 +324,94 @@ def _bullet_density_issues(yaml_text: str) -> list[str]:
         return ["Missing cv.sections."]
 
     experience = sections.get("experience")
+    projects = sections.get("projects")
+    bud = budget or resolve_page_budget(experience=experience, projects=projects)
+
     if not isinstance(experience, list) or not experience:
-        issues.append("Experience missing — need exactly 2 roles with 3–4 bullets each.")
-    else:
-        if len(experience) != 2:
+        if bud.exp_keep > 0:
             issues.append(
-                f"Experience has {len(experience)} roles — need exactly 2."
+                f"Experience missing — need {bud.exp_keep} JD-best role(s) "
+                f"with {bud.exp_bullets} bullets each."
             )
-        for i, row in enumerate(experience[:2], start=1):
+    else:
+        if len(experience) != bud.exp_keep:
+            issues.append(
+                f"Experience has {len(experience)} roles — need {bud.exp_keep} "
+                f"({bud.reason})."
+            )
+        for i, row in enumerate(experience[: bud.exp_keep], start=1):
             if not isinstance(row, dict):
                 issues.append(f"Experience role {i} is malformed.")
                 continue
             highs = row.get("highlights")
             n = len(highs) if isinstance(highs, list) else 0
-            # Prefer exactly 3; allow 4 only when page still has room (compile may trim).
-            if n < 3 or n > 4:
+            lo = max(3, bud.exp_bullets - 1)
+            hi = bud.exp_bullets
+            if n < lo or n > hi:
                 issues.append(
-                    f"Experience role {i} has {n} bullets — need 3 XYZ bullets "
-                    "(4th only if JD-critical)."
+                    f"Experience role {i} has {n} bullets — need {lo}–{hi} "
+                    "XYZ bullets from the fact bank."
                 )
 
-    projects = sections.get("projects")
     if not isinstance(projects, list) or not projects:
-        issues.append("Projects missing — need 2 projects with 3 XYZ bullets each.")
+        issues.append(
+            f"Projects missing — need {bud.proj_keep} project(s) with "
+            f"{bud.proj_bullets} XYZ bullets each."
+        )
     else:
-        if len(projects) < 2:
-            issues.append(f"Projects has {len(projects)} entries — need 2.")
-        for i, row in enumerate(projects[:2], start=1):
+        if len(projects) < bud.proj_keep:
+            issues.append(
+                f"Projects has {len(projects)} entries — need {bud.proj_keep}."
+            )
+        for i, row in enumerate(projects[: bud.proj_keep], start=1):
             if not isinstance(row, dict):
                 issues.append(f"Project {i} is malformed.")
                 continue
             highs = row.get("highlights")
             n = len(highs) if isinstance(highs, list) else 0
-            if n < 3 or n > 4:
+            lo = max(3, bud.proj_bullets - 1)
+            hi = bud.proj_bullets
+            if n < lo or n > hi:
                 issues.append(
-                    f"Project {i} has {n} bullets — need 3 XYZ bullets "
-                    "(4th only if JD-critical)."
+                    f"Project {i} has {n} bullets — need {lo}–{hi} XYZ bullets "
+                    "(4th only if JD-critical / budget allows)."
                 )
+            loc = str(row.get("location") or "").strip()
+            if loc and "github.com" in loc.lower() and not re.search(
+                r"\[GitHub\]\(https://github\.com/[^)]+\)", loc, flags=re.I
+            ):
+                issues.append(
+                    f"Project {i} GitHub location must be [GitHub](url), not raw URL."
+                )
+
+    education = sections.get("education")
+    if not isinstance(education, list) or not education:
+        issues.append("Education missing — need one college row (fills empty page).")
+
+    summary = sections.get("summary")
+    if isinstance(summary, list):
+        if not any(str(x).strip() for x in summary):
+            issues.append("Summary missing — need one dense paragraph.")
+    elif not str(summary or "").strip():
+        issues.append("Summary missing — need one dense paragraph.")
+
+    skills = sections.get("skills")
+    if not isinstance(skills, list) or len(skills) < 3:
+        issues.append("Skills missing — need 3–5 labeled groups from the fact bank.")
+
+    acts = sections.get("hackathons_and_activities")
+    if not isinstance(acts, list) or not any(str(a).strip() for a in acts):
+        issues.append(
+            "Activities missing — need fact-bank hackathon/leadership bullets."
+        )
+
+    # Stub bullets only — soft 120-char floor is prompt/critique, not a ship blocker
+    # when the fact bank itself is short (content gap ≠ layout failure).
+    issues.extend(
+        bullet_length_issues(sections, min_chars=80, max_chars=MAX_BULLET_CHARS + 60)
+    )
     return issues
 
-
-_PROJECT_GITHUB_LINKS: dict[str, str] = {
-    "earthquake impact prediction system": (
-        "https://github.com/architjoke/earthquake-impact-app"
-    ),
-    "dcgan fashion item generator": "https://github.com/architjoke/DCGAN",
-    "dcgan": "https://github.com/architjoke/DCGAN",
-    "ai road inspection system": (
-        "https://github.com/MSG-Technologies/AI-Road-Inspection"
-    ),
-    "offline road inspection": (
-        "https://github.com/MSG-Technologies/AI-Road-Inspection"
-    ),
-    "road inspection": (
-        "https://github.com/MSG-Technologies/AI-Road-Inspection"
-    ),
-    "pothole detection": (
-        "https://github.com/MSG-Technologies/AI-Road-Inspection"
-    ),
-}
 
 # Never ship these projects on tailored fresher resumes
 _EXCLUDED_PROJECT_MARKERS = (
@@ -353,19 +422,20 @@ _EXCLUDED_PROJECT_MARKERS = (
 
 
 def _resolve_project_url(name: str) -> tuple[str, str | None]:
-    """Return (display_title, github_url_or_None)."""
+    """Return (display_title, github_url_or_None) from markdown/name only.
+
+    Never invent person-specific repo URLs — recover links from the fact bank
+    via ``_apply_fact_bank_contracts`` / project fields instead.
+    """
     name = name.strip()
     link_match = re.match(r"^\[([^\]]+)\]\((https?://[^)]+)\)\s*$", name)
     if link_match:
         return link_match.group(1), link_match.group(2)
-    key = re.sub(r"\s+", " ", name.lower())
-    url = _PROJECT_GITHUB_LINKS.get(key)
-    if not url:
-        for alias, mapped in _PROJECT_GITHUB_LINKS.items():
-            if alias in key:
-                url = mapped
-                break
-    return name, url
+    bare = re.search(r"https://github\.com/[^\s)\"']+", name)
+    if bare:
+        title = re.sub(r"\s*https://github\.com/[^\s)\"']+", "", name).strip()
+        return title or name, bare.group(0)
+    return name, None
 
 
 def _normalize_project_links(data: dict) -> None:
@@ -382,6 +452,14 @@ def _normalize_project_links(data: dict) -> None:
         project.pop("start_date", None)
         project.pop("end_date", None)
         title, url = _resolve_project_url(str(project.get("name") or ""))
+        # Explicit project url/link fields from master or LLM.
+        if not url:
+            for key in ("url", "link", "github", "repository"):
+                cand = str(project.get(key) or "").strip()
+                if "github.com" in cand.lower():
+                    m = re.search(r"https://github\.com/[^\s)\"']+", cand, flags=re.I)
+                    url = m.group(0) if m else cand
+                    break
         summary = str(project.get("summary") or "").strip()
         if not url:
             m = re.search(r"https://github\.com/[^\s)\"']+", summary)
@@ -405,9 +483,23 @@ def _normalize_project_links(data: dict) -> None:
             project["summary"] = summary
         elif "summary" in project:
             project.pop("summary", None)
+        # Normalize location: raw GitHub URL OR markdown chip → consistent [GitHub](url).
+        loc = str(project.get("location") or "").strip()
+        if not url and loc:
+            md = re.search(
+                r"\[GitHub\]\((https://github\.com/[^)\s]+)\)",
+                loc,
+                flags=re.IGNORECASE,
+            )
+            if md:
+                url = md.group(1)
+            elif "github.com" in loc.lower():
+                murl = re.search(r"https://github\.com/[^\s)\"']+", loc, flags=re.I)
+                if murl:
+                    url = murl.group(0)
         if url:
-            project["location"] = f"[GitHub]({url})"
-        elif str(project.get("location") or "").lower().startswith("[github]"):
+            project["location"] = f"[GitHub]({url.rstrip('.,;')})"
+        else:
             project.pop("location", None)
 
 
@@ -540,7 +632,9 @@ def _drop_excluded_projects(data: dict) -> None:
 
 
 def _normalize_header_contacts(data: dict) -> None:
-    """Clickable LinkedIn/GitHub profile URLs; drop duplicate website=GitHub."""
+    """Clickable LinkedIn/GitHub from master/cv only; drop duplicate website=GitHub."""
+    from src.core.form_answers import normalize_phone_fields
+
     cv = data.get("cv")
     if not isinstance(cv, dict):
         return
@@ -552,28 +646,36 @@ def _normalize_header_contacts(data: dict) -> None:
     networks = cv.get("social_networks")
     if not isinstance(networks, list):
         networks = []
-    by_net: dict[str, dict] = {}
+    cleaned: list[dict] = []
     for row in networks:
-        if isinstance(row, dict) and row.get("network"):
-            by_net[str(row["network"]).strip().lower()] = row
+        if not isinstance(row, dict) or not row.get("network"):
+            continue
+        net = str(row["network"]).strip()
+        username = str(row.get("username") or "").strip().lstrip("/")
+        if not username:
+            continue
+        net_l = net.lower()
+        if net_l == "linkedin" and username.startswith("in/"):
+            username = username[3:]
+        cleaned.append({"network": net, "username": username})
+    if cleaned:
+        cv["social_networks"] = cleaned
+    elif "social_networks" in cv:
+        cv.pop("social_networks", None)
 
-    # Ensure canonical usernames → RenderCV builds full https URLs
-    linkedin = by_net.get("linkedin") or {
-        "network": "LinkedIn",
-        "username": "archit-gupta-41379b293",
-    }
-    linkedin["network"] = "LinkedIn"
-    linkedin["username"] = str(
-        linkedin.get("username") or "archit-gupta-41379b293"
-    ).strip().lstrip("/")
-    if linkedin["username"].startswith("in/"):
-        linkedin["username"] = linkedin["username"][3:]
-
-    github = by_net.get("github") or {"network": "GitHub", "username": "architjoke"}
-    github["network"] = "GitHub"
-    github["username"] = str(github.get("username") or "architjoke").strip().lstrip("/")
-
-    cv["social_networks"] = [linkedin, github]
+    # Shared phone contract (no hardcoded +91 when CC is present).
+    phone_blob = normalize_phone_fields(
+        {
+            "phone": cv.get("phone"),
+            "phone_national": cv.get("phone_national"),
+            "phone_e164": cv.get("phone_e164"),
+            "phone_display": cv.get("phone_display"),
+            "country_calling_code": cv.get("country_calling_code"),
+            "phone_country_code": cv.get("phone_country_code"),
+        }
+    )
+    if phone_blob.get("phone"):
+        cv["phone"] = phone_blob["phone"]
     data["cv"] = cv
 
 
@@ -609,7 +711,10 @@ def _apply_design(yaml_text: str, preset: str = "balanced") -> str:
     _normalize_education_rows(data)
     _normalize_skills_rows(data)
     _reorder_sections(data)
+    layout = _load_layout_file()
     data["design"] = _design_for_preset(preset)
+    # Top-level locale (not under design) — kills India national trunk-0 display.
+    data["locale"] = _locale_from_layout(layout)
     settings = data.get("settings")
     if isinstance(settings, dict):
         settings.pop("date", None)
@@ -792,6 +897,392 @@ def _normalize_skills_rows(data: dict) -> None:
             data["cv"] = cv
 
 
+def _master_cv_sections(master_yaml: str) -> dict:
+    """Parse trusted fact-bank sections (empty dict on failure)."""
+    try:
+        raw = yaml.safe_load(master_yaml or "") or {}
+    except Exception:
+        return {}
+    return _cv_sections(raw) if isinstance(raw, dict) else {}
+
+
+def _entry_key(name: str) -> str:
+    """Normalize company/project names for fact-bank matching ([Title](url) → title)."""
+    raw = str(name or "").strip()
+    md = re.match(r"^\[([^\]]+)\]\([^)]+\)\s*$", raw)
+    if md:
+        raw = md.group(1)
+    return re.sub(r"[^a-z0-9]+", "", raw.lower())
+
+
+def _match_master_row(row: dict, master_by: dict[str, dict], keys: tuple[str, ...]) -> dict | None:
+    for nk in keys:
+        key = _entry_key(str(row.get(nk) or ""))
+        if key in master_by:
+            return master_by[key]
+        for mkey, mrow in master_by.items():
+            if mkey and key and (mkey in key or key in mkey):
+                return mrow
+    return None
+
+
+def _apply_fact_bank_contracts(data: dict, master_yaml: str) -> None:
+    """Invariant: page-fill sections + truthful meta + ≥3 bullets from the fact bank."""
+    if not (master_yaml or "").strip():
+        return
+    master_secs = _master_cv_sections(master_yaml)
+    if not master_secs:
+        return
+    sections = _cv_sections(data)
+    if not sections:
+        return
+
+    if not sections.get("summary") and master_secs.get("summary"):
+        sections["summary"] = master_secs["summary"]
+
+    if not isinstance(sections.get("education"), list) or not sections.get("education"):
+        master_edu = master_secs.get("education")
+        if isinstance(master_edu, list) and master_edu:
+            sections["education"] = list(master_edu)
+
+    if not isinstance(sections.get("hackathons_and_activities"), list) or not sections.get(
+        "hackathons_and_activities"
+    ):
+        for key in ("hackathons_and_activities", "activities", "extracurricular"):
+            master_acts = master_secs.get(key)
+            if isinstance(master_acts, list) and master_acts:
+                sections["hackathons_and_activities"] = [
+                    str(a).strip() for a in master_acts[:3] if str(a).strip()
+                ]
+                break
+
+    if not sections.get("skills"):
+        master_skills = master_secs.get("skills")
+        if isinstance(master_skills, list) and master_skills:
+            sections["skills"] = list(master_skills)
+
+    # Anchor experience meta + top up thin highlights from matching master rows.
+    for section_key, name_keys in (
+        ("experience", ("company",)),
+        ("projects", ("name",)),
+    ):
+        rows = sections.get(section_key)
+        master_rows = master_secs.get(section_key)
+        if not isinstance(rows, list) or not isinstance(master_rows, list):
+            continue
+        master_by: dict[str, dict] = {}
+        for mrow in master_rows:
+            if not isinstance(mrow, dict):
+                continue
+            for nk in name_keys:
+                val = str(mrow.get(nk) or "").strip()
+                if val:
+                    master_by[_entry_key(val)] = mrow
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            src = _match_master_row(row, master_by, name_keys)
+            if not isinstance(src, dict):
+                continue
+            if section_key == "experience":
+                for field in ("company", "position", "start_date", "end_date", "location"):
+                    if src.get(field) not in (None, ""):
+                        row[field] = src[field]
+            if section_key == "projects":
+                # Restore truthful GitHub/name from master when LLM stripped links.
+                src_name = str(src.get("name") or "").strip()
+                if src_name and (
+                    "github.com" in src_name.lower()
+                    or not str(row.get("name") or "").strip()
+                ):
+                    row["name"] = src_name
+                for field in ("location", "url", "link", "github", "repository", "summary"):
+                    if src.get(field) not in (None, "") and not str(
+                        row.get(field) or ""
+                    ).strip():
+                        row[field] = src[field]
+            highs = [str(h).strip() for h in (row.get("highlights") or []) if str(h).strip()]
+            master_highs = [
+                str(h).strip()
+                for h in (src.get("highlights") or [])
+                if str(h).strip()
+            ]
+            # Prefer weighty fact-bank bullets over LLM stubs (<80 chars).
+            weighty = [h for h in highs if len(re.sub(r"\*+", "", h)) >= 80]
+            if len(weighty) >= 3:
+                row["highlights"] = weighty[:4]
+                continue
+            merged: list[str] = []
+            seen: set[str] = set()
+            for h in master_highs + weighty + highs:
+                key = h.lower()
+                if not h or key in seen:
+                    continue
+                merged.append(h)
+                seen.add(key)
+                if len(merged) >= 4:
+                    break
+            if merged:
+                row["highlights"] = merged[:4]
+
+    # If the LLM under-supplied slots, JD-rank-fill from the fact bank so density
+    # gates see the master budget (never invent rows — only copy master entries).
+    budget = resolve_page_budget(
+        experience=master_secs.get("experience"),
+        projects=master_secs.get("projects"),
+    )
+    _seed_section_slots_from_master(
+        sections,
+        master_secs,
+        section_key="experience",
+        name_keys=("company",),
+        keep=budget.exp_keep,
+    )
+    _seed_section_slots_from_master(
+        sections,
+        master_secs,
+        section_key="projects",
+        name_keys=("name",),
+        keep=budget.proj_keep,
+    )
+
+    cv = data.get("cv")
+    if isinstance(cv, dict):
+        cv["sections"] = sections
+        data["cv"] = cv
+    _normalize_education_rows(data)
+    _normalize_skills_rows(data)
+
+
+def _seed_section_slots_from_master(
+    sections: dict,
+    master_secs: dict,
+    *,
+    section_key: str,
+    name_keys: tuple[str, ...],
+    keep: int,
+) -> None:
+    """Append JD-unranked master rows until ``keep`` slots are filled."""
+    if keep <= 0:
+        return
+    rows = sections.get(section_key)
+    if not isinstance(rows, list):
+        rows = []
+    master_rows = master_secs.get(section_key)
+    if not isinstance(master_rows, list) or not master_rows:
+        return
+    present: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for nk in name_keys:
+            key = _entry_key(str(row.get(nk) or ""))
+            if key:
+                present.add(key)
+    if len([r for r in rows if isinstance(r, dict)]) >= keep:
+        sections[section_key] = rows
+        return
+    for mrow in master_rows:
+        if not isinstance(mrow, dict):
+            continue
+        keys = [_entry_key(str(mrow.get(nk) or "")) for nk in name_keys]
+        if any(k and k in present for k in keys):
+            continue
+        rows.append({k: v for k, v in mrow.items()})
+        for k in keys:
+            if k:
+                present.add(k)
+        if len([r for r in rows if isinstance(r, dict)]) >= keep:
+            break
+    sections[section_key] = rows
+
+
+_TECH_BOLD_TOKENS = frozenset(
+    {
+        "python",
+        "javascript",
+        "typescript",
+        "nodejs",
+        "node.js",
+        "react",
+        "flask",
+        "fastapi",
+        "pytorch",
+        "tensorflow",
+        "keras",
+        "sklearn",
+        "scikit-learn",
+        "opencv",
+        "yolov8",
+        "xgboost",
+        "postgresql",
+        "postgres",
+        "mysql",
+        "mongodb",
+        "docker",
+        "llm",
+        "llms",
+        "rag",
+        "chatgpt",
+        "claude",
+        "gemini",
+        "cursor",
+        "api",
+        "apis",
+        "rest",
+        "rest api",
+        "rest apis",
+        "dcgan",
+        "gan",
+    }
+)
+
+
+def _inject_jd_bold(
+    data: dict,
+    jd: str | None = None,
+    keywords: list[str] | None = None,
+) -> None:
+    """Bold 2–4 tech tokens per bullet (keywords first; never soft JD nouns)."""
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for raw in list(keywords or []) + list(_jd_tokens(jd or "")):
+        tok = str(raw or "").strip()
+        key = tok.lower()
+        if len(key) < 3 or key in seen or key in _JD_STOPWORDS:
+            continue
+        if key not in _TECH_BOLD_TOKENS and not any(ch.isdigit() or ch in ".#/" for ch in key):
+            continue
+        seen.add(key)
+        tokens.append(tok)
+    tokens.sort(key=len, reverse=True)
+    if not tokens:
+        return
+
+    sections = _cv_sections(data)
+    for key in ("experience", "projects"):
+        rows = sections.get(key)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("highlights"), list):
+                continue
+            new_highs: list[str] = []
+            for h in row["highlights"]:
+                text = str(h or "")
+                if not text.strip():
+                    continue
+                already = len(re.findall(r"\*\*[^*]+\*\*", text))
+                if already >= 2:
+                    new_highs.append(text)
+                    continue
+                bolded = 0
+                for tok in tokens:
+                    if bolded + already >= 4:
+                        break
+                    pat = re.compile(
+                        rf"(?<!\*)\b({re.escape(tok)})\b(?!\*)",
+                        re.IGNORECASE,
+                    )
+                    new_text, n = pat.subn(lambda m: f"**{m.group(1)}**", text, count=1)
+                    if n:
+                        text = new_text
+                        bolded += 1
+                new_highs.append(text)
+            row["highlights"] = new_highs
+
+
+def _reorder_skills_for_jd(data: dict, jd: str | None = None) -> None:
+    """Put JD-overlapping skills first inside each group; rank groups by overlap."""
+    tokens = _jd_tokens(jd or "")
+    sections = _cv_sections(data)
+    skills = sections.get("skills")
+    if not isinstance(skills, list) or not skills:
+        return
+
+    scored: list[tuple[int, int, dict]] = []
+    for idx, row in enumerate(skills):
+        if not isinstance(row, dict):
+            continue
+        details = str(row.get("details") or "")
+        parts = [p.strip() for p in re.split(r"\s*,\s*", details) if p.strip()]
+        if tokens and parts:
+            hit = [p for p in parts if any(t in p.lower() for t in tokens)]
+            parts = hit + [p for p in parts if p not in hit]
+            details = ", ".join(parts)
+        score = sum(1 for t in tokens if t in details.lower()) if tokens else 0
+        scored.append(
+            (
+                -score,
+                idx,
+                {
+                    "label": str(row.get("label") or "Skills").strip(),
+                    "details": _truncate_text(details, MAX_SKILL_DETAIL_CHARS * 2),
+                },
+            )
+        )
+    scored.sort()
+    sections["skills"] = [row for _, _, row in scored][:5]
+    cv = data.get("cv")
+    if isinstance(cv, dict):
+        cv["sections"] = sections
+        data["cv"] = cv
+
+
+def _pair_keyword_evidence(
+    data: dict,
+    keywords: list[str] | None,
+    master_yaml: str = "",
+) -> None:
+    """Ensure supportable JD keywords appear in Skills when truthful in the fact bank."""
+    from src.core.ats_scanner import _token_in_hay
+
+    required = [str(k).strip() for k in (keywords or []) if str(k).strip()]
+    if not required:
+        return
+    sections = _cv_sections(data)
+    resume_blob = yaml.safe_dump(sections, sort_keys=False).lower()
+    master_blob = (master_yaml or "").lower()
+    missing = [
+        kw
+        for kw in required
+        if not _token_in_hay(resume_blob, kw) and _token_in_hay(master_blob, kw)
+    ]
+    if not missing:
+        return
+    skills = sections.get("skills")
+    if not isinstance(skills, list) or not skills:
+        return
+    for kw in missing[:6]:
+        best_i, best_score = 0, -1
+        for i, row in enumerate(skills):
+            if not isinstance(row, dict):
+                continue
+            blob = f"{row.get('label', '')} {row.get('details', '')}".lower()
+            score = sum(1 for t in kw.lower().split() if t in blob)
+            if score > best_score:
+                best_score, best_i = score, i
+        row = skills[best_i]
+        if not isinstance(row, dict):
+            continue
+        details = str(row.get("details") or "")
+        if kw.lower() in details.lower():
+            continue
+        display = kw
+        m = re.search(re.escape(kw), master_yaml or "", flags=re.I)
+        if m:
+            display = m.group(0)
+        row["details"] = _truncate_text(
+            f"{details}, {display}".strip(", ").strip(),
+            MAX_SKILL_DETAIL_CHARS * 2,
+        )
+    sections["skills"] = skills[:5]
+    cv = data.get("cv")
+    if isinstance(cv, dict):
+        cv["sections"] = sections
+        data["cv"] = cv
+
+
 def _normalize_education_rows(data: dict) -> None:
     """College-only education; optional single CGPA highlight (no coursework)."""
     sections = _cv_sections(data)
@@ -854,51 +1345,48 @@ def _drop_precollege_education(yaml_text: str) -> str:
     return yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
 
 
+def _resolve_budget_from_master(
+    master_yaml: str,
+    draft_sections: dict | None = None,
+) -> PageBudget:
+    """Prefer fact-bank volume; fall back to draft sections."""
+    master_secs = _master_cv_sections(master_yaml) if (master_yaml or "").strip() else {}
+    exp = master_secs.get("experience") if master_secs else None
+    proj = master_secs.get("projects") if master_secs else None
+    if not exp and isinstance(draft_sections, dict):
+        exp = draft_sections.get("experience")
+        proj = draft_sections.get("projects")
+    return resolve_page_budget(experience=exp, projects=proj)
+
+
 def _enforce_one_page_budget(
     yaml_text: str,
     *,
     preset: str | None = None,
     jd: str | None = None,
     master_yaml: str | None = None,
+    keywords: list[str] | None = None,
 ) -> str:
-    """Deterministic fresher budget: JD-ranked 2 roles / 2 projects, clean education."""
+    """JD-rank + volume budget → 1-page slots (scales when new jobs are added)."""
     data = yaml.safe_load(yaml_text) or {}
     if not isinstance(data, dict):
         return yaml_text
     data = _unwrap_rendercv_root(data)
-    _normalize_education_rows(data)
-    _normalize_skills_rows(data)
+    master = master_yaml or ""
+    # Fact-bank contracts before ranking so sparse LLM drafts still fill the page.
+    if master.strip():
+        _strip_hallucinated_highlights(data, master)
+        _apply_fact_bank_contracts(data, master)
+    else:
+        _normalize_education_rows(data)
+        _normalize_skills_rows(data)
     _drop_excluded_projects(data)
-    # Only strip metrics when we have a fact bank to compare against — empty
-    # master would delete every quantified bullet (false hallucination cull).
-    if (master_yaml or "").strip():
-        _strip_hallucinated_highlights(data, master_yaml)
     sections = _cv_sections(data)
 
-    experience = sections.get("experience")
-    if isinstance(experience, list) and experience:
-        ranked = _rank_rows_by_jd(experience, jd)
-        # Prefer real internships; drop soft campus filler when we already have 2.
-        ranked = [
-            r
-            for r in ranked
-            if not (
-                isinstance(r, dict)
-                and "university intern" in str(r.get("position") or "").lower()
-                and len(ranked) > 2
-            )
-        ] or ranked
-        sections["experience"] = ranked[:2]
-
-    projects = sections.get("projects")
-    if isinstance(projects, list) and projects:
-        ranked = _rank_rows_by_jd(projects, jd)
-        sections["projects"] = ranked[:2]
-
-    for act_key in ("hackathons_and_activities", "extracurricular", "activities"):
-        acts = sections.get(act_key)
-        if isinstance(acts, list) and len(acts) > 3:
-            sections[act_key] = acts[:3]
+    budget = _resolve_budget_from_master(master, sections)
+    apply_budget_to_sections(
+        sections, budget, rank_fn=_rank_rows_by_jd, jd=jd
+    )
 
     for drop_key in ("certificates", "publications", "interests", "awards"):
         sections.pop(drop_key, None)
@@ -907,6 +1395,10 @@ def _enforce_one_page_budget(
     if isinstance(cv, dict):
         cv["sections"] = sections
         data["cv"] = cv
+
+    _reorder_skills_for_jd(data, jd)
+    _pair_keyword_evidence(data, keywords, master)
+    _inject_jd_bold(data, jd, keywords)
     _reorder_sections(data)
 
     chosen = preset or _select_design_preset(
@@ -933,22 +1425,37 @@ def _hard_shrink_yaml(
     *,
     preset: str = "ultra_dense",
     jd: str | None = None,
+    master_yaml: str | None = None,
+    keywords: list[str] | None = None,
     level: int = 3,
 ) -> str:
     """Progressive 1-page shrink — densify spacing first; keep weighty bullets."""
-    text = _enforce_one_page_budget(yaml_text, preset=preset, jd=jd)
+    master = master_yaml or ""
+    text = _enforce_one_page_budget(
+        yaml_text,
+        preset=preset,
+        jd=jd,
+        master_yaml=master,
+        keywords=keywords,
+    )
     data = yaml.safe_load(text) or {}
     if not isinstance(data, dict):
         return text
     sections = _cv_sections(data)
+    budget = _resolve_budget_from_master(master, sections)
 
-    # Level 1: trim to 4 bullets, keep activities.
-    # Level 2: trim to 3 bullets, keep 2 activity lines.
-    # Level 3: 3 bullets, 1 project only if still overflowing.
-    exp_bullets = 4 if level <= 1 else 3
-    proj_bullets = 4 if level <= 1 else 3
-    proj_keep = 2 if level < 3 else 1
-    act_keep = 3 if level <= 1 else (2 if level == 2 else 2)
+    # Level escalates cuts while respecting the volume-derived keep counts.
+    exp_bullets = min(budget.exp_bullets, 4 if level <= 1 else 3)
+    proj_bullets = min(budget.proj_bullets, 4 if level <= 1 else 3)
+    proj_keep = budget.proj_keep if level < 3 else min(1, budget.proj_keep)
+    # Level 3 may drop one experience slot, but never invent a fixed "always 2".
+    floor_exp = 1 if budget.exp_keep >= 1 else 0
+    exp_keep = (
+        budget.exp_keep
+        if level < 3
+        else max(floor_exp, budget.exp_keep - (1 if budget.exp_keep > 2 else 0))
+    )
+    act_keep = min(budget.act_keep, 3 if level <= 1 else 2)
 
     experience = sections.get("experience")
     if isinstance(experience, list) and experience:
@@ -958,7 +1465,7 @@ def _hard_shrink_yaml(
             )
             if isinstance(row, dict)
             else row
-            for row in experience[:2]
+            for row in experience[:exp_keep]
         ]
 
     projects = sections.get("projects")
@@ -1047,10 +1554,10 @@ def _pdf_page_count(pdf_path: Path) -> int:
 
 # Cap LangGraph draft↔compile retries early for speed (override ACE_MAX_DRAFT_REVISIONS).
 MAX_DRAFT_REVISIONS = max(1, int(os.environ.get("ACE_MAX_DRAFT_REVISIONS", "2")))
-# Skip airy→balanced escalate — start dense by default.
-_START_PRESET = (os.environ.get("ACE_TAILOR_START_PRESET") or "dense").strip().lower()
+# Start readable; overflow densifies, short 1-pagers air out (page-fill).
+_START_PRESET = (os.environ.get("ACE_TAILOR_START_PRESET") or "balanced").strip().lower()
 if _START_PRESET not in _PRESET_ORDER:
-    _START_PRESET = "dense"
+    _START_PRESET = "balanced"
 
 
 def _floor_preset(preset: str) -> str:
@@ -1348,6 +1855,8 @@ def _build_draft_prompt(state: State, *, compact: bool) -> str:
         if compact
         else f"## Resume Style Guide\n---\n{_load_style_guide()}\n---\n"
     )
+    budget = _resolve_budget_from_master(master)
+    budget_block = budget.prompt_lines()
 
     from src.core.prompts import UNTRUSTED_INPUT_GUARDRAIL
     from src.core.security import wrap_untrusted
@@ -1358,6 +1867,9 @@ def _build_draft_prompt(state: State, *, compact: bool) -> str:
         company=state.get("company") or "Unknown",
         track=track,
         track_brief=track_brief(track),
+        budget_block=budget_block,
+        min_bullet=MIN_BULLET_CHARS,
+        max_bullet=MAX_BULLET_CHARS,
         style_extra=style_extra,
         lessons_block=lessons_block,
         jd=wrap_untrusted("job_description", jd),
@@ -1408,31 +1920,35 @@ def draft_node(state: State) -> dict:
             parse_exc,
             raw_text[:240],
         )
+        master_for_budget = state.get("master_yaml") or ""
+        bud = _resolve_budget_from_master(master_for_budget)
         repair = (
             "Your previous reply was not valid RenderCV YAML. "
             "Reply with ONLY a fenced ```yaml block (no prose). "
-            "Must include cv.name and cv.sections with experience (2 roles × 3 "
-            "highlights) and projects (2 × 3 highlights).\n\nBroken output:\n"
+            "Must include cv.name and cv.sections matching this budget:\n"
+            f"{bud.prompt_lines()}\n\nBroken output:\n"
             + _clip_head(raw_text, 3500)
         )
         response = _draft_invoke(repair)
         tailored = _extract_yaml(message_text(getattr(response, "content", response)))
+    master_yaml = state.get("master_yaml") or ""
     tailored = _enforce_one_page_budget(
         tailored,
         jd=state.get("jd") or "",
-        master_yaml=state.get("master_yaml") or "",
+        master_yaml=master_yaml,
+        keywords=list(state.get("required_keywords") or []),
     )
     try:
         data = _unwrap_rendercv_root(yaml.safe_load(tailored) or {})
         if isinstance(data, dict):
-            _strip_hallucinated_highlights(data, state.get("master_yaml") or "")
             _reorder_sections(data)
             tailored = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
     except Exception:
         pass
     preset = _floor_preset(_select_design_preset(tailored))
     tailored = _apply_design(tailored, preset)
-    issues = _bullet_density_issues(tailored)
+    budget = _resolve_budget_from_master(master_yaml)
+    issues = _bullet_density_issues(tailored, budget=budget)
     density_ok = not issues
     feedback = (state.get("critique_feedback") or "").strip()
     if issues:
@@ -1569,8 +2085,18 @@ def compile_node(state: State) -> dict:
     """design_tuner → RenderCV; escalate denser presets before LLM rewrite."""
     jd = state.get("jd") or ""
     master = state.get("master_yaml") or ""
+    keywords = list(state.get("required_keywords") or [])
+    budget = _resolve_budget_from_master(master)
+    budget_hint = budget.prompt_lines()
+    layout = _load_layout_file()
+    vol = layout.get("volume") if isinstance(layout.get("volume"), dict) else {}
+    airy_max = int(vol.get("airy_max_bullets") or 11)
+    dense_min = int(vol.get("dense_min_bullets") or 16)
     tailored = _enforce_one_page_budget(
-        state["current_tailored_yaml"], jd=jd, master_yaml=master
+        state["current_tailored_yaml"],
+        jd=jd,
+        master_yaml=master,
+        keywords=keywords,
     )
     preset = _floor_preset(
         state.get("design_preset") or _select_design_preset(tailored)
@@ -1647,8 +2173,9 @@ def compile_node(state: State) -> dict:
                 "design_preset": preset,
                 "critique_feedback": (
                     (state.get("critique_feedback") or "")
-                    + "\nDraft exceeded 1 page. Prefer 2×3 XYZ bullets; "
-                    "shorten each bullet to ≤120 chars; CGPA-only education."
+                    + "\nDraft exceeded 1 page. Respect budget:\n"
+                    + budget_hint
+                    + "\nShorten each bullet to ≤175 chars; CGPA-only education."
                 ).strip(),
             }
         pdf_path = _resolve_rendercv_pdf(tailored, company_dir, stdout, stderr)
@@ -1658,7 +2185,7 @@ def compile_node(state: State) -> dict:
         return {
             "compile_error": (
                 f"PDF still {pages} pages after ultra_dense preset. "
-                "Prefer 2×3 bullets ≤120 chars; drop weakest project if needed."
+                "Tighten bullets ≤175 chars; drop weakest project if needed."
             ),
             "yaml_path": str(yaml_path),
             "pdf_path": "",
@@ -1666,8 +2193,9 @@ def compile_node(state: State) -> dict:
             "design_preset": preset,
             "critique_feedback": (
                 (state.get("critique_feedback") or "")
-                + "\nStill over 1 page. Keep 2 roles × 3 bullets and 2 projects "
-                "× 3 bullets; shorten each bullet; CGPA-only education."
+                + "\nStill over 1 page. Respect budget:\n"
+                + budget_hint
+                + "\nShorten each bullet; CGPA-only education."
             ).strip(),
         }
 
@@ -1682,7 +2210,12 @@ def compile_node(state: State) -> dict:
             (3, "ultra_dense"),
         ):
             hard = _hard_shrink_yaml(
-                tailored, preset=shrink_preset, jd=jd, level=level
+                tailored,
+                preset=shrink_preset,
+                jd=jd,
+                master_yaml=master,
+                keywords=keywords,
+                level=level,
             )
             yaml_path.write_text(hard, encoding="utf-8")
             code, err, stdout, stderr = _run_rendercv(yaml_path, company_dir)
@@ -1707,8 +2240,8 @@ def compile_node(state: State) -> dict:
             return {
                 "compile_error": (
                     f"PDF still {pages} pages after hard shrink. "
-                    "Cut to 2 experience × 3 bullets and 1–2 projects × 3 bullets; "
-                    "education with NO bullets except optional CGPA: X.X/10."
+                    "Cut to volume budget; education with NO bullets except "
+                    "optional CGPA: X.X/10."
                 ),
                 "yaml_path": str(yaml_path),
                 "pdf_path": "",
@@ -1716,8 +2249,9 @@ def compile_node(state: State) -> dict:
                 "design_preset": preset,
                 "critique_feedback": (
                     (state.get("critique_feedback") or "")
-                    + "\nONE-PAGE FAIL: CGPA-only education; 2 roles; "
-                    "drop to 1 project if needed; ≤120-char bullets."
+                    + "\nONE-PAGE FAIL: CGPA-only education; respect budget:\n"
+                    + budget_hint
+                    + "\n≤175-char bullets."
                 ).strip(),
             }
 
@@ -1731,6 +2265,34 @@ def compile_node(state: State) -> dict:
             "design_preset": preset,
         }
 
+    # Short 1-pager: loosen spacing (airy ← balanced ← dense) while staying on 1 page.
+    # Invariant: leftover whitespace should shrink via chrome, not invent content.
+    try:
+        bullet_n = _count_highlights(yaml.safe_load(tailored) or {})
+    except Exception:
+        bullet_n = 99
+    if bullet_n <= dense_min:
+        airier = _next_airier_preset(preset)
+        while airier is not None:
+            candidate = _apply_design(tailored, airier)
+            yaml_path.write_text(candidate, encoding="utf-8")
+            code, err, stdout, stderr = _run_rendercv(yaml_path, company_dir)
+            if code != 0:
+                break
+            cand_pdf = _resolve_rendercv_pdf(candidate, company_dir, stdout, stderr)
+            cand_pages = _pdf_page_count(cand_pdf) if cand_pdf.is_file() else -1
+            if cand_pages != 1:
+                # Revert to last known good 1-page render.
+                tailored = _apply_design(tailored, preset)
+                yaml_path.write_text(tailored, encoding="utf-8")
+                _run_rendercv(yaml_path, company_dir)
+                break
+            tailored = candidate
+            preset = airier
+            pdf_path = cand_pdf
+            pages = 1
+            airier = _next_airier_preset(preset)
+
     # Sparse 1-page: one optional expand pass if volume is still thin.
     prior_fb = state.get("critique_feedback") or ""
     if (
@@ -1743,11 +2305,11 @@ def compile_node(state: State) -> dict:
             bullets = _count_highlights(yaml.safe_load(tailored) or {})
         except Exception:
             bullets = 99
-        if bullets < 10:
+        if bullets < airy_max:
             return {
                 "compile_error": (
                     "Page fits but content looks sparse. Deepen XYZ bullets "
-                    "with fact-bank stack detail (keep ≤120 chars)."
+                    "with fact-bank stack detail (keep ≤175 chars)."
                 ),
                 "yaml_path": str(yaml_path),
                 "pdf_path": "",
@@ -1755,8 +2317,9 @@ def compile_node(state: State) -> dict:
                 "design_preset": preset,
                 "critique_feedback": (
                     prior_fb
-                    + "\nSPARSE LAYOUT: expand to 3 XYZ bullets per entry using "
-                    "fact-bank technical depth (no invented metrics)."
+                    + "\nSPARSE LAYOUT: expand using fact-bank depth to meet "
+                    "budget:\n"
+                    + budget_hint
                 ).strip(),
             }
 
@@ -1876,11 +2439,15 @@ def tailor_with_graph(
     """
     from src.core.resume_artifacts import jd_signature, lookup_artifact, store_artifact
 
+    company_key = (company or "").strip()
+    if company_key.lower() in ("", "unknown"):
+        company_key = ""
     artifact_key, supportable = jd_signature(
         jd,
         master_yaml,
         track=job_track,
         title=job_title,
+        company=company_key,
     )
     hit = lookup_artifact(artifact_key)
     if hit is not None:
@@ -1918,29 +2485,21 @@ def tailor_with_graph(
     pdf_path = (result.get("pdf_path") or "").strip()
     yaml_text = (result.get("current_tailored_yaml") or "").strip()
     if not pdf_path or not Path(pdf_path).is_file():
-        # Version-banner / compile failure: ship static base resume rather than abort.
+        # Fail closed for apply enqueue — never cache an untailored static PDF
+        # under a JD fingerprint (silent wrong reuse).
         fallback = _default_base_resume_pdf()
         if fallback is not None:
             logger.warning(
-                "Tailor graph missing PDF (compile_error=%r) — using base resume %s",
+                "Tailor graph missing PDF (compile_error=%r) — degraded base "
+                "resume %s (not cached)",
                 (result.get("compile_error") or "")[:240],
                 fallback.name,
             )
-            resolved = str(fallback)
-            if yaml_text:
-                try:
-                    store_artifact(
-                        artifact_key,
-                        pdf_path=resolved,
-                        yaml_text=yaml_text,
-                        supportable=supportable,
-                        track=job_track,
-                        title=job_title,
-                        ats_score=result.get("ats_score"),
-                    )
-                except Exception:
-                    logger.debug("resume artifact store failed", exc_info=True)
-            return resolved, yaml_text or ""
+            raise FileNotFoundError(
+                "TAILOR_DEGRADED: compile produced no PDF "
+                f"(compile_error={result.get('compile_error')!r}); "
+                f"refusing to cache fallback {fallback.name}"
+            )
         raise FileNotFoundError(
             "Tailor graph finished without a PDF "
             f"(last ATS score={result.get('ats_score')}/"
@@ -1949,6 +2508,16 @@ def tailor_with_graph(
             f"compile_error={result.get('compile_error')!r})"
         )
     resolved = str(Path(pdf_path).resolve())
+    # Never ship sparse / broken layout PDFs into the apply queue.
+    master_budget = _resolve_budget_from_master(master_yaml)
+    quality_issues = _bullet_density_issues(yaml_text, budget=master_budget)
+    if quality_issues or not bool(result.get("density_ok", True)):
+        detail = "; ".join(quality_issues) or (
+            result.get("critique_feedback") or "density_ok=false"
+        )
+        raise ValueError(
+            "RESUME_QUALITY_FAIL: refusing to enqueue apply — " + detail[:500]
+        )
     try:
         store_artifact(
             artifact_key,

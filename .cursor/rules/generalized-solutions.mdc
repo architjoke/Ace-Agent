@@ -1,0 +1,24 @@
+---
+description: Prefer general, reusable designs over one-off task-specific patches
+alwaysApply: true
+---
+
+# Generalized solutions only
+
+Never ship a fix that only works for the exact failure in front of you. Solve the **class** of problem with durable structure, contracts, and policies.
+
+## Do
+
+- Name the invariant (e.g. “host spacing must survive restarts”, “title alone never bypasses JD fit”).
+- Prefer shared helpers, schema/versioned caches, env knobs, and killable boundaries over magic constants.
+- Design so tomorrow’s similar case is already covered without another special-case patch.
+
+## Don’t
+
+- Raise a peek limit / hardcode one host / one company / one title / one provider as the “fix”.
+- Add `if company == "Coy"` or “only when Groq TPM” one-offs when a general quota/quality gate exists.
+- Leave silent wrong reuse (caches, fallbacks) that paper over a missing fingerprint or policy.
+
+## Smell test
+
+If removing the brand, JD, host, or provider name from the change would break it, the solution is too specific — generalize first.

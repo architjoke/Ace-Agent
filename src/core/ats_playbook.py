@@ -50,12 +50,16 @@ A skill listed only in Skills with no evidence elsewhere is weak (orphan keyword
 - Keep bullets concise; no first-person; no fluff
 
 ## Structural ATS rules (RenderCV / parseability)
-- Keep valid RenderCV YAML; single-column themes only (classic is fine)
+- Keep valid RenderCV YAML; theme monopoly is custom ``ace`` only (no stock themes)
 - Standard section titles: summary, education, experience, projects, skills
 - Contact in body fields (name/email/phone/social_networks), never invented headers
 - Consistent date formats already used in the master YAML
 - No tables, multi-column hacks, icons, or images in content
 """
+
+# role_family registry seed — content emphasis only; chrome stays ace presets.
+# Future multi-persona: map onboarding “studies + target roles” → these keys.
+ROLE_FAMILIES = ("SDE", "AI", "ML", "PRODUCT", "GENERAL")
 
 TRACK_GUIDANCE = {
     "SDE": (
@@ -69,6 +73,10 @@ TRACK_GUIDANCE = {
     "ML": (
         "Prioritize ML pipelines: Scikit-learn/XGBoost/TensorFlow, feature engineering, "
         "training/evaluation, OpenCV/YOLO when relevant, and measurable model quality work."
+    ),
+    "PRODUCT": (
+        "Prioritize AI product experimentation, prototypes, APIs, evaluation/testing, "
+        "tooling (Cursor/Claude when factual), documentation, and cross-functional delivery."
     ),
 }
 

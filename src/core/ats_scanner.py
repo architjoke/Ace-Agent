@@ -60,9 +60,97 @@ _STOPISH = {
     "this",
     "your",
     "our",
+    "you",
+    "we",
+    "they",
+    "them",
+    "their",
+    "his",
+    "her",
+    "who",
+    "what",
+    "when",
+    "where",
+    "why",
+    "how",
+    "about",
+    "across",
+    "have",
+    "has",
+    "had",
+    "are",
+    "was",
+    "were",
+    "will",
+    "can",
+    "more",
+    "most",
+    "other",
+    "such",
+    "than",
+    "then",
+    "also",
+    "into",
+    "over",
+    "under",
+    "please",
+    "world",
+    "global",
+    "belonging",
+    "build",
+    "building",
+    "built",
+    "add",
+    "added",
+    "back",
+    "consumers",
+    "consumer",
+    "directly",
+    "founding",
+    "completed",
     "ace",
     "basics",
     "software",
+    # Soft unigrams TF-IDF loves — never gate ATS (multi-word tech kept via phrases)
+    "product",
+    "products",
+    "feature",
+    "features",
+    "development",
+    "approach",
+    "approaches",
+    "documentation",
+    "workflow",
+    "workflows",
+    "tools",
+    "technologies",
+    "technology",
+    "concepts",
+    "platform",
+    "platforms",
+    "application",
+    "applications",
+    "system",
+    "systems",
+    "quality",
+    "support",
+    "supporting",
+    "understanding",
+    "familiarity",
+    "curiosity",
+    "communication",
+    "students",
+    "graduates",
+    "interest",
+    "environment",
+    "analysis",
+    "users",
+    "feedback",
+    "learning",
+    "problems",
+    "someone",
+    "available",
+    "india",
 }
 
 _TECH_PHRASES = [
@@ -92,11 +180,66 @@ _TECH_PHRASES = [
     "decision trees",
     "generative ai",
     "large language",
+    "large language models",
     "natural language",
+    "prompt engineering",
+    "agentic workflows",
+    "ai agents",
+    "vector search",
+    "proof of concept",
+    "user stories",
     "ci/cd",
     "unit testing",
     "system design",
 ]
+
+# Exact tool/stack tokens to lift from a JD when present (high-precision ATS).
+_KNOWN_TECH_TOKENS = (
+    "python",
+    "javascript",
+    "typescript",
+    "node.js",
+    "nodejs",
+    "react",
+    "fastapi",
+    "flask",
+    "django",
+    "pytorch",
+    "tensorflow",
+    "keras",
+    "scikit-learn",
+    "sklearn",
+    "opencv",
+    "yolov8",
+    "xgboost",
+    "postgresql",
+    "postgres",
+    "mysql",
+    "mongodb",
+    "redis",
+    "docker",
+    "kubernetes",
+    "aws",
+    "gcp",
+    "azure",
+    "llm",
+    "llms",
+    "rag",
+    "chatgpt",
+    "claude",
+    "gemini",
+    "cursor",
+    "langchain",
+    "openai",
+    "rest api",
+    "rest apis",
+    "graphql",
+    "fastapi",
+    "agile",
+    "scrum",
+    "api",
+    "apis",
+)
 
 
 @lru_cache(maxsize=1)
@@ -145,7 +288,12 @@ def _tfidf_terms(jd_text: str, top_k: int = 20) -> list[str]:
         if score <= 0:
             continue
         tokens = term.split()
-        if any(tok in _STOPISH for tok in tokens):
+        # Unigrams: hard stop-list. Phrases: only drop if every token is soft
+        # (keeps "machine learning" even when "learning" alone is fluff).
+        if len(tokens) == 1:
+            if tokens[0] in _STOPISH:
+                continue
+        elif all(tok in _STOPISH for tok in tokens):
             continue
         if len(term) < 2:
             continue
@@ -188,6 +336,87 @@ def _regex_tech_tokens(jd_text: str, limit: int = 25) -> list[str]:
     return [term for term, count in ranked if count >= 1][:limit]
 
 
+def _looks_technical(term: str) -> bool:
+    """Keep multi-word phrases; drop soft single English nouns from ATS gates."""
+    key = _normalize(term)
+    if not key or key in _STOPISH:
+        return False
+    if " " in key or "/" in key or "." in key or "#" in key or "+" in key:
+        return True
+    if any(ch.isdigit() for ch in key):
+        return True
+    # Known short tech tokens
+    if key in {
+        "python",
+        "java",
+        "javascript",
+        "typescript",
+        "sql",
+        "nosql",
+        "html",
+        "css",
+        "react",
+        "angular",
+        "vue",
+        "django",
+        "flask",
+        "fastapi",
+        "pytorch",
+        "tensorflow",
+        "keras",
+        "numpy",
+        "pandas",
+        "docker",
+        "kubernetes",
+        "aws",
+        "gcp",
+        "azure",
+        "linux",
+        "git",
+        "github",
+        "llm",
+        "llms",
+        "rag",
+        "nlp",
+        "cnn",
+        "gan",
+        "dcgan",
+        "yolo",
+        "yolov8",
+        "api",
+        "apis",
+        "rest",
+        "graphql",
+        "postgres",
+        "postgresql",
+        "mysql",
+        "mongodb",
+        "redis",
+        "kafka",
+        "spark",
+        "hadoop",
+        "opencv",
+        "scikit",
+        "xgboost",
+        "chatgpt",
+        "claude",
+        "gemini",
+        "cursor",
+        "langchain",
+        "openai",
+        "agile",
+        "scrum",
+        "jira",
+        "figma",
+    }:
+        return True
+    # Soft unigrams already in _STOPISH; remaining alpha-only 3–4 letter
+    # tokens are usually noise (poc alone is ok via known list).
+    if len(key) <= 3:
+        return False
+    return True
+
+
 def extract_jd_keywords(jd_text: str, top_k: int = 20) -> list[str]:
     """Extract top technical keywords/phrases from a JD via spaCy/TF-IDF/regex."""
     jd_norm = _normalize(jd_text or "")
@@ -201,11 +430,35 @@ def extract_jd_keywords(jd_text: str, top_k: int = 20) -> list[str]:
         key = _normalize(term)
         if not key or key in seen or key in _STOPISH:
             return
+        if not _looks_technical(key):
+            return
+        # Drop soft multi-word HR phrases unless explicitly whitelisted.
+        tokens = key.split()
+        if len(tokens) >= 2 and key not in {p.lower() for p in _TECH_PHRASES}:
+            if key not in _KNOWN_TECH_TOKENS:
+                techish = sum(
+                    1
+                    for t in tokens
+                    if t in _KNOWN_TECH_TOKENS
+                    or any(ch.isdigit() for ch in t)
+                    or "." in t
+                    or "/" in t
+                )
+                if techish == 0:
+                    return
         seen.add(key)
         ordered.append(key)
 
+    # Known tools mentioned in the JD — highest precision (word boundaries).
+    for tok in _KNOWN_TECH_TOKENS:
+        if _token_in_hay(jd_norm, tok):
+            _add(tok)
+    # Phrases next.
     for phrase in _phrase_hits(jd_norm):
         _add(phrase)
+    for term in _tfidf_terms(jd_text, top_k=top_k * 2):
+        if " " in term or "/" in term or "." in term:
+            _add(term)
     nouns = _spacy_nouns(jd_text) or _regex_tech_tokens(jd_text)
     for noun in nouns:
         _add(noun)
@@ -215,6 +468,16 @@ def extract_jd_keywords(jd_text: str, top_k: int = 20) -> list[str]:
     keywords = ordered[:top_k]
     logger.info("Extracted %s JD keywords: %s", len(keywords), keywords)
     return keywords
+
+
+def _token_in_hay(hay: str, token: str) -> bool:
+    """Word-boundary containment so short tokens like 'rag' don't hit 'average'."""
+    tok = _normalize(token)
+    if not tok or not hay:
+        return False
+    if " " in tok:
+        return tok in hay
+    return re.search(rf"(?<![a-z0-9]){re.escape(tok)}(?![a-z0-9])", hay) is not None
 
 
 def filter_supportable_keywords(
@@ -229,25 +492,43 @@ def filter_supportable_keywords(
         key = _normalize(kw)
         if not key:
             continue
-        if key in hay or all(tok in hay for tok in key.split() if len(tok) > 2):
+        parts = [t for t in key.split() if len(t) > 2]
+        if _token_in_hay(hay, key) or (parts and all(_token_in_hay(hay, t) for t in parts)):
             supportable.append(key)
         else:
             unsupported.append(key)
     return supportable, unsupported
 
 
+def _keyword_aliases(keyword: str) -> list[str]:
+    key = _normalize(keyword)
+    if not key:
+        return []
+    aliases = [key]
+    # Common singular/plural + dotted variants for ATS matching.
+    swaps = {
+        "api": ["apis", "rest api", "rest apis"],
+        "apis": ["api", "rest api", "rest apis"],
+        "rest api": ["rest apis", "api", "apis"],
+        "rest apis": ["rest api", "api", "apis"],
+        "node.js": ["nodejs", "node"],
+        "nodejs": ["node.js", "node"],
+        "postgres": ["postgresql"],
+        "postgresql": ["postgres"],
+        "llm": ["llms"],
+        "llms": ["llm"],
+    }
+    for extra in swaps.get(key, []):
+        if extra not in aliases:
+            aliases.append(extra)
+    return aliases
+
+
 def _keyword_found(resume_norm: str, keyword: str) -> bool:
     key = _normalize(keyword)
     if not key:
         return False
-    if key in resume_norm:
-        return True
-    if " " not in key:
-        return (
-            re.search(rf"(?<![a-z0-9]){re.escape(key)}(?![a-z0-9])", resume_norm)
-            is not None
-        )
-    return False
+    return any(_token_in_hay(resume_norm, alias) for alias in _keyword_aliases(key))
 
 
 def calculate_ats_score(
@@ -339,7 +620,10 @@ def resolve_ats_pass_score(
             key_s = str(key or "").strip()
             if not key_s:
                 continue
-            if key_s.lower() in lowered or lowered in key_s.lower():
+            key_l = key_s.lower()
+            # Prefer key⊆company (not bidirectional) so short company names
+            # cannot match longer override keys by accident.
+            if key_l == lowered or (len(key_l) >= 3 and key_l in lowered):
                 score = int(value)
                 reason = f"company_override:{key_s}"
                 break

@@ -218,6 +218,45 @@ def tailor_job(
             "yaml_snapshot": yaml_snapshot,
         }
     except Exception as exc:
+        msg = str(exc)
+        if "TOKEN_LIMIT_REACHED" in msg or "HIT LIMIT REACHED" in msg:
+            from src.core.llm_router import mark_token_limit_reached, token_limit_reached
+
+            if not token_limit_reached():
+                mark_token_limit_reached(msg)
+            logger.error(
+                "[HIT LIMIT REACHED] tailor stopped for %s — %s",
+                company,
+                msg[:240],
+            )
+            log_application(
+                company,
+                job_url,
+                job_track,
+                "TOKEN_LIMIT_REACHED",
+                error_log=f"tailor_token_limit: {type(exc).__name__}: {exc}",
+                jd_text=description,
+                tailored_yaml_snapshot=yaml_snapshot,
+                job_title=str(triage.get("title") or ""),
+            )
+            return None
+        if "RESUME_QUALITY_FAIL" in msg or "TAILOR_DEGRADED" in msg:
+            logger.error(
+                "Resume quality/degraded gate blocked enqueue for %s — %s",
+                company,
+                msg[:300],
+            )
+            log_application(
+                company,
+                job_url,
+                job_track,
+                "FAILED",
+                error_log=f"resume_quality: {exc}",
+                jd_text=description,
+                tailored_yaml_snapshot=yaml_snapshot,
+                job_title=str(triage.get("title") or ""),
+            )
+            return None
         logger.exception("Tailoring failed for %s — continuing", company)
         log_application(
             company,
@@ -270,6 +309,12 @@ async def apply_job(
             jd_text=jd_text,
             tailored_yaml_snapshot=yaml_snapshot,
             job_title=title,
+        )
+        # Drop rebuild scratch — Submitted/ already holds the archived PDF.
+        from src.core.output_artifacts import release_company_build
+
+        release_company_build(
+            company, pdf_path=pdf_path, archive=False, reason=reason
         )
         return "already_applied"
 
@@ -325,6 +370,14 @@ async def apply_job(
             jd_text=jd_text,
             tailored_yaml_snapshot=yaml_snapshot,
             job_title=title,
+        )
+        from src.core.output_artifacts import release_company_build
+
+        release_company_build(
+            company,
+            pdf_path=pdf_path,
+            archive=False,
+            reason="already_applied",
         )
         return "already_applied"
     except JobClosedError as exc:
@@ -514,14 +567,36 @@ async def _produce_one(
     async with produce_sem:
         if stop_produce.is_set():
             return
+        from src.core.llm_router import token_limit_detail, token_limit_reached
+
+        if token_limit_reached():
+            logger.error(
+                "[HIT LIMIT REACHED] stopping producers — %s",
+                token_limit_detail(),
+            )
+            stop_produce.set()
+            counts["token_limit_reached"] = counts.get("token_limit_reached", 0) + 1
+            return
         triage = await asyncio.to_thread(triage_job, job, master_text, min_fit)
         if triage is None:
             counts["dropped"] = counts.get("dropped", 0) + 1
+            return
+        if token_limit_reached():
+            logger.error(
+                "[HIT LIMIT REACHED] stopping producers after triage — %s",
+                token_limit_detail(),
+            )
+            stop_produce.set()
             return
         async with groq_sem:
             tailored = await asyncio.to_thread(tailor_job, triage, master_yaml)
         if tailored is None:
             counts["failed"] = counts.get("failed", 0) + 1
+            if token_limit_reached():
+                logger.error(
+                    "[HIT LIMIT REACHED] tailor burned quotas — stop producers"
+                )
+                stop_produce.set()
             return
         snap = tailored.get("yaml_snapshot") or ""
         if tailored.get("citizenship_review") and "ace:citizenship_review=1" not in snap:
@@ -576,16 +651,88 @@ async def _wait_queue_warm(
         await asyncio.sleep(poll_sec)
 
 
+async def _drain_apply_queue(
+    *,
+    master_yaml: Path,
+    browser_workers: int,
+    counts: dict[str, int],
+) -> dict[str, int]:
+    """Apply READY/CLAIMED backlog only (no hunt/tailor) — resume after HIT LIMIT."""
+    producers_done = asyncio.Event()
+    producers_done.set()
+
+    async def _apply_wrapper(**kwargs: Any) -> str:
+        outcome = await apply_job(**kwargs)
+        counts[outcome] = counts.get(outcome, 0) + 1
+        return outcome
+
+    logger.info(
+        "Draining apply queue first (READY=%s CLAIMED=%s) — maximize submits before hunt",
+        queue_counts().get("READY", 0),
+        queue_counts().get("CLAIMED", 0),
+    )
+    pool_result = await run_browser_pool(
+        master_yaml=master_yaml,
+        apply_fn=_apply_wrapper,
+        n_workers=browser_workers,
+        producers_done=producers_done,
+    )
+    if isinstance(pool_result, dict):
+        logger.info("Queue drain finished: %s", pool_result)
+        for k, v in pool_result.items():
+            if k not in counts:
+                counts[k] = 0
+    return pool_result if isinstance(pool_result, dict) else {}
+
+
+async def _linkedin_batch_cleanup(counts: dict[str, int]) -> None:
+    li_touched = (
+        int(counts.get("success", 0))
+        + int(counts.get("fallback", 0))
+        + int(counts.get("requires_human", 0))
+        + int(counts.get("failed", 0))
+    )
+    if li_touched <= 0:
+        return
+    logger.info("Batch LinkedIn resume cleanup (%s)…", APPLY_RESUME_FILENAME)
+    try:
+        from src.core.settings import get_settings as _gs
+
+        cleanup_profile = worker_profile_dir("w1")
+        out_dir = Path(_gs().output_dir)
+        sample = out_dir / APPLY_RESUME_FILENAME
+        pdf_hint = sample if sample.is_file() else out_dir / APPLY_RESUME_FILENAME
+        await cleanup_linkedin_uploaded_resume(
+            pdf_hint,
+            user_data_dir=cleanup_profile,
+        )
+    except Exception:
+        logger.exception("Batch LinkedIn resume cleanup failed")
+
+
 async def run_parallel(
     location: str | None = None,
     max_results_per_track: int | None = None,
     master_yaml: Path | None = None,
     target_companies: int | None = None,
 ) -> int:
-    """Discover → parallel triage/tailor → N browser workers → batch LinkedIn cleanup."""
+    """Discover → parallel triage/tailor → N browser workers → batch LinkedIn cleanup.
+
+    Quota-aware: restores HIT LIMIT from disk, drains READY backlog first, and
+    skips hunt/tailor while draft quotas are exhausted (next-day auto-reset).
+    """
+    from src.core.llm_router import (
+        blocks_browser_applies,
+        sync_token_limit_state,
+        token_limit_detail,
+        token_limit_reached,
+        token_limit_reset_at,
+    )
+
     settings = reload_settings()
     init_db()
     init_queue()
+    sync_token_limit_state()
 
     master_yaml = Path(master_yaml or settings.master_yaml).expanduser().resolve()
     if not master_yaml.is_file():
@@ -610,6 +757,48 @@ async def run_parallel(
     warm_n = _env_int("ACE_QUEUE_WARM_THRESHOLD", 2)
     browser_workers = max(1, int(settings.browser_workers))
     groq_slots = max(1, int(settings.groq_concurrency))
+
+    counts: dict[str, int] = {
+        "success": 0,
+        "fallback": 0,
+        "dropped": 0,
+        "failed": 0,
+        "skipped": 0,
+        "queued": 0,
+    }
+
+    q0 = queue_counts()
+    backlog = int(q0.get("READY", 0)) + int(q0.get("CLAIMED", 0))
+
+    # 1) Always drain existing tailored packages first (resume after yesterday's limit).
+    if backlog > 0 and not blocks_browser_applies():
+        await _drain_apply_queue(
+            master_yaml=master_yaml,
+            browser_workers=browser_workers,
+            counts=counts,
+        )
+        await _linkedin_batch_cleanup(counts)
+        sync_token_limit_state()
+
+    # 2) Draft HIT LIMIT with empty/blocked queue → no hunt (save quotas for tomorrow).
+    if token_limit_reached():
+        reset_at = token_limit_reset_at()
+        logger.error(
+            "[HIT LIMIT REACHED] skipping hunt/tailor until reset (%.0f) — %s "
+            "(queue READY=%s). Start again after reset to resume applies.",
+            reset_at,
+            token_limit_detail()[:200],
+            queue_counts().get("READY", 0),
+        )
+        await _linkedin_batch_cleanup(counts)
+        logger.info(
+            "Done (quota pause) — success=%s fallback=%s failed=%s queued=%s",
+            counts.get("success", 0),
+            counts.get("fallback", 0),
+            counts.get("failed", 0),
+            counts.get("queued", 0),
+        )
+        return 0
 
     logger.info(
         "Parallel hunt near %s — %s/track fit≥%s | produce=%s groq=%s browsers=%s warm≥%s%s",
@@ -641,14 +830,6 @@ async def run_parallel(
 
     logger.info("Discovered %s unique jobs — parallel triage/tailor → apply queue", len(jobs))
 
-    counts: dict[str, int] = {
-        "success": 0,
-        "fallback": 0,
-        "dropped": 0,
-        "failed": 0,
-        "skipped": 0,
-        "queued": 0,
-    }
     produce_sem = asyncio.Semaphore(produce_n)
     groq_sem = asyncio.Semaphore(groq_slots)
     stop_produce = asyncio.Event()
@@ -705,28 +886,7 @@ async def run_parallel(
     if isinstance(pool_result, dict):
         logger.info("Browser pool finished: %s", pool_result)
 
-    # Batch LinkedIn resume cleanup once per cycle (success or after LI attempts).
-    li_touched = (
-        int(counts.get("success", 0))
-        + int(counts.get("fallback", 0))
-        + int(counts.get("requires_human", 0))
-        + int(counts.get("failed", 0))
-    )
-    if li_touched > 0:
-        logger.info("Batch LinkedIn resume cleanup (%s)…", APPLY_RESUME_FILENAME)
-        try:
-            from src.core.settings import get_settings as _gs
-
-            cleanup_profile = worker_profile_dir("w1")
-            out_dir = Path(_gs().output_dir)
-            sample = out_dir / APPLY_RESUME_FILENAME
-            pdf_hint = sample if sample.is_file() else out_dir / APPLY_RESUME_FILENAME
-            await cleanup_linkedin_uploaded_resume(
-                pdf_hint,
-                user_data_dir=cleanup_profile,
-            )
-        except Exception:
-            logger.exception("Batch LinkedIn resume cleanup failed")
+    await _linkedin_batch_cleanup(counts)
 
     logger.info(
         "Done — success=%s fallback=%s dropped=%s failed=%s queued=%s total_jobs=%s",

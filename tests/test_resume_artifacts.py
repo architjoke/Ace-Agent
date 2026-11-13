@@ -196,6 +196,32 @@ def test_expired_ttl_and_missing_pdf(tmp_path, monkeypatch):
     assert ra.lookup_artifact(key, db_path=db, now=now) is None
 
 
+def test_company_changes_fingerprint_when_pass_score_differs(monkeypatch):
+    from src.core import resume_artifacts as ra
+
+    _stub_keyword_extract(monkeypatch)
+
+    def _resolve(**kwargs):
+        company = (kwargs.get("company") or "").lower()
+        if "strictcorp" in company:
+            return {"pass_score": 95, "reason": "company_override:StrictCorp"}
+        return {"pass_score": 85, "reason": "default"}
+
+    monkeypatch.setattr(
+        "src.core.ats_scanner.resolve_ats_pass_score",
+        _resolve,
+    )
+    jd = "Requirements\n- Python\n- FastAPI\n"
+    master = _master_python()
+    key_a, _ = ra.jd_signature(
+        jd, master, track="SDE", title="SDE", company="Acme"
+    )
+    key_b, _ = ra.jd_signature(
+        jd, master, track="SDE", title="SDE", company="StrictCorp"
+    )
+    assert key_a != key_b
+
+
 def test_title_only_lookup_never_hits():
     from src.core.tailor import lookup_archetype_pdf, store_archetype_pdf
 

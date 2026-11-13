@@ -15,33 +15,20 @@
 = <<cv.name|escape_typst_characters>>
 ((* endif *))
 
-// Labeled connections: Email / Phone / LinkedIn / GitHub (icons optional)
+// Compact connections: icon + value only (no Location:/Email: labels — those
+// force 2–3 wrapped header rows and leave the bottom of the page empty).
 #let connections-list = (
 ((* for connection in cv.connections *))
   [((*- if connection["url"] and design.header.make_connections_links -*))
   #box(original-link("<<connection["url"]>>")[
   ((*- endif -*))
   ((*- if design.header.use_icons_for_connections -*))
-    #fa-icon("<<connection["typst_icon"]>>", size: 0.9em) #h(0.05cm)
+    #fa-icon("<<connection["typst_icon"]>>", size: 0.85em) #h(0.06cm)
   ((*- endif -*))
-  ((*- if connection["typst_icon"] == "location-dot" -*))
-    *Location:* #h(0.08cm)<<connection["placeholder"]|escape_typst_characters>>
-  ((*- elif connection["typst_icon"] == "envelope" -*))
-    *Email:* #h(0.08cm)<<connection["placeholder"]|escape_typst_characters>>
-  ((*- elif connection["typst_icon"] == "phone" -*))
-    *Phone:* #h(0.08cm)<<connection["placeholder"]|escape_typst_characters>>
-  ((*- elif connection["typst_icon"] == "linkedin" -*))
-    *LinkedIn:* #h(0.08cm)<<connection["clean_url"]|escape_typst_characters>>
-  ((*- elif connection["typst_icon"] == "github" -*))
-    *GitHub:* #h(0.08cm)<<connection["clean_url"]|escape_typst_characters>>
-  ((*- elif connection["typst_icon"] == "link" -*))
-    *Website:* #h(0.08cm)<<connection["clean_url"]|escape_typst_characters>>
+  ((*- if connection["typst_icon"] in ["linkedin", "github", "link"] and connection["url"] -*))
+    <<connection["clean_url"]|escape_typst_characters>>
   ((*- else -*))
-    ((*- if not design.header.use_urls_as_placeholders_for_connections or not connection["url"] -*))
-      <<connection["placeholder"]|escape_typst_characters>>
-    ((*- else -*))
-      <<connection["clean_url"]|escape_typst_characters>>
-    ((*- endif -*))
+    <<connection["placeholder"]|escape_typst_characters>>
   ((*- endif -*))
   ((*- if connection["url"] and design.header.make_connections_links -*))
   ])

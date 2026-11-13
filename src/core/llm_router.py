@@ -12,9 +12,12 @@ Cohere is the cloud escape hatch when OpenAI is out of credits / rate-limited.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import time
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Callable, Literal
 
 logger = logging.getLogger(__name__)
@@ -97,6 +100,7 @@ _FAILOVER_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504})
 
 # Soft cooldown so burned TPD / empty OpenAI credits don't burn seconds every draft.
 _PROVIDER_COOLDOWN_UNTIL: dict[str, float] = {}
+# Hard quota/credit burns → immediate HIT LIMIT REACHED (stop the batch).
 _HARD_BURN_NEEDLES = (
     "tokens per day",
     "tpd",
@@ -105,33 +109,176 @@ _HARD_BURN_NEEDLES = (
     "billing",
     "you exceeded your current quota",
 )
-# Set when every provider in a role chain is hard-burned / cooled — batch should pause.
+# Dead/retired models — park provider only (do not claim "quota" globally).
+_PROVIDER_DEAD_NEEDLES = (
+    "end of life",
+    "no longer available",
+)
+# Temporary rate limits (TPM / trial RPM) — short cooldown; stop after repeats.
+_SOFT_RATE_NEEDLES = (
+    "tokens per minute",
+    "tpm",
+    "rate_limit_exceeded",
+    "too many requests",
+    "trial key",
+    "20 api calls / minute",
+)
+_SOFT_RATE_FAILS: dict[str, int] = {}
+_SOFT_RATE_STOP_AFTER = 5
+# Set when hard quota burn / repeated soft limits — batch must pause.
 _TOKEN_LIMIT_REACHED = False
 _TOKEN_LIMIT_DETAIL = ""
+# Vision/browser burns stop Chromium applies; draft/TPM burns do not (drain READY).
+_BLOCKS_BROWSER_APPLIES = False
+_TOKEN_LIMIT_RESET_AT = 0.0  # epoch seconds; 0 = unset
+_QUOTA_STATE_PATH = Path(__file__).resolve().parents[2] / "data" / "quota_state.json"
 
 
 def token_limit_reached() -> bool:
+    """True when draft/hunt/tailor should pause (persisted across restarts)."""
     return bool(_TOKEN_LIMIT_REACHED)
+
+
+def blocks_browser_applies() -> bool:
+    """True when browser apply pool must stop (vision/Gemini capacity, etc.)."""
+    return bool(_TOKEN_LIMIT_REACHED and _BLOCKS_BROWSER_APPLIES)
 
 
 def token_limit_detail() -> str:
     return _TOKEN_LIMIT_DETAIL or "API token/quota limit reached"
 
 
-def mark_token_limit_reached(detail: str = "") -> None:
-    global _TOKEN_LIMIT_REACHED, _TOKEN_LIMIT_DETAIL
+def token_limit_reset_at() -> float:
+    return float(_TOKEN_LIMIT_RESET_AT or 0.0)
+
+
+def _next_local_midnight_ts() -> float:
+    """Quota day boundary — next local midnight (maximize applies per calendar day)."""
+    from datetime import datetime, timedelta
+
+    now = datetime.now().astimezone()
+    nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    # Optional override: ACE_QUOTA_RESET_HOUR=4 → next 04:00 local.
+    raw = (os.environ.get("ACE_QUOTA_RESET_HOUR") or "").strip()
+    if raw:
+        try:
+            hour = max(0, min(23, int(raw)))
+            nxt = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+            if nxt <= now:
+                nxt = nxt + timedelta(days=1)
+        except ValueError:
+            pass
+    return float(nxt.timestamp())
+
+
+def _persist_quota_state() -> None:
+    try:
+        _QUOTA_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "token_limit_reached": bool(_TOKEN_LIMIT_REACHED),
+            "blocks_browser_applies": bool(_BLOCKS_BROWSER_APPLIES),
+            "detail": _TOKEN_LIMIT_DETAIL,
+            "reset_at": float(_TOKEN_LIMIT_RESET_AT or 0.0),
+            "updated_at": time.time(),
+        }
+        tmp = _QUOTA_STATE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(_QUOTA_STATE_PATH)
+    except Exception:
+        logger.debug("quota_state persist failed", exc_info=True)
+
+
+def sync_token_limit_state(*, now: float | None = None) -> bool:
+    """Load disk state; auto-clear after reset_at (next day). Returns active flag."""
+    global _TOKEN_LIMIT_REACHED, _TOKEN_LIMIT_DETAIL, _BLOCKS_BROWSER_APPLIES
+    global _TOKEN_LIMIT_RESET_AT
+    clock = float(now if now is not None else time.time())
+    if not _QUOTA_STATE_PATH.is_file():
+        return bool(_TOKEN_LIMIT_REACHED)
+    try:
+        data = json.loads(_QUOTA_STATE_PATH.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return bool(_TOKEN_LIMIT_REACHED)
+    reset_at = float(data.get("reset_at") or 0.0)
+    reached = bool(data.get("token_limit_reached"))
+    if reached and reset_at > 0 and clock >= reset_at:
+        logger.info(
+            "Quota day reset — clearing HIT LIMIT (reset_at=%s)",
+            reset_at,
+        )
+        clear_token_limit_reached()
+        return False
+    if reached:
+        _TOKEN_LIMIT_REACHED = True
+        _TOKEN_LIMIT_DETAIL = str(data.get("detail") or _TOKEN_LIMIT_DETAIL or "")
+        _BLOCKS_BROWSER_APPLIES = bool(data.get("blocks_browser_applies"))
+        _TOKEN_LIMIT_RESET_AT = reset_at
+        logger.warning(
+            "Restored HIT LIMIT from disk until %s — %s (blocks_apply=%s)",
+            reset_at,
+            (_TOKEN_LIMIT_DETAIL or "")[:160],
+            _BLOCKS_BROWSER_APPLIES,
+        )
+    return bool(_TOKEN_LIMIT_REACHED)
+
+
+def mark_token_limit_reached(
+    detail: str = "",
+    *,
+    blocks_apply: bool = False,
+    reset_at: float | None = None,
+) -> None:
+    """Trip HIT LIMIT. Draft burns default to hunt/tailor pause only (queue still drains)."""
+    global _TOKEN_LIMIT_REACHED, _TOKEN_LIMIT_DETAIL, _BLOCKS_BROWSER_APPLIES
+    global _TOKEN_LIMIT_RESET_AT
+    if _TOKEN_LIMIT_REACHED and not detail and not blocks_apply:
+        return
     _TOKEN_LIMIT_REACHED = True
-    _TOKEN_LIMIT_DETAIL = (detail or "API token/quota limit reached").strip()[:400]
-    logger.error(
-        "TOKEN LIMIT REACHED — pausing applies until quotas reset (%s)",
-        _TOKEN_LIMIT_DETAIL,
+    if detail:
+        _TOKEN_LIMIT_DETAIL = detail.strip()[:400]
+    elif not _TOKEN_LIMIT_DETAIL:
+        _TOKEN_LIMIT_DETAIL = "API token/quota limit reached"
+    if blocks_apply:
+        _BLOCKS_BROWSER_APPLIES = True
+    if reset_at is not None:
+        _TOKEN_LIMIT_RESET_AT = float(reset_at)
+    elif not _TOKEN_LIMIT_RESET_AT:
+        _TOKEN_LIMIT_RESET_AT = _next_local_midnight_ts()
+    banner = (
+        "\n"
+        "************************************************************\n"
+        "*** HIT LIMIT REACHED — pausing hunt/tailor until quotas reset ***\n"
+        f"*** {_TOKEN_LIMIT_DETAIL[:200]}\n"
+        f"*** resumes after local reset @ {_TOKEN_LIMIT_RESET_AT:.0f}"
+        f" | browser_apply_blocked={_BLOCKS_BROWSER_APPLIES}\n"
+        "************************************************************\n"
     )
+    logger.error(
+        "TOKEN LIMIT REACHED — pausing until quotas reset (%s) reset_at=%.0f blocks_apply=%s",
+        _TOKEN_LIMIT_DETAIL,
+        _TOKEN_LIMIT_RESET_AT,
+        _BLOCKS_BROWSER_APPLIES,
+    )
+    try:
+        print(banner, flush=True)
+    except Exception:
+        pass
+    _persist_quota_state()
 
 
 def clear_token_limit_reached() -> None:
-    global _TOKEN_LIMIT_REACHED, _TOKEN_LIMIT_DETAIL
+    global _TOKEN_LIMIT_REACHED, _TOKEN_LIMIT_DETAIL, _SOFT_RATE_FAILS
+    global _BLOCKS_BROWSER_APPLIES, _TOKEN_LIMIT_RESET_AT
     _TOKEN_LIMIT_REACHED = False
     _TOKEN_LIMIT_DETAIL = ""
+    _BLOCKS_BROWSER_APPLIES = False
+    _TOKEN_LIMIT_RESET_AT = 0.0
+    _SOFT_RATE_FAILS = {}
+    try:
+        if _QUOTA_STATE_PATH.is_file():
+            _QUOTA_STATE_PATH.unlink()
+    except Exception:
+        logger.debug("quota_state clear failed", exc_info=True)
 
 
 def _load_dotenv() -> None:
@@ -402,16 +549,35 @@ def _cooldown_remaining(provider: str) -> float:
     return max(0.0, until - time.time())
 
 
+def _is_hard_burn_message(msg: str) -> bool:
+    return any(n in msg for n in _HARD_BURN_NEEDLES)
+
+
+def _is_provider_dead_message(msg: str) -> bool:
+    return any(n in msg for n in _PROVIDER_DEAD_NEEDLES)
+
+
+def _is_soft_rate_message(msg: str) -> bool:
+    # TPM / trial RPM — not the same as hard daily/credit burn.
+    if _is_hard_burn_message(msg) or _is_provider_dead_message(msg):
+        return False
+    return any(n in msg for n in _SOFT_RATE_NEEDLES)
+
+
 def _mark_provider_cooldown(provider: str, exc: BaseException) -> None:
-    """Park hard-burned providers briefly so draft doesn't retry them every call."""
+    """Park burned/rate-limited providers; hard burns trip HIT LIMIT immediately."""
     import re
     import time
 
     msg = str(exc).lower()
-    if not any(n in msg for n in _HARD_BURN_NEEDLES):
+    hard = _is_hard_burn_message(msg)
+    dead = _is_provider_dead_message(msg)
+    soft = _is_soft_rate_message(msg)
+    if not hard and not soft and not dead:
         return
-    # Prefer upstream "retry in XmYs" when present; else 10 minutes.
-    secs = 600.0
+
+    # Prefer upstream "retry in XmYs" when present.
+    secs = 600.0 if (hard or dead) else 45.0
     m = re.search(r"try again in\s+(\d+)m([\d.]+)s", msg)
     if m:
         secs = int(m.group(1)) * 60 + float(m.group(2))
@@ -419,14 +585,36 @@ def _mark_provider_cooldown(provider: str, exc: BaseException) -> None:
         m2 = re.search(r"try again in\s+([\d.]+)\s*s", msg)
         if m2:
             secs = float(m2.group(1))
-    secs = min(max(secs, 30.0), 3600.0)
+    if hard or dead:
+        secs = min(max(secs, 300.0), 3600.0)
+    else:
+        secs = min(max(secs, 15.0), 120.0)
     _PROVIDER_COOLDOWN_UNTIL[provider] = time.time() + secs
+    kind = (
+        "HARD burn"
+        if hard
+        else ("dead model" if dead else "soft rate limit")
+    )
     logger.warning(
-        "Provider %s cooling down for %.0fs after burn (%s)",
+        "Provider %s cooling down for %.0fs after %s (%s)",
         provider,
         secs,
+        kind,
         type(exc).__name__,
     )
+
+    if hard:
+        # No benefit continuing the hunt/tailor cascade when credits/TPD are gone.
+        mark_token_limit_reached(f"{provider}: {str(exc)[:300]}")
+        return
+
+    if soft:
+        _SOFT_RATE_FAILS[provider] = int(_SOFT_RATE_FAILS.get(provider) or 0) + 1
+        if _SOFT_RATE_FAILS[provider] >= _SOFT_RATE_STOP_AFTER:
+            mark_token_limit_reached(
+                f"{provider}: rate limit hit {_SOFT_RATE_FAILS[provider]}× "
+                f"(TPM/trial) — {str(exc)[:240]}"
+            )
 
 
 def invoke_with_failover(
@@ -442,6 +630,10 @@ def invoke_with_failover(
     structured: optional Pydantic model for with_structured_output(...).
     """
     _load_dotenv()
+    if token_limit_reached():
+        raise RuntimeError(
+            f"TOKEN_LIMIT_REACHED: HIT LIMIT REACHED — {token_limit_detail()}"
+        )
     chain = providers_for_role(role)
     if not chain:
         raise RuntimeError(f"No providers available for role={role}")
@@ -455,12 +647,18 @@ def invoke_with_failover(
 
     errors: list[str] = []
     for idx, provider in enumerate(chain):
+        if token_limit_reached():
+            raise RuntimeError(
+                f"TOKEN_LIMIT_REACHED: HIT LIMIT REACHED — {token_limit_detail()}"
+            )
         cool = _cooldown_remaining(provider)
         if cool > 0:
             errors.append(f"{provider}: cooling {cool:.0f}s")
             if idx >= len(chain) - 1:
+                mark_token_limit_reached(" | ".join(errors))
                 raise RuntimeError(
-                    f"All providers failed for role={role}. " + " | ".join(errors)
+                    "TOKEN_LIMIT_REACHED: All providers failed for "
+                    f"role={role}. " + " | ".join(errors)
                 )
             logger.info(
                 "Skipping cooled provider %s (%.0fs left) → %s",
@@ -476,10 +674,12 @@ def invoke_with_failover(
                 provider,
                 idx + 1,
             )
-            return api_request_with_retry(
+            out = api_request_with_retry(
                 lambda p=provider: _call(p),
                 label=f"{role}/{provider}",
             )
+            _SOFT_RATE_FAILS[provider] = 0
+            return out
         except Exception as exc:
             # Groq TPM/size: one same-provider escape on smaller model.
             if provider == "groq" and (
@@ -489,14 +689,20 @@ def invoke_with_failover(
                     logger.warning(
                         "Groq TPM/size — retry once with %s", DEFAULT_GROQ_FALLBACK_MODEL
                     )
-                    return api_request_with_retry(
+                    out = api_request_with_retry(
                         lambda: _call("groq", DEFAULT_GROQ_FALLBACK_MODEL),
                         label=f"{role}/groq-fallback",
                     )
+                    _SOFT_RATE_FAILS[provider] = 0
+                    return out
                 except Exception as retry_exc:
                     exc = retry_exc
 
             _mark_provider_cooldown(provider, exc)
+            if token_limit_reached():
+                raise RuntimeError(
+                    f"TOKEN_LIMIT_REACHED: HIT LIMIT REACHED — {token_limit_detail()}"
+                ) from exc
             errors.append(f"{provider}: {exc}")
             if idx >= len(chain) - 1:
                 joined = " | ".join(errors)

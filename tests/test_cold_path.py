@@ -149,25 +149,53 @@ def test_artifact_cache_same_fingerprint_hits(tmp_path, monkeypatch):
         lambda p, **k: Path(p),
     )
 
+    good_yaml = """
+cv:
+  name: Archit Gupta
+  sections:
+    education:
+      - institution: LNMIIT
+        degree: B.Tech
+    experience:
+      - company: MSG Technologies
+        position: Intern
+        highlights: ["Built A", "Built B", "Built C"]
+      - company: Infosys
+        position: Intern
+        highlights: ["Built A", "Built B", "Built C"]
+    projects:
+      - name: Road Inspection System
+        location: "[GitHub](https://github.com/MSG-Technologies/AI-Road-Inspection)"
+        highlights: ["Built A", "Built B", "Built C"]
+      - name: Earthquake Early Warning
+        location: "[GitHub](https://github.com/architjoke/earthquake-warning)"
+        highlights: ["Built A", "Built B", "Built C"]
+    skills:
+      - label: Languages
+        details: Python
+"""
+
     class _G:
         def invoke(self, *_a, **_k):
             return {
                 "pdf_path": str(pdf),
-                "current_tailored_yaml": "x: 1\n",
+                "current_tailored_yaml": good_yaml,
                 "ats_score": 90,
                 "ats_pass_score": 85,
                 "missing_keywords": [],
                 "compile_error": "",
+                "density_ok": True,
             }
 
     monkeypatch.setattr(t, "get_tailor_graph", lambda: _G())
+    monkeypatch.setattr(t, "_bullet_density_issues", lambda *_a, **_k: [])
     jd = "Requirements\n- Python\nUnique Title XYZ role."
     master = "skills:\n  - Python\n"
     path, y = t.tailor_with_graph(
         jd, master, job_track="SDE", job_title="Unique Title XYZ"
     )
     assert Path(path) == pdf.resolve()
-    assert y.startswith("x:")
+    assert "cv:" in y
     monkeypatch.setattr(
         t,
         "get_tailor_graph",
